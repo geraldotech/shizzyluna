@@ -1,0 +1,6 @@
+{
+  "name": "Shizzi",
+  "description": "Rootless hotspot & tethering carrier restriction bypass utility powered by Shizuku",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
