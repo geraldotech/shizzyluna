@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dev.shizzi.ui.theme.AccentChoice
@@ -34,6 +35,8 @@ data class Settings(
 
     val dnsSettings: DnsSettings = DnsSettings(),
     val clientRules: List<ClientRule> = emptyList(),
+    val experimentalBpfEnabled: Boolean = false,
+    val bpfPollIntervalMs: Int = 1000,
 )
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
@@ -130,6 +133,14 @@ class SettingsStore(private val context: Context) {
         }
     }
 
+    suspend fun setExperimentalBpfEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[EXPERIMENTAL_BPF_ENABLED] = enabled }
+    }
+
+    suspend fun setBpfPollIntervalMs(intervalMs: Int) {
+        context.dataStore.edit { it[BPF_POLL_INTERVAL_MS] = intervalMs.coerceIn(500, 5000) }
+    }
+
     private fun MutablePreferences.mintTokenIfAbsent() {
         if (!this[AUTOMATION_TOKEN].isNullOrEmpty()) return
 
@@ -151,6 +162,8 @@ internal val DNS_PRESET = stringPreferencesKey("dns_preset")
 internal val CUSTOM_DNS_PRIMARY = stringPreferencesKey("custom_dns_primary")
 internal val CUSTOM_DNS_SECONDARY = stringPreferencesKey("custom_dns_secondary")
 internal val CLIENT_RULES = stringPreferencesKey("client_rules")
+internal val EXPERIMENTAL_BPF_ENABLED = booleanPreferencesKey("experimental_bpf_enabled")
+internal val BPF_POLL_INTERVAL_MS = intPreferencesKey("bpf_poll_interval_ms")
 
 internal fun toSettings(preferences: Preferences) = Settings(
     theme = runCatching { ThemeChoice.valueOf(preferences[THEME].orEmpty()) }
@@ -170,4 +183,6 @@ internal fun toSettings(preferences: Preferences) = Settings(
         customSecondary = preferences[CUSTOM_DNS_SECONDARY].orEmpty(),
     ),
     clientRules = ClientRule.parseList(preferences[CLIENT_RULES]),
+    experimentalBpfEnabled = preferences[EXPERIMENTAL_BPF_ENABLED] ?: false,
+    bpfPollIntervalMs = (preferences[BPF_POLL_INTERVAL_MS] ?: 1000).coerceIn(500, 5000),
 )

@@ -8,6 +8,7 @@ import java.io.File
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -31,6 +32,7 @@ data class SessionUiState(
     val firewallBackend: FirewallBackend = FirewallBackend.NONE,
     val kernelNetfilterAvailable: Boolean = false,
     val fallbackReason: String = "",
+    val bpfAttribution: BpfAttributionStatusReport = BpfAttributionStatusReport(),
 
     val traffic: Traffic = Traffic(),
 ) {
@@ -52,6 +54,7 @@ fun SessionUiState.asStopped(): SessionUiState = copy(
     firewallBackend = FirewallBackend.NONE,
     kernelNetfilterAvailable = false,
     fallbackReason = "",
+    bpfAttribution = BpfAttributionStatusReport(),
     traffic = Traffic(),
 )
 
@@ -105,8 +108,16 @@ fun SessionUiState.applyOutcome(outcome: Result<String>): SessionUiState {
                         seenPackets = obj.optLong("seenPackets", 0L),
                         matchedPackets = obj.optLong("matchedPackets", 0L),
                         droppedPackets = obj.optLong("droppedPackets", 0L),
+                        blockedDropPackets = obj.optLong("blockedDropPackets", 0L),
+                        shapingDropPackets = obj.optLong("shapingDropPackets", 0L),
+                        policyVersionBlockedDrops = obj.optLong("policyVersionBlockedDrops", 0L),
                         shapedBytes = obj.optLong("shapedBytes", 0L),
                         policyInstalled = obj.optBoolean("policyInstalled", false),
+                        unattributedPostNatObserved = obj.optBoolean("unattributedPostNatObserved", false),
+                        mappingSource = obj.optString("mappingSource", "softap_dump+downstream_neigh"),
+                        directAttributedPackets = obj.optLong("directAttributedPackets", 0L),
+                        bpfAttributedPackets = obj.optLong("bpfAttributedPackets", 0L),
+                        policyVersion = obj.optLong("policyVersion", 1L),
                     ),
                 )
             }
@@ -120,6 +131,8 @@ fun SessionUiState.applyOutcome(outcome: Result<String>): SessionUiState {
     val fwBackend = runCatching {
         FirewallBackend.valueOf(parsed?.optString("firewallBackend", FirewallBackend.NONE.name).orEmpty())
     }.getOrDefault(FirewallBackend.NONE)
+
+    val bpfReport = BpfAttributionStatusReport.fromJson(parsed?.optJSONObject("bpfAttribution"))
 
     return copy(
         isBusy = false,
@@ -136,6 +149,7 @@ fun SessionUiState.applyOutcome(outcome: Result<String>): SessionUiState {
         firewallBackend = fwBackend,
         kernelNetfilterAvailable = parsed?.optBoolean("kernelNetfilterAvailable", false) == true,
         fallbackReason = parsed?.optString("fallbackReason").orEmpty(),
+        bpfAttribution = bpfReport,
         traffic = Traffic(
             up = parsed?.optLong("bytesUp") ?: 0,
             down = parsed?.optLong("bytesDown") ?: 0,
@@ -162,12 +176,9 @@ class TetherClient {
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName(BuildConfig.APPLICATION_ID, TetherService::class.java.name),
     )
-
         .daemon(true)
-
         .tag(SERVICE_TAG)
         .processNameSuffix("probe")
-
         .debuggable(BuildConfig.DEBUG)
         .version(TetherService.CONTRACT_VERSION)
 
@@ -191,12 +202,41 @@ class TetherClient {
         }
     }
 
+    /**
+     * Binds to the Shizuku UserService and ensures that a stale daemon from a previous APK
+     * build (`remoteContract != CONTRACT_VERSION`) is automatically terminated and restarted.
+     */
     private suspend fun service(): ITetherService {
         boundService?.let { existing ->
-            if (existing.asBinder().pingBinder()) return existing
-            boundService = null
+            if (existing.asBinder().pingBinder()) {
+                val remoteVer = runCatching { existing.contractVersion }.getOrDefault(-1)
+                if (remoteVer == TetherService.CONTRACT_VERSION) {
+                    return existing
+                }
+                SessionLog.warn(
+                    "UserService contract mismatch (remote=$remoteVer, expected=${TetherService.CONTRACT_VERSION}); terminating stale daemon",
+                )
+                releaseBinding(shouldTerminate = true)
+                delay(350)
+            } else {
+                boundService = null
+            }
         }
 
+        var bound = bindOnce()
+        val remoteVer = runCatching { bound.contractVersion }.getOrDefault(-1)
+        if (remoteVer != TetherService.CONTRACT_VERSION) {
+            SessionLog.warn(
+                "Restarting stale Shizuku UserService (remote=$remoteVer != expected=${TetherService.CONTRACT_VERSION})",
+            )
+            releaseBinding(shouldTerminate = true)
+            delay(450)
+            bound = bindOnce()
+        }
+        return bound
+    }
+
+    private suspend fun bindOnce(): ITetherService {
         val deferred = CompletableDeferred<ITetherService>()
         pendingBind = deferred
         Shizuku.bindUserService(userServiceArgs, connection)
@@ -232,7 +272,6 @@ class TetherClient {
         runCatching { binder.linkToDeath(recipient, 0) }
             .onSuccess { deathRecipient = recipient }
             .onFailure {
-
                 boundService = null
             }
     }
@@ -241,6 +280,47 @@ class TetherClient {
         val bound = service()
         verifyContract(bound)
         bound.runProbes(attemptTethering, AVAILABILITY_TIMEOUT_MS)
+    }
+
+    suspend fun runFirewallDiagnostics(): FirewallDiagnosticReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val json = bound.runFirewallDiagnostics()
+        FirewallDiagnosticReport.fromJsonString(json)
+    }
+
+    suspend fun runFirewallClientPoc(
+        clientAMac: String,
+        clientBMac: String,
+        durationSec: Int = 5,
+    ): FirewallDiagnosticReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val json = bound.runFirewallClientPoc(clientAMac, clientBMac, durationSec)
+        FirewallDiagnosticReport.fromJsonString(json)
+    }
+
+    suspend fun cleanupFirewallTestRules(): String = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        bound.cleanupFirewallTestRules()
+    }
+
+    suspend fun setExperimentalBpfConfig(
+        enabled: Boolean,
+        pollIntervalMs: Int,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.setExperimentalBpfConfig(enabled, pollIntervalMs)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun collectBpfSnapshotNow(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.collectBpfSnapshotNow()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
     }
 
     suspend fun checkCompatibility(): List<CapabilityResult> = withContext(Dispatchers.IO) {

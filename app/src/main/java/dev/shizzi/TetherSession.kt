@@ -21,11 +21,62 @@ class TetherSession(private val context: Context) {
     private var vpnMode = VpnMode.AUTO
     private var watchdog: SessionWatchdog? = null
     private val teardown = SessionTeardown(context)
-    private val downstream = DownstreamInspector()
+    private val downstream = DownstreamInspector(inspector = inspector, context = context)
     private val vpn = VpnUpstream(context) { problem -> tearDownAfter(problem) }
     private var activeRules = listOf<ClientRule>()
 
     val isActive: Boolean get() = state == SessionState.ACTIVE
+
+    fun runFirewallDiagnostics(): String =
+        FirewallDiagnosticRunner.runReadOnlyDiagnostic(
+            context = context,
+            downstreamInspector = downstream,
+            upstreamInterfaceName = interfaceName,
+            vpnActive = vpn.isBound || vpn.isVpnPresent(),
+        ).toJsonString()
+
+    fun runFirewallClientPoc(
+        clientAMac: String,
+        clientBMac: String,
+        durationSec: Int,
+    ): String =
+        FirewallDiagnosticRunner.runTemporaryClientPoc(
+            context = context,
+            downstreamInspector = downstream,
+            upstreamInterfaceName = interfaceName,
+            vpnActive = vpn.isBound || vpn.isVpnPresent(),
+            clientAMac = clientAMac,
+            clientBMac = clientBMac,
+            durationSec = durationSec,
+        ).toJsonString()
+
+    fun cleanupFirewallTestRules(): String =
+        FirewallDiagnosticRunner.recoverOrphanedTestRules()
+
+    fun setExperimentalBpfConfig(enabled: Boolean, pollIntervalMs: Int): String {
+        val downIface = if (isActive) {
+            downstream.inspectSnapshot(forceRefresh = false).apInterfaces.firstOrNull().orEmpty()
+        } else {
+            ""
+        }
+        TunTrafficEngine.configureExperimentalBpf(
+            enabled = enabled,
+            pollIntervalMs = pollIntervalMs.toLong(),
+            downstreamIface = downIface,
+            upstreamIface = interfaceName.orEmpty(),
+        )
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun collectBpfSnapshotNow(): String {
+        if (isActive) {
+            val snapshot = downstream.inspectSnapshot(forceRefresh = true)
+            HostFirewall.enforce(activeRules, snapshot.clients, logSummary = false)
+            val downIface = snapshot.apInterfaces.firstOrNull().orEmpty()
+            TunTrafficEngine.bpfAttributor.syncInterfaces(downIface, interfaceName.orEmpty())
+        }
+        return TunTrafficEngine.collectBpfSnapshotNow().toJson().toString()
+    }
 
     fun updateRules(rulesJson: String) {
         val previousCount = activeRules.size
@@ -287,8 +338,16 @@ class TetherSession(private val context: Context) {
                     put("seenPackets", counters.seenPackets)
                     put("matchedPackets", counters.matchedPackets)
                     put("droppedPackets", counters.droppedPackets)
+                    put("blockedDropPackets", counters.blockedDropPackets)
+                    put("shapingDropPackets", counters.shapingDropPackets)
+                    put("policyVersionBlockedDrops", counters.policyVersionBlockedDrops)
                     put("shapedBytes", counters.shapedBytes)
                     put("policyInstalled", counters.policyInstalled)
+                    put("unattributedPostNatObserved", counters.unattributedPostNatObserved)
+                    put("mappingSource", c.mappingSource)
+                    put("directAttributedPackets", counters.directAttributedPackets)
+                    put("bpfAttributedPackets", counters.bpfAttributedPackets)
+                    put("policyVersion", counters.policyVersion)
                     val ipsArr = org.json.JSONArray()
                     c.allIps.forEach { ipsArr.put(it) }
                     put("allIps", ipsArr)
@@ -296,6 +355,7 @@ class TetherSession(private val context: Context) {
             }
         }
         put("connectedClients", clientsArray)
+        put("bpfAttribution", TunTrafficEngine.getBpfAttributionReport().toJson())
     }.toString()
 
     private fun isVpnBypassed(): Boolean {

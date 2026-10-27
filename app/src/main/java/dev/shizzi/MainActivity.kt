@@ -74,6 +74,7 @@ class MainActivity : ComponentActivity() {
                     val compatibility by viewModel.compatibilityState.collectAsState()
                     val permissions by viewModel.permissionState.collectAsState()
                     val clients by viewModel.clientsState.collectAsState()
+                    val firewallDiag by viewModel.firewallDiagState.collectAsState()
 
                     ShizziApp(
                         state = AppState(
@@ -82,6 +83,7 @@ class MainActivity : ComponentActivity() {
                             diagnostics = diagnostics,
                             permissions = permissions,
                             clients = clients,
+                            firewallDiag = firewallDiag,
                         ),
                         onboarding = OnboardingEntry(
                             compatibility = compatibility,
@@ -117,6 +119,12 @@ class MainActivity : ComponentActivity() {
                             onSaveClientRule = viewModel::saveClientRule,
                             onRemoveClientRule = viewModel::removeClientRule,
                             onRefreshClients = viewModel::refreshClients,
+                            onRunFirewallReadOnlyProbes = viewModel::runFirewallReadOnlyProbes,
+                            onRunFirewallClientPoc = viewModel::runFirewallClientPoc,
+                            onCleanupFirewallRules = viewModel::cleanupFirewallTestRules,
+                            onSetExperimentalBpfEnabled = viewModel::setExperimentalBpfEnabled,
+                            onSetBpfPollIntervalMs = viewModel::setBpfPollIntervalMs,
+                            onCollectBpfSnapshotNow = viewModel::collectBpfSnapshotNow,
                         ),
                     )
                 }

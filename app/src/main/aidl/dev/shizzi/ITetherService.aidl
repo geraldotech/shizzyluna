@@ -27,4 +27,14 @@ interface ITetherService {
     void updateRules(String rulesJson);
 
     int getContractVersion();
+
+    String runFirewallDiagnostics();
+
+    String runFirewallClientPoc(String clientAMac, String clientBMac, int durationSec);
+
+    String cleanupFirewallTestRules();
+
+    String setExperimentalBpfConfig(boolean enabled, int pollIntervalMs);
+
+    String collectBpfSnapshotNow();
 }

@@ -1,7 +1,11 @@
 package dev.shizzi
 
+import android.content.Context
+import android.net.MacAddress
+import android.net.wifi.WifiManager
 import java.io.File
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
 
 data class DiscoveredHost(
     val mac: String,
@@ -13,21 +17,189 @@ data class DiscoveredHost(
     val seenPackets: Long = 0L,
     val matchedPackets: Long = 0L,
     val droppedPackets: Long = 0L,
+    val blockedDropPackets: Long = 0L,
+    val shapingDropPackets: Long = 0L,
+    val policyVersionBlockedDrops: Long = 0L,
     val shapedBytes: Long = 0L,
     val policyInstalled: Boolean = false,
+    val unattributedPostNatObserved: Boolean = false,
+    val mappingSource: String = "softap_dump+downstream_neigh",
+    val directAttributedPackets: Long = 0L,
+    val bpfAttributedPackets: Long = 0L,
+    val policyVersion: Long = 1L,
+)
+
+data class CallbackObservation(
+    val softApCallbackStatus: String = "NOT_REGISTERED",
+    val softApCallbackMacs: Set<String> = emptySet(),
+    val tetheringCallbackStatus: String = "NOT_REGISTERED",
+    val tetheringCallbackClientIps: Map<String, List<String>> = emptyMap(),
 )
 
 data class DownstreamSnapshot(
     val count: Int,
     val clients: List<DiscoveredHost>,
     val apInterfaces: Set<String> = emptySet(),
+    val mappingSourceSummary: String = "softap_dump+downstream_neigh",
+    val callbackObservation: CallbackObservation = CallbackObservation(),
 )
 
-class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamInspector()) {
+class DownstreamInspector(
+    private val inspector: UpstreamInspector = UpstreamInspector(),
+    private val context: Context? = null,
+) {
 
     private var cachedSnapshot = DownstreamSnapshot(count = 0, clients = emptyList())
     private var lastReadAt = 0L
     private var loggedCount = -1
+
+    @Volatile
+    private var callbacksInitialized = false
+
+    @Volatile
+    private var softApCallbackStatus: String = "NOT_INITIALIZED"
+
+    @Volatile
+    private var tetheringCallbackStatus: String = "NOT_INITIALIZED"
+
+    private val callbackConnectedMacs = ConcurrentHashMap.newKeySet<String>()
+    private val callbackClientIpsByMac = ConcurrentHashMap<String, List<String>>()
+
+    @Synchronized
+    fun ensureOfficialCallbacksProbed(targetContext: Context? = context): CallbackObservation {
+        if (!callbacksInitialized && targetContext != null) {
+            callbacksInitialized = true
+            val directExecutor = Executor { runnable -> runnable.run() }
+            probeSoftApCallback(targetContext, directExecutor)
+            probeTetheringEventCallback(targetContext, directExecutor)
+        } else if (targetContext == null && !callbacksInitialized) {
+            softApCallbackStatus = "NO_CONTEXT"
+            tetheringCallbackStatus = "NO_CONTEXT"
+        }
+        return CallbackObservation(
+            softApCallbackStatus = softApCallbackStatus,
+            softApCallbackMacs = callbackConnectedMacs.toSet(),
+            tetheringCallbackStatus = tetheringCallbackStatus,
+            tetheringCallbackClientIps = HashMap(callbackClientIpsByMac),
+        )
+    }
+
+    private fun probeSoftApCallback(ctx: Context, executor: Executor) {
+        runCatching {
+            val wifiManager = ctx.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            if (wifiManager == null) {
+                softApCallbackStatus = "WIFI_MANAGER_NULL"
+                return
+            }
+            val callbackClass = Class.forName("android.net.wifi.WifiManager\$SoftApCallback")
+            val registerMethod = wifiManager.javaClass.methods.firstOrNull {
+                it.name == "registerSoftApCallback" && it.parameterTypes.size == 2
+            }
+            if (registerMethod == null) {
+                softApCallbackStatus = "METHOD_NOT_FOUND"
+                return
+            }
+            val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                callbackClass.classLoader,
+                arrayOf(callbackClass),
+            ) { _, method, args ->
+                if (method.name == "onConnectedClientsChanged") {
+                    val clientsList = args?.firstOrNull { it is List<*> } as? List<*>
+                    if (clientsList != null) {
+                        val extracted = mutableSetOf<String>()
+                        for (clientObj in clientsList) {
+                            if (clientObj == null) continue
+                            val macObj = runCatching {
+                                clientObj.javaClass.getMethod("getMacAddress").invoke(clientObj)
+                            }.getOrNull()
+                            val macStr = (macObj as? MacAddress)?.toString()?.uppercase()
+                                ?: macObj?.toString()?.uppercase()
+                            if (macStr != null && isValidClientMac(macStr)) {
+                                extracted.add(macStr)
+                            }
+                        }
+                        callbackConnectedMacs.clear()
+                        callbackConnectedMacs.addAll(extracted)
+                        softApCallbackStatus = "ACTIVE_CLIENTS_${extracted.size}"
+                    }
+                }
+                null
+            }
+            registerMethod.invoke(wifiManager, executor, proxy)
+            if (softApCallbackStatus == "NOT_INITIALIZED") {
+                softApCallbackStatus = "REGISTERED"
+            }
+        }.onFailure { err ->
+            val cause = (err as? java.lang.reflect.InvocationTargetException)?.targetException ?: err
+            softApCallbackStatus = "FAILED:${cause.javaClass.simpleName}:${cause.message?.take(80)}"
+        }
+    }
+
+    private fun probeTetheringEventCallback(ctx: Context, executor: Executor) {
+        runCatching {
+            val tetheringManager = ctx.getSystemService("tethering")
+            if (tetheringManager == null) {
+                tetheringCallbackStatus = "TETHERING_MANAGER_NULL"
+                return
+            }
+            val callbackClass = Class.forName("android.net.TetheringManager\$TetheringEventCallback")
+            val registerMethod = tetheringManager.javaClass.methods.firstOrNull {
+                it.name == "registerTetheringEventCallback" && it.parameterTypes.size == 2
+            }
+            if (registerMethod == null) {
+                tetheringCallbackStatus = "METHOD_NOT_FOUND"
+                return
+            }
+            val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                callbackClass.classLoader,
+                arrayOf(callbackClass),
+            ) { _, method, args ->
+                if (method.name == "onClientsChanged") {
+                    val clientsCol = args?.firstOrNull { it is Collection<*> } as? Collection<*>
+                    if (clientsCol != null) {
+                        val map = HashMap<String, List<String>>()
+                        for (tetheredClient in clientsCol) {
+                            if (tetheredClient == null) continue
+                            val macObj = runCatching {
+                                tetheredClient.javaClass.getMethod("getMacAddress").invoke(tetheredClient)
+                            }.getOrNull()
+                            val macStr = (macObj as? MacAddress)?.toString()?.uppercase()
+                                ?: macObj?.toString()?.uppercase()
+                                ?: continue
+                            val addressesCol = runCatching {
+                                tetheredClient.javaClass.getMethod("getAddresses").invoke(tetheredClient) as? Collection<*>
+                            }.getOrNull().orEmpty()
+                            val ips = mutableListOf<String>()
+                            for (linkAddrObj in addressesCol) {
+                                if (linkAddrObj == null) continue
+                                val addrObj = runCatching {
+                                    linkAddrObj.javaClass.getMethod("getAddress").invoke(linkAddrObj) as? java.net.InetAddress
+                                }.getOrNull()
+                                val hostAddr = addrObj?.hostAddress?.substringBefore('%')
+                                if (!hostAddr.isNullOrBlank()) {
+                                    ips.add(hostAddr)
+                                }
+                            }
+                            if (isValidClientMac(macStr)) {
+                                map[macStr] = ips.distinct()
+                            }
+                        }
+                        callbackClientIpsByMac.clear()
+                        callbackClientIpsByMac.putAll(map)
+                        tetheringCallbackStatus = "ACTIVE_CLIENTS_${map.size}"
+                    }
+                }
+                null
+            }
+            registerMethod.invoke(tetheringManager, executor, proxy)
+            if (tetheringCallbackStatus == "NOT_INITIALIZED") {
+                tetheringCallbackStatus = "REGISTERED"
+            }
+        }.onFailure { err ->
+            val cause = (err as? java.lang.reflect.InvocationTargetException)?.targetException ?: err
+            tetheringCallbackStatus = "FAILED:${cause.javaClass.simpleName}:${cause.message?.take(80)}"
+        }
+    }
 
     fun findTetheredDownstream(): String? {
         val observation = inspector.observe()
@@ -48,6 +220,8 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
             return cachedSnapshot
         }
 
+        val cbObs = ensureOfficialCallbacksProbed()
+
         val tetheredIfaces = runCatching {
             val obs = inspector.observe()
             if (obs.didTimeout) emptySet() else parseTetheredInterfaces(obs.rawOutput).toSet()
@@ -67,6 +241,7 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
 
         val rawNeighbors = ArrayList<NeighborRecord>().apply {
             addAll(runCatching { parseIpNeighFromShell() }.getOrDefault(emptyList()))
+            addAll(runCatching { parseIp6NeighFromShell() }.getOrDefault(emptyList()))
             addAll(runCatching { parseArpFromShell() }.getOrDefault(emptyList()))
         }
 
@@ -74,6 +249,7 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
             wifiDump = wifiParsed,
             tetheredInterfaces = apIfaces,
             neighbors = rawNeighbors,
+            callbackObservation = cbObs,
         )
 
         val enrichedClients = resolvedClients.map { host ->
@@ -84,17 +260,25 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
                 seenPackets = counters.seenPackets,
                 matchedPackets = counters.matchedPackets,
                 droppedPackets = counters.droppedPackets,
+                blockedDropPackets = counters.blockedDropPackets,
+                shapingDropPackets = counters.shapingDropPackets,
+                policyVersionBlockedDrops = counters.policyVersionBlockedDrops,
                 shapedBytes = counters.shapedBytes,
                 policyInstalled = counters.policyInstalled,
+                unattributedPostNatObserved = counters.unattributedPostNatObserved,
             )
         }
 
         val finalCount = enrichedClients.size
+        val sourceSummary = enrichedClients.map { it.mappingSource }.distinct().joinToString(",")
+            .ifBlank { "softap_dump+downstream_neigh" }
         lastReadAt = now
         cachedSnapshot = DownstreamSnapshot(
             count = finalCount,
             clients = enrichedClients,
             apInterfaces = apIfaces,
+            mappingSourceSummary = sourceSummary,
+            callbackObservation = cbObs,
         )
 
         logCountChange(finalCount, enrichedClients)
@@ -142,12 +326,17 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
     )
 
     private fun parseIpNeighFromShell(): List<NeighborRecord> {
-        return runCatching {
-            val process = ProcessBuilder("ip", "neigh").start()
-            val text = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor(2, TimeUnit.SECONDS)
-            parseIpNeighOutput(text)
-        }.getOrDefault(emptyList())
+        val res = HostFirewall.executeCommand("ip", "-4", "neigh", "show", timeoutMs = 1_500L)
+        if (!res.isSuccess && res.stdout.isBlank()) {
+            val fallback = HostFirewall.executeCommand("ip", "neigh", "show", timeoutMs = 1_500L)
+            return parseIpNeighOutput(fallback.stdout)
+        }
+        return parseIpNeighOutput(res.stdout)
+    }
+
+    private fun parseIp6NeighFromShell(): List<NeighborRecord> {
+        val res = HostFirewall.executeCommand("ip", "-6", "neigh", "show", timeoutMs = 1_500L)
+        return parseIpNeighOutput(res.stdout)
     }
 
     private fun parseArpFromShell(): List<NeighborRecord> {
@@ -187,7 +376,7 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
             val results = mutableListOf<NeighborRecord>()
             for (line in text.lines()) {
                 val match = IP_NEIGH_PATTERN.find(line.trim()) ?: continue
-                val ip = match.groupValues[1].trim()
+                val ip = match.groupValues[1].trim().substringBefore('%')
                 val iface = match.groupValues[2].trim()
                 val mac = match.groupValues[3].uppercase()
                 val state = match.groupValues[4].uppercase()
@@ -216,11 +405,6 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
             return results
         }
 
-        /**
-         * Parses `dumpsys wifi` strictly from the active `SoftApManager` state dump.
-         * Never scans general `dumpsys wifi` lines for arbitrary MAC addresses (which would
-         * match hundreds of Wi-Fi scan BSSIDs, saved networks, and historical logs).
-         */
         internal fun parseWifiSoftApDump(output: String): WifiSoftApDump {
             val lines = output.lines()
             val apInterfaces = LinkedHashSet<String>()
@@ -285,14 +469,15 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
             wifiDump: WifiSoftApDump?,
             tetheredInterfaces: Set<String>,
             neighbors: List<NeighborRecord>,
+            callbackObservation: CallbackObservation = CallbackObservation(),
         ): List<DiscoveredHost> {
             val apIfaces = LinkedHashSet<String>().apply {
                 addAll(tetheredInterfaces)
                 wifiDump?.apInterfaces?.let { addAll(it) }
             }
 
-            // Group neighbor records by MAC, keeping only neighbors on downstream AP interfaces
-            // (or if apIfaces isn't reported yet, neighbors that are NOT on upstream cellular/tun)
+            // Strictly scope neighbor entries to downstream AP interfaces so upstream neighbors or
+            // scan results are never mistaken for connected clients.
             val filteredNeighbors = neighbors.filter { record ->
                 when {
                     apIfaces.isNotEmpty() -> record.interfaceName in apIfaces
@@ -300,48 +485,60 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
                 }
             }
 
-            // Also keep an unfiltered neighbor lookup by MAC so if a MAC is already verified by
-            // SoftApManager, we can still resolve its IPv4/IPv6 regardless of interface naming
-            val allNeighborsByMac = neighbors.groupBy { it.mac.uppercase() }
             val apNeighborsByMac = filteredNeighbors.groupBy { it.mac.uppercase() }
 
-            fun buildHostForMac(mac: String, defaultIface: String): DiscoveredHost {
-                val records = apNeighborsByMac[mac] ?: allNeighborsByMac[mac].orEmpty()
-                val allIps = records.map { it.ip }.filter { it.isNotBlank() }.distinct()
+            fun buildHostForMac(mac: String, defaultIface: String, hasSoftApDump: Boolean): DiscoveredHost {
+                val records = apNeighborsByMac[mac].orEmpty()
+                val cbIps = callbackObservation.tetheringCallbackClientIps[mac].orEmpty()
+                val neighIps = records.map { it.ip }.filter { it.isNotBlank() }
+                val allIps = (cbIps + neighIps).distinct()
                 val primaryIpv4 = allIps.firstOrNull { !it.contains(':') }
                 val primaryIp = primaryIpv4 ?: allIps.firstOrNull().orEmpty()
                 val iface = records.firstOrNull()?.interfaceName
                     ?: apIfaces.firstOrNull()
                     ?: defaultIface
 
+                val sources = mutableListOf<String>()
+                if (mac in callbackObservation.softApCallbackMacs) sources.add("softap_callback")
+                if (cbIps.isNotEmpty()) sources.add("tethering_callback")
+                if (hasSoftApDump) sources.add("softap_dump")
+                if (neighIps.isNotEmpty()) sources.add("downstream_neigh")
+                val sourceLabel = sources.joinToString("+").ifBlank { "softap_dump" }
+
                 return DiscoveredHost(
                     mac = mac,
                     ip = primaryIp,
                     allIps = allIps,
                     interfaceName = iface,
+                    mappingSource = sourceLabel,
                 )
             }
 
             val defaultApIface = apIfaces.firstOrNull() ?: "wlan1"
 
-            // Case 1: We have an authoritative SoftApManager client count from `dumpsys wifi`
+            // If official SoftApCallback reported active MACs, combine with WifiSoftApDump
             if (wifiDump != null && wifiDump.hasAuthoritativeCount) {
-                val nonWifiTetheredIfaces = apIfaces.filter { !it.startsWith("wlan") && !it.startsWith("ap") && !it.startsWith("swlan") && !it.startsWith("softap") }
+                val nonWifiTetheredIfaces = apIfaces.filter {
+                    !it.startsWith("wlan") && !it.startsWith("ap") && !it.startsWith("swlan") && !it.startsWith("softap")
+                }
 
-                if (wifiDump.reportedCount == 0 && nonWifiTetheredIfaces.isEmpty()) {
-                    // 0 Wi-Fi clients are connected to the hotspot -> return empty list!
+                if (wifiDump.reportedCount == 0 &&
+                    callbackObservation.softApCallbackMacs.isEmpty() &&
+                    nonWifiTetheredIfaces.isEmpty()
+                ) {
                     return emptyList()
                 }
 
                 val verified = LinkedHashMap<String, DiscoveredHost>()
 
-                // 1a. Add the exact WifiClient MACs reported by SoftApManager
-                for (mac in wifiDump.connectedMacs) {
-                    verified[mac] = buildHostForMac(mac, defaultApIface)
+                for (mac in callbackObservation.softApCallbackMacs) {
+                    verified[mac] = buildHostForMac(mac, defaultApIface, hasSoftApDump = true)
                 }
 
-                // 1b. If SoftApManager reported N > verified.size (e.g. OEM redacted WifiClient line),
-                // fill the remaining slots strictly from active neighbors on the downstream AP interface
+                for (mac in wifiDump.connectedMacs) {
+                    verified[mac] = buildHostForMac(mac, defaultApIface, hasSoftApDump = true)
+                }
+
                 if (verified.size < wifiDump.reportedCount) {
                     val needed = wifiDump.reportedCount - verified.size
                     val candidates = apNeighborsByMac.entries
@@ -350,15 +547,14 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
                         .take(needed)
 
                     for ((mac, _) in candidates) {
-                        verified[mac] = buildHostForMac(mac, defaultApIface)
+                        verified[mac] = buildHostForMac(mac, defaultApIface, hasSoftApDump = true)
                     }
                 }
 
-                // 1c. Also include active USB/Ethernet tethered clients if any non-Wi-Fi downstream is active
                 for (nonWifiIface in nonWifiTetheredIfaces) {
                     for ((mac, recs) in apNeighborsByMac) {
                         if (recs.any { it.interfaceName == nonWifiIface && it.state == "REACHABLE" }) {
-                            verified.putIfAbsent(mac, buildHostForMac(mac, nonWifiIface))
+                            verified.putIfAbsent(mac, buildHostForMac(mac, nonWifiIface, hasSoftApDump = false))
                         }
                     }
                 }
@@ -366,13 +562,18 @@ class DownstreamInspector(private val inspector: UpstreamInspector = UpstreamIns
                 return verified.values.toList()
             }
 
-            // Case 2: Fallback if `dumpsys wifi` timed out — only trust active neighbors on known tethered AP interfaces
+            if (callbackObservation.softApCallbackMacs.isNotEmpty()) {
+                return callbackObservation.softApCallbackMacs.map { mac ->
+                    buildHostForMac(mac, defaultApIface, hasSoftApDump = false)
+                }
+            }
+
             if (apIfaces.isEmpty()) {
                 return emptyList()
             }
 
             return apNeighborsByMac.keys
-                .map { mac -> buildHostForMac(mac, defaultApIface) }
+                .map { mac -> buildHostForMac(mac, defaultApIface, hasSoftApDump = false) }
         }
 
         private fun neighborStatePriority(records: List<NeighborRecord>): Int {

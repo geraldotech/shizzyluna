@@ -448,7 +448,9 @@ class ClientManagerTest {
     }
 
     @Test
-    fun `conntrack parser resolves post-NAT 192_0_2_2 flow to original downstream client IP across two clients`() {
+    fun `SYNTHETIC FIXTURE - conntrack parser resolves post-NAT 192_0_2_2 flow to original downstream client IP across two clients`() {
+        // NOTE: This test uses a SYNTHETIC conntrack line to verify parser and 5-tuple lookup logic only.
+        // It does NOT prove that /proc/net/nf_conntrack is readable under Shizuku UID 2000 on a physical phone.
         TunTrafficEngine.clearAll()
         val clientAMac = "AA:BB:CC:00:00:01"
         val clientBMac = "AA:BB:CC:00:00:02"
@@ -462,11 +464,10 @@ class ClientManagerTest {
         )
         TunTrafficEngine.updatePolicies(policies, hosts)
 
-        val sampleConntrack =
+        val syntheticConntrack =
             "ipv4     2 tcp      6 431999 ESTABLISHED src=192.168.167.10 dst=142.250.190.46 sport=41000 dport=443 src=142.250.190.46 dst=192.0.2.2 sport=443 dport=41000 [ASSURED] mark=0 use=2"
-        assertTrue(TunTrafficEngine.parseConntrackLine(sampleConntrack))
+        assertTrue(TunTrafficEngine.parseConntrackLine(syntheticConntrack))
 
-        // Verify post-NAT packet for port 41000 resolves to Client A (blocked) and not Client B
         val pkt = buildIpv4TcpPacket(
             srcIp = intArrayOf(192, 0, 2, 2),
             dstIp = intArrayOf(142, 250, 190, 46),
@@ -484,19 +485,24 @@ class ClientManagerTest {
     }
 
     @Test
-    fun `honest EnforcementState never claims verified enforcement on DIRECT_TUN_FALLBACK or before packets match`() {
+    fun `honest EnforcementState never claims verified enforcement on DIRECT_TUN_FALLBACK, stale counters, or post-NAT leak`() {
         val emptySnapshot = TunTrafficEngine.CounterSnapshot(
             mac = "E2:15:CD:54:E4:9B",
             seenPackets = 0L,
             matchedPackets = 0L,
             forwardedPackets = 0L,
             droppedPackets = 0L,
+            blockedDropPackets = 0L,
+            shapingDropPackets = 0L,
             shapedPackets = 0L,
             rxBytes = 0L,
             txBytes = 0L,
             droppedBytes = 0L,
             shapedBytes = 0L,
             policyInstalled = false,
+            policyVersion = 1L,
+            policyVersionBlockedDrops = 0L,
+            unattributedPostNatObserved = false,
         )
 
         // 1. Direct-TUN fallback without kernel netfilter -> ENFORCEMENT_UNAVAILABLE
@@ -523,33 +529,52 @@ class ClientManagerTest {
         )
         assertEquals(EnforcementState.CONFIGURED, configuredState)
 
-        // 3. Multi-client degraded state (userspace active, 0 drops, degraded = true) -> DEGRADED_MULTI_CLIENT
-        val degradedState = HostFirewall.computeClientEnforcementState(
+        // 3. Stale cumulative droppedPackets (1082) with policyVersionBlockedDrops == 0 must NOT report PACKETS_DROPPED
+        val staleCounterState = HostFirewall.computeClientEnforcementState(
             isRestricted = true,
             bandwidthLimitKbps = 0,
-            counters = emptySnapshot.copy(policyInstalled = true),
-            datapathMode = DatapathMode.USERSPACE_PROXY,
-            kernelAvailable = false,
-            isDegradedMultiClient = true,
-        )
-        assertEquals(EnforcementState.DEGRADED_MULTI_CLIENT, degradedState)
-
-        // 4. Userspace proxy active + policy installed + 0 packets -> POLICY_INSTALLED (not yet PACKETS_DROPPED)
-        val installedState = HostFirewall.computeClientEnforcementState(
-            isRestricted = true,
-            bandwidthLimitKbps = 0,
-            counters = emptySnapshot.copy(policyInstalled = true),
+            counters = emptySnapshot.copy(
+                policyInstalled = true,
+                droppedPackets = 1082L,
+                shapingDropPackets = 1082L,
+                policyVersionBlockedDrops = 0L,
+            ),
             datapathMode = DatapathMode.USERSPACE_PROXY,
             kernelAvailable = false,
             isDegradedMultiClient = false,
         )
-        assertEquals(EnforcementState.POLICY_INSTALLED, installedState)
+        assertEquals(EnforcementState.POLICY_INSTALLED, staleCounterState)
 
-        // 5. Userspace proxy active + droppedPackets > 0 -> PACKETS_DROPPED (verified)
+        // 4. Current policy version has drops (41), BUT unattributed post-NAT packets are escaping -> DEGRADED_MULTI_CLIENT
+        val leakWithPartialDropsState = HostFirewall.computeClientEnforcementState(
+            isRestricted = true,
+            bandwidthLimitKbps = 0,
+            counters = emptySnapshot.copy(
+                policyInstalled = true,
+                matchedPackets = 41L,
+                droppedPackets = 41L,
+                blockedDropPackets = 41L,
+                policyVersionBlockedDrops = 41L,
+                unattributedPostNatObserved = true,
+            ),
+            datapathMode = DatapathMode.USERSPACE_PROXY,
+            kernelAvailable = false,
+            isDegradedMultiClient = false,
+        )
+        assertEquals(EnforcementState.DEGRADED_MULTI_CLIENT, leakWithPartialDropsState)
+
+        // 5. Userspace proxy active + policyVersionBlockedDrops > 0 + no post-NAT leak -> PACKETS_DROPPED
         val verifiedDropState = HostFirewall.computeClientEnforcementState(
             isRestricted = true,
             bandwidthLimitKbps = 0,
-            counters = emptySnapshot.copy(policyInstalled = true, matchedPackets = 5L, droppedPackets = 5L),
+            counters = emptySnapshot.copy(
+                policyInstalled = true,
+                matchedPackets = 5L,
+                droppedPackets = 5L,
+                blockedDropPackets = 5L,
+                policyVersionBlockedDrops = 5L,
+                unattributedPostNatObserved = false,
+            ),
             datapathMode = DatapathMode.USERSPACE_PROXY,
             kernelAvailable = false,
             isDegradedMultiClient = false,
@@ -560,12 +585,270 @@ class ClientManagerTest {
         val unrestrictedState = HostFirewall.computeClientEnforcementState(
             isRestricted = false,
             bandwidthLimitKbps = 0,
-            counters = emptySnapshot.copy(droppedPackets = 358L),
+            counters = emptySnapshot.copy(droppedPackets = 358L, policyVersionBlockedDrops = 358L),
             datapathMode = DatapathMode.USERSPACE_PROXY,
             kernelAvailable = false,
             isDegradedMultiClient = false,
         )
         assertEquals(EnforcementState.UNRESTRICTED, unrestrictedState)
+    }
+
+    @Test
+    fun `empty flow cache post-NAT packet leak marks unattributedPostNatObserved and degrades blocked client state`() {
+        TunTrafficEngine.clearAll()
+        val macA = "E2:15:CD:54:E4:9B"
+        val hostA = DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "swlan0")
+        val policyA = TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true, blockReason = "Manual block")
+        TunTrafficEngine.updatePolicies(mapOf(macA to policyA), listOf(hostA))
+
+        // Flow cache is empty (no synthetic conntrack pre-loaded).
+        // Send a post-NAT packet (src=192.0.2.2 -> dst=8.8.8.8) as observed on the user's phone:
+        val postNatDnsPkt = buildIpv4TcpPacket(intArrayOf(192, 0, 2, 2), intArrayOf(8, 8, 8, 8), 55111, 53, 80)
+        val meta = TunTrafficEngine.parsePacketMeta(postNatDnsPkt, postNatDnsPkt.size)!!
+        val matchedMac = TunTrafficEngine.resolveClientMacForPacket(meta, isUpload = true)
+        assertEquals(null, matchedMac)
+
+        val decision = TunTrafficEngine.evaluateAndShape(meta, matchedMac, isUpload = true)
+        // Engine does not globally drop unknown traffic (which would break Client B),
+        // but MUST record postNatUnmatchedPackets and mark the blocked client as unattributedPostNatObserved!
+        assertEquals(PacketDecision.ALLOW, decision)
+        assertTrue(TunTrafficEngine.postNatUnmatchedPackets.get() > 0L)
+
+        val snapA = TunTrafficEngine.getCounterSnapshot(macA)
+        assertTrue(snapA.unattributedPostNatObserved)
+
+        val uiClients = ClientDiscovery.discoverClients(
+            savedRules = listOf(ClientRule(mac = macA, isBlocked = true)),
+            discoveredHosts = listOf(
+                hostA.copy(
+                    droppedPackets = 41L,
+                    blockedDropPackets = 41L,
+                    policyVersionBlockedDrops = 41L,
+                    unattributedPostNatObserved = snapA.unattributedPostNatObserved,
+                ),
+            ),
+            activeClientCount = 1,
+            datapathMode = DatapathMode.USERSPACE_PROXY,
+            firewallBackend = FirewallBackend.USERSPACE,
+            kernelNetfilterAvailable = false,
+        )
+        assertEquals(EnforcementState.DEGRADED_MULTI_CLIENT, uiClients[0].enforcementState)
+        assertTrue(uiClients[0].formattedBlockStatusLabel().contains("degraded"))
+
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `IPv6 link-local multicast control traffic fe80 to ff02_2 is not treated as post-NAT internet leak`() {
+        TunTrafficEngine.clearAll()
+        val macA = "E2:15:CD:54:E4:9B"
+        val hostA = DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "swlan0")
+        val policyA = TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true)
+        TunTrafficEngine.updatePolicies(mapOf(macA to policyA), listOf(hostA))
+
+        // fe80::1234 -> ff02::2 (All Routers multicast)
+        val rsPkt = buildIpv6UdpPacket(
+            srcWords = intArrayOf(0xfe80, 0, 0, 0, 0, 0, 0, 0x1234),
+            dstWords = intArrayOf(0xff02, 0, 0, 0, 0, 0, 0, 0x0002),
+            srcPort = 0,
+            dstPort = 0,
+        )
+        val meta = TunTrafficEngine.parsePacketMeta(rsPkt, rsPkt.size)!!
+        assertTrue(TunTrafficEngine.isLinkLocalMulticastControl(meta))
+
+        val decision = TunTrafficEngine.evaluateAndShape(meta, matchedMac = null, isUpload = true)
+        assertEquals(PacketDecision.ALLOW, decision)
+        assertEquals(1L, TunTrafficEngine.localControlPackets.get())
+        assertEquals(0L, TunTrafficEngine.postNatUnmatchedPackets.get())
+        assertFalse(TunTrafficEngine.getCounterSnapshot(macA).unattributedPostNatObserved)
+
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `flow reuse and purgeFlowsForMac invalidates stale NAT port mapping when client changes or cache is cleared`() {
+        TunTrafficEngine.clearAll()
+        val macA = "AA:BB:CC:00:00:01"
+        val macB = "AA:BB:CC:00:00:02"
+        val hostA = DiscoveredHost(mac = macA, ip = "192.168.167.10", allIps = listOf("192.168.167.10"), interfaceName = "swlan0")
+        val hostB = DiscoveredHost(mac = macB, ip = "192.168.167.20", allIps = listOf("192.168.167.20"), interfaceName = "swlan0")
+        TunTrafficEngine.updatePolicies(
+            mapOf(
+                macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true),
+                macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+            ),
+            listOf(hostA, hostB),
+        )
+
+        // SYNTHETIC conntrack entry attributing port 60000 -> 1.1.1.1:443 to Client A
+        val ctLineA =
+            "ipv4 2 udp 17 30 src=192.168.167.10 dst=1.1.1.1 sport=60000 dport=443 src=1.1.1.1 dst=192.0.2.2 sport=443 dport=60000 mark=0 use=1"
+        assertTrue(TunTrafficEngine.parseConntrackLine(ctLineA))
+        assertEquals(1, TunTrafficEngine.getAttributedFlowCount(macA))
+
+        // Purge Client A flows (e.g. for empty-cache test or reconnect)
+        val removed = TunTrafficEngine.purgeFlowsForMac(macA)
+        assertEquals(1, removed)
+        assertEquals(0, TunTrafficEngine.getAttributedFlowCount(macA))
+
+        // Now Client B reuses NAT port 60000 to 1.1.1.1:443
+        val ctLineB =
+            "ipv4 2 udp 17 30 src=192.168.167.20 dst=1.1.1.1 sport=60000 dport=443 src=1.1.1.1 dst=192.0.2.2 sport=443 dport=60000 mark=0 use=1"
+        assertTrue(TunTrafficEngine.parseConntrackLine(ctLineB))
+        assertEquals(1, TunTrafficEngine.getAttributedFlowCount(macB))
+
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `error classification separates PERMISSION_DENIED, COMMAND_MISSING, FILE_MISSING, and TIMEOUT`() {
+        assertEquals(
+            ProbeErrorKind.PERMISSION_DENIED,
+            HostFirewall.classifyError(
+                exitCode = 4,
+                stdout = "",
+                stderr = "iptables v1.8.7 (nf_tables): can't initialize iptables table `filter': Permission denied (you must be root)",
+                timedOut = false,
+            ),
+        )
+        assertEquals(
+            ProbeErrorKind.PERMISSION_DENIED,
+            HostFirewall.classifyError(
+                exitCode = 2,
+                stdout = "",
+                stderr = "RTNETLINK answers: Operation not permitted",
+                timedOut = false,
+            ),
+        )
+        assertEquals(
+            ProbeErrorKind.COMMAND_MISSING,
+            HostFirewall.classifyError(
+                exitCode = 127,
+                stdout = "",
+                stderr = "/system/bin/sh: nft: inaccessible or not found",
+                timedOut = false,
+            ),
+        )
+        assertEquals(
+            ProbeErrorKind.FILE_MISSING,
+            HostFirewall.classifyError(
+                exitCode = 1,
+                stdout = "",
+                stderr = "cat: /proc/net/nf_conntrack: No such file or directory",
+                timedOut = false,
+            ),
+        )
+        assertEquals(
+            ProbeErrorKind.TIMEOUT,
+            HostFirewall.classifyError(
+                exitCode = -1,
+                stdout = "",
+                stderr = "Command timed out after 2000ms",
+                timedOut = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `iptables chain counter parser sums rule packet counts and diagnostic report serializes cleanly`() {
+        val sampleIptablesOut = """
+            Chain SHIZZI_TEST_1A2B3C (2 references)
+                pkts      bytes target     prot opt in     out     source               destination
+                  18     1420 DROP       0    --  *      *       192.168.167.151      0.0.0.0/0
+                   7      840 DROP       0    --  *      *       0.0.0.0/0            192.168.167.151
+        """.trimIndent()
+        assertEquals(25L, FirewallDiagnosticRunner.parseIptablesChainPacketSum(sampleIptablesOut))
+
+        val report = FirewallDiagnosticReport(
+            testId = "DIAG-TEST01",
+            timestamp = "2026-10-26T18:00:00.000-0700",
+            apkVersion = "0.4.0-rs-lua5",
+            versionCode = 10,
+            sourceCommit = "0b0d7595ffc5605b3582bd639c3f7ff14cbd10e2+lua5",
+            serviceBuildId = 10,
+            device = "samsung SM-S918B",
+            androidApi = 34,
+            androidRelease = "14",
+            vendorBuild = "UP1A.231005.007",
+            tetheringModuleVersion = "com.google.android.tethering:341510000",
+            uid = 2000,
+            pid = 12345,
+            shizukuUid = 2000,
+            shizukuMode = "ADB_SHELL (uid=2000, rootless)",
+            selinuxContext = "u:r:shell:s0",
+            effectiveCapabilitiesHex = "CapEff=0000000000000000 CapPrm=0000000000000000",
+            downstreamInterface = "swlan0",
+            upstreamInterface = "testtun38",
+            datapathMode = "USERSPACE_PROXY",
+            vpnState = "NO_VPN",
+            softApCallbackStatus = "ACTIVE_CLIENTS_2",
+            tetheringCallbackStatus = "ACTIVE_CLIENTS_2",
+            clients = listOf(
+                ClientIdentityRecord(
+                    clientId = "E2:15:CD:54:E4:9B",
+                    currentAddresses = listOf("192.168.167.151"),
+                    ipv4Addresses = listOf("192.168.167.151"),
+                    ipv6Addresses = emptyList(),
+                    downstreamInterface = "swlan0",
+                    mappingSource = "softap_callback+tethering_callback+downstream_neigh",
+                ),
+            ),
+            probes = listOf(
+                ReadOnlyProbeResult(
+                    probeName = "ip_rule_show",
+                    command = "ip rule show",
+                    exitCode = 0,
+                    timedOut = false,
+                    errorKind = ProbeErrorKind.NONE,
+                    boundedStdout = "0: from all lookup local",
+                    boundedStderr = "",
+                ),
+            ),
+            mechanismCapabilities = listOf(
+                MechanismCapability(
+                    mechanism = "policy_routing_ip_rule",
+                    family = "IPv4",
+                    canReadRules = true,
+                    canWriteOwnedRules = false,
+                    selectiveEnforcementObserved = false,
+                    status = FirewallDiagnosticStatus.READ_ONLY,
+                    detail = "canRead=true (ip rule show is read-only); write denied: RTNETLINK answers: Operation not permitted",
+                ),
+            ),
+            conntrackObservations = listOf(
+                TunTrafficEngine.ConntrackPathObservation(
+                    path = "/proc/net/nf_conntrack",
+                    existsObserved = false,
+                    openReadStatus = "FILE_MISSING_OR_HIDDEN",
+                    rawError = "exists=false",
+                    bytesRead = 0,
+                    totalLines = 0,
+                    relevantParsedFlows = 0,
+                    sampleTuples = emptyList(),
+                ),
+            ),
+            conntrackReadStatus = "FILE_MISSING_OR_UNEXPOSED",
+            parsedFlows = 0,
+            attributedFlows = 0,
+            unmatchedDelta = 12L,
+            temporaryRuleTest = TemporaryRuleTestResult(executed = false),
+            validationMatrix = emptyList(),
+            overallStatus = FirewallDiagnosticStatus.ENFORCEMENT_UNAVAILABLE,
+            finalDecision = "INDISPONÍVEL EM ADB_SHELL",
+            factsConfirmed = listOf("ip rule show é apenas leitura"),
+            hypothesesToVerify = listOf("Testar com 2 clientes"),
+        )
+
+        val json = report.toJsonString()
+        val roundtrip = FirewallDiagnosticReport.fromJsonString(json)
+        assertEquals("DIAG-TEST01", roundtrip.testId)
+        assertEquals("0.4.0-rs-lua5", roundtrip.apkVersion)
+        assertEquals(10, roundtrip.serviceBuildId)
+        assertEquals(FirewallDiagnosticStatus.ENFORCEMENT_UNAVAILABLE, roundtrip.overallStatus)
+        assertTrue(roundtrip.mechanismCapabilities[0].canReadRules)
+        assertFalse(roundtrip.mechanismCapabilities[0].canWriteOwnedRules)
+        assertEquals(FirewallDiagnosticStatus.READ_ONLY, roundtrip.mechanismCapabilities[0].status)
+        assertTrue(report.toMarkdownReport().contains("ShizziLuna — Relatório de Capacidade do Firewall por Cliente"))
     }
 
     private fun buildIpv4TcpPacket(
@@ -617,4 +900,5 @@ class ClientManagerTest {
         return buf
     }
 }
+
 

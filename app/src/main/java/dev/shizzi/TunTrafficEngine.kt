@@ -10,8 +10,11 @@ import java.io.File
 import java.io.FileDescriptor
 import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 
@@ -28,16 +31,30 @@ enum class PacketDecision {
     DROP_AQM,
 }
 
+enum class AttributionSource {
+    DIRECT_IP,
+    BPF_NAT,
+    CONNTRACK_PROCFS,
+    UNMATCHED_AMBIGUOUS_OR_STALE,
+    UNMATCHED_UNSUPPORTED_OR_FRAGMENT,
+    UNMATCHED_UNKNOWN,
+}
+
 /**
- * Userspace L3 packet inspection, real-time firewall blocking, calibrated Token Bucket
- * bandwidth shaper, and packet-level diagnostic counter engine interposed on the
- * TestNetwork TUN file descriptor.
+ * Userspace L3 packet inspection, real-time firewall blocking, calibrated non-blocking Token Bucket
+ * bandwidth shaper, experimental BPF NAT flow attribution, and packet-level diagnostic counter engine
+ * interposed on the TestNetwork TUN file descriptor.
  *
- * Bandwidth semantics:
+ * Bandwidth & Pacing Semantics:
  * - [EnforcedClientPolicy.bandwidthLimitKbps] is defined in kilobits per second
  *   (1 Kbps = 1,000 bits/s = 125 bytes/s; 1 Mbps = 1,000 Kbps = 125,000 bytes/s).
- * - Each client receives an independent Download TokenBucket and an independent Upload
- *   TokenBucket at [bandwidthLimitKbps] so download saturation never starves upload TCP ACKs.
+ * - Burst capacity: `max(4500 bytes, 100ms of rate)`.
+ * - Queue bounds per client per direction: max [MAX_QUEUED_PACKETS_PER_CLIENT] packets (32) and
+ *   [MAX_QUEUED_BYTES_PER_CLIENT] bytes (48 KB), with max virtual queue delay `100ms`.
+ * - Shared forwarding threads (`shizzi-tun-upload`, `shizzi-tun-download`) NEVER call `Thread.sleep()`.
+ *   Paced packets are scheduled in bounded per-client queues so shaping Client A never stalls Client B.
+ * - On policy change, queued packets for that client are immediately re-evaluated and dropped if the
+ *   client became blocked.
  */
 object TunTrafficEngine {
 
@@ -53,17 +70,29 @@ object TunTrafficEngine {
     private const val SAMPLE_LOG_INTERVAL_MS = 2_500L
     private const val COUNTER_LOG_INTERVAL_MS = 5_000L
 
+    const val MAX_QUEUED_PACKETS_PER_CLIENT = 32
+    const val MAX_QUEUED_BYTES_PER_CLIENT = 48 * 1024
+    const val DEFAULT_MAX_QUEUE_DELAY_MS = 100L
+
     data class ClientTrafficCounters(
         val mac: String,
         val seenPackets: AtomicLong = AtomicLong(0L),
         val matchedPackets: AtomicLong = AtomicLong(0L),
+        val directAttributedPackets: AtomicLong = AtomicLong(0L),
+        val bpfAttributedPackets: AtomicLong = AtomicLong(0L),
         val forwardedPackets: AtomicLong = AtomicLong(0L),
         val droppedPackets: AtomicLong = AtomicLong(0L),
+        val blockedDropPackets: AtomicLong = AtomicLong(0L),
+        val shapingDropPackets: AtomicLong = AtomicLong(0L),
         val shapedPackets: AtomicLong = AtomicLong(0L),
         val rxBytes: AtomicLong = AtomicLong(0L),
         val txBytes: AtomicLong = AtomicLong(0L),
         val droppedBytes: AtomicLong = AtomicLong(0L),
         val shapedBytes: AtomicLong = AtomicLong(0L),
+        val policyVersion: AtomicLong = AtomicLong(1L),
+        val policyVersionBlockedDrops: AtomicLong = AtomicLong(0L),
+        val policyVersionShapedPackets: AtomicLong = AtomicLong(0L),
+        @Volatile var policyBaselinePostNatUnmatched: Long = 0L,
         @Volatile var lastSeenAt: Long = 0L,
         @Volatile var lastLoggedPackets: Long = -1L,
         @Volatile var lastCounterLogAt: Long = 0L,
@@ -81,6 +110,25 @@ object TunTrafficEngine {
         val droppedBytes: Long,
         val shapedBytes: Long,
         val policyInstalled: Boolean,
+        val blockedDropPackets: Long = droppedPackets,
+        val shapingDropPackets: Long = 0L,
+        val policyVersion: Long = 1L,
+        val policyVersionBlockedDrops: Long = droppedPackets,
+        val unattributedPostNatObserved: Boolean = false,
+        val directAttributedPackets: Long = 0L,
+        val bpfAttributedPackets: Long = 0L,
+        val policyVersionShapedPackets: Long = shapedPackets,
+    )
+
+    data class ConntrackPathObservation(
+        val path: String,
+        val existsObserved: Boolean,
+        val openReadStatus: String,
+        val rawError: String,
+        val bytesRead: Int,
+        val totalLines: Int,
+        val relevantParsedFlows: Int,
+        val sampleTuples: List<String>,
     )
 
     data class EnforcedClientPolicy(
@@ -99,9 +147,23 @@ object TunTrafficEngine {
         val dstPort: Int,
         val length: Int,
         val isSmallControlPacket: Boolean,
+        val isNonInitialFragment: Boolean = false,
+        val isTcpSyn: Boolean = false,
     )
 
-    private data class FlowKey(
+    internal data class PacketAttribution(
+        val mac: String?,
+        val source: AttributionSource,
+    )
+
+    internal data class EvaluationDetail(
+        val decision: PacketDecision,
+        val paceDelayMs: Long = 0L,
+        val policyVersion: Long = 1L,
+    )
+
+    internal data class FlowKey(
+        val version: Int = 4,
         val protocol: Int,
         val natPort: Int,
         val remoteIp: String,
@@ -112,8 +174,7 @@ object TunTrafficEngine {
      * Calibrated Token Bucket shaper for a single direction (Upload or Download) of a client.
      * - Rate: `limitKbps * 125.0` bytes/sec.
      * - Burst capacity: `max(4500 bytes, 100ms of rate)` so TCP initial windows pass cleanly.
-     * - Pacing: sleeps up to [maxPaceWaitMs] for smooth inter-packet spacing; drops excess data
-     *   packets beyond the virtual queue threshold so TCP congestion control converges to the cap.
+     * - Non-blocking: computes the required pacing delay in milliseconds without sleeping.
      */
     internal class TokenBucket(limitKbps: Int) {
         @Volatile
@@ -142,7 +203,7 @@ object TunTrafficEngine {
         /**
          * Returns:
          * - `0L` if packet passes immediately within burst tokens
-         * - `> 0L` (milliseconds to sleep) if packet was shaped/paced
+         * - `> 0L` (milliseconds to pace in per-client queue) if packet was shaped
          * - `-1L` if virtual queue backlog exceeds [maxQueueDelayMs] and packet must be AQM-dropped
          */
         fun consume(
@@ -174,6 +235,62 @@ object TunTrafficEngine {
         }
     }
 
+    /**
+     * Bounded per-client packet queue for non-blocking pacing so shaping Client A never stalls Client B.
+     */
+    internal class QueuedPacedPacket(
+        val mac: String,
+        val isUpload: Boolean,
+        val data: ByteArray,
+        val length: Int,
+        val releaseAtMonoNs: Long,
+        val policyVersionAtEnqueue: Long,
+        val targetFd: FileDescriptor?,
+    )
+
+    internal class ClientPacingQueue(val mac: String) {
+        val packets = ConcurrentLinkedQueue<QueuedPacedPacket>()
+        val queuedCount = AtomicInteger(0)
+        val queuedBytes = AtomicInteger(0)
+
+        fun tryEnqueue(pkt: QueuedPacedPacket): Boolean {
+            while (true) {
+                val curCount = queuedCount.get()
+                val curBytes = queuedBytes.get()
+                if (curCount >= MAX_QUEUED_PACKETS_PER_CLIENT ||
+                    curBytes + pkt.length > MAX_QUEUED_BYTES_PER_CLIENT
+                ) {
+                    return false
+                }
+                if (queuedCount.compareAndSet(curCount, curCount + 1)) {
+                    queuedBytes.addAndGet(pkt.length)
+                    packets.add(pkt)
+                    return true
+                }
+            }
+        }
+
+        fun pollIfDue(nowNs: Long): QueuedPacedPacket? {
+            val head = packets.peek() ?: return null
+            if (head.releaseAtMonoNs > nowNs) return null
+            val removed = packets.poll() ?: return null
+            queuedCount.decrementAndGet()
+            queuedBytes.addAndGet(-removed.length)
+            return removed
+        }
+
+        fun drainAll(): List<QueuedPacedPacket> {
+            val drained = ArrayList<QueuedPacedPacket>()
+            while (true) {
+                val item = packets.poll() ?: break
+                queuedCount.decrementAndGet()
+                queuedBytes.addAndGet(-item.length)
+                drained.add(item)
+            }
+            return drained
+        }
+    }
+
     private val running = AtomicBoolean(false)
 
     @Volatile
@@ -185,6 +302,10 @@ object TunTrafficEngine {
         private set
 
     @Volatile
+    var activeDownstreamName: String = ""
+        private set
+
+    @Volatile
     var fallbackReason: String? = null
         private set
 
@@ -192,6 +313,7 @@ object TunTrafficEngine {
     private var datapathEndPfd: ParcelFileDescriptor? = null
     private var uploadThread: Thread? = null
     private var downloadThread: Thread? = null
+    private var pacingExecutor: ScheduledExecutorService? = null
 
     private val countersByMac = ConcurrentHashMap<String, ClientTrafficCounters>()
     private val ipToMac = ConcurrentHashMap<String, String>()
@@ -204,6 +326,7 @@ object TunTrafficEngine {
 
     private val uploadBucketsByMac = ConcurrentHashMap<String, TokenBucket>()
     private val downloadBucketsByMac = ConcurrentHashMap<String, TokenBucket>()
+    private val pacingQueuesByMac = ConcurrentHashMap<String, ClientPacingQueue>()
 
     private val flowToMacCache = ConcurrentHashMap<FlowKey, String>()
     private val flowTimestamps = ConcurrentHashMap<FlowKey, Long>()
@@ -213,9 +336,39 @@ object TunTrafficEngine {
     val totalUploadPackets = AtomicLong(0L)
     val totalDownloadPackets = AtomicLong(0L)
     val unmatchedPackets = AtomicLong(0L)
+    val postNatUnmatchedPackets = AtomicLong(0L)
+    val unknownForwardedBytes = AtomicLong(0L)
+    val directAttributedPackets = AtomicLong(0L)
+    val bpfAttributedPackets = AtomicLong(0L)
+    val ambiguousOrStaleLookups = AtomicLong(0L)
+    val localControlPackets = AtomicLong(0L)
+    val unsupportedOrFragmentPackets = AtomicLong(0L)
+
+    val bpfAttributor = NatFlowAttributor()
+    val bpfReader = BpfMapReader(attributor = bpfAttributor)
+
+    @Volatile
+    var isExperimentalBpfEnabled: Boolean = false
+        private set
+
+    @Volatile
+    var bpfPollIntervalMs: Long = BpfMapReader.DEFAULT_POLL_INTERVAL_MS
+        private set
 
     @Volatile
     var isConntrackAvailable: Boolean = false
+        private set
+
+    @Volatile
+    var lastConntrackReadStatus: String = "NOT_TESTED"
+        private set
+
+    @Volatile
+    var lastConntrackPollLatencyMs: Long = 0L
+        private set
+
+    @Volatile
+    var lastConntrackParsedFlows: Int = 0
         private set
 
     @Volatile
@@ -223,13 +376,115 @@ object TunTrafficEngine {
         private set
 
     @Volatile
-    private var lastNeighborResolveMs: Long = 0L
-
-    @Volatile
     private var lastConntrackResolveMs: Long = 0L
 
     val isAttached: Boolean
         get() = running.get() && datapathMode == DatapathMode.USERSPACE_PROXY
+
+    fun getVerifiedClientBindingsSnapshot(): Pair<Map<String, String>, Set<String>> {
+        return HashMap(ipToMac) to HashSet(activeConnectedMacs)
+    }
+
+    /**
+     * Configures the experimental BPF NAT flow attribution reader.
+     */
+    @Synchronized
+    fun configureExperimentalBpf(
+        enabled: Boolean,
+        pollIntervalMs: Long = BpfMapReader.DEFAULT_POLL_INTERVAL_MS,
+        downstreamIface: String = activeDownstreamName,
+        upstreamIface: String = activeUpstreamName,
+    ) {
+        isExperimentalBpfEnabled = enabled
+        bpfPollIntervalMs = pollIntervalMs.coerceIn(
+            BpfMapReader.MIN_POLL_INTERVAL_MS,
+            BpfMapReader.MAX_POLL_INTERVAL_MS,
+        )
+        bpfAttributor.syncInterfaces(downstreamIface, upstreamIface)
+        bpfReader.configure(
+            enabled = enabled,
+            intervalMs = bpfPollIntervalMs,
+            sessionActive = running.get() && datapathMode == DatapathMode.USERSPACE_PROXY,
+        )
+    }
+
+    /**
+     * Triggers an immediate on-demand BPF map collection cycle (off the packet path) and returns
+     * the updated [BpfAttributionStatusReport].
+     */
+    fun collectBpfSnapshotNow(): BpfAttributionStatusReport {
+        bpfReader.collectOnce(respectBackoff = false)
+        return getBpfAttributionReport()
+    }
+
+    fun getBpfAttributionReport(): BpfAttributionStatusReport {
+        val snap = bpfAttributor.currentSnapshot()
+        val nowMono = System.nanoTime() / 1_000_000L
+        val ageMs = if (snap.collectedAtMonotonicMs > 0L) {
+            (nowMono - snap.collectedAtMonotonicMs).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val hasRestrictivePolicy = policiesByMac.values.any { it.isBlocked || it.bandwidthLimitKbps > 0 }
+        val isStale = snap.collectedAtMonotonicMs > 0L && ageMs > bpfAttributor.maxFreshnessMs
+
+        val state = when {
+            !isExperimentalBpfEnabled -> ExperimentalBpfState.DISABLED
+            snap.collectionStatus == BpfCollectionStatus.IDLE -> ExperimentalBpfState.COLLECTING
+            snap.collectionStatus != BpfCollectionStatus.OK &&
+                snap.collectionStatus != BpfCollectionStatus.EMPTY_VALID -> ExperimentalBpfState.STALE_OR_UNAVAILABLE
+            isStale -> ExperimentalBpfState.STALE_OR_UNAVAILABLE
+            hasRestrictivePolicy -> ExperimentalBpfState.PARTIAL_ENFORCEMENT
+            else -> ExperimentalBpfState.MAPPINGS_AVAILABLE
+        }
+
+        var totalBlockedDrops = 0L
+        var totalShapeDrops = 0L
+        var totalShapedPkts = 0L
+        for (c in countersByMac.values) {
+            totalBlockedDrops += c.blockedDropPackets.get()
+            totalShapeDrops += c.shapingDropPackets.get()
+            totalShapedPkts += c.shapedPackets.get()
+        }
+
+        return BpfAttributionStatusReport(
+            experimentalEnabled = isExperimentalBpfEnabled,
+            state = state,
+            collectionStatus = snap.collectionStatus,
+            collectionError = snap.collectionError,
+            parserVersion = BpfDumpParser.PARSER_VERSION,
+            pollIntervalMs = bpfPollIntervalMs,
+            snapshotAgeMs = ageMs,
+            lastCollectionDurationMs = snap.collectionDurationMs,
+            sessionGeneration = snap.sessionGeneration,
+            bindingGeneration = snap.bindingGeneration,
+            downstreamIface = snap.downstreamIface.ifBlank { activeDownstreamName },
+            downstreamIfIndex = snap.downstreamIfIndex,
+            upstreamIface = snap.upstreamIface.ifBlank { activeUpstreamName },
+            upstreamIfIndex = snap.upstreamIfIndex,
+            totalUpstreamEntries = snap.totalUpstreamEntries,
+            totalDownstreamEntries = snap.totalDownstreamEntries,
+            reverseMatchedCount = snap.reverseMatchedCount,
+            activeMappedFlows = snap.flowsByTuple.size,
+            ambiguousTupleCount = snap.ambiguousTuples.size,
+            unverifiedOwnerEntries = snap.unverifiedOwnerEntries,
+            rejectedLineCount = snap.rejectedLineCount,
+            coverageIncomplete = snap.coverageIncomplete,
+            perClientCounts = snap.perClientCounts,
+            directAttributedPackets = directAttributedPackets.get(),
+            bpfAttributedPackets = bpfAttributedPackets.get(),
+            unknownForwardedPackets = unmatchedPackets.get(),
+            unknownForwardedBytes = unknownForwardedBytes.get(),
+            ambiguousOrStaleLookups = ambiguousOrStaleLookups.get(),
+            localControlPackets = localControlPackets.get(),
+            unsupportedOrFragmentPackets = unsupportedOrFragmentPackets.get(),
+            blockedDropPackets = totalBlockedDrops,
+            shapingDropPackets = totalShapeDrops,
+            shapedPackets = totalShapedPkts,
+            rejectedOldGenerationCount = bpfAttributor.rejectedOldGenerationCount.get(),
+            tupleReuseGuardTriggeredCount = bpfAttributor.tupleReuseGuardTriggeredCount.get(),
+        )
+    }
 
     /**
      * Attaches the userspace proxy to [realTunPfd] and returns the proxy [ParcelFileDescriptor]
@@ -243,6 +498,10 @@ object TunTrafficEngine {
     ): ParcelFileDescriptor? {
         stop()
         activeUpstreamName = upstreamInterfaceName
+        bpfAttributor.onSessionOrUpstreamChanged(
+            downstreamIface = activeDownstreamName,
+            upstreamIface = upstreamInterfaceName,
+        )
 
         return runCatching {
             val engineSock = FileDescriptor()
@@ -274,6 +533,8 @@ object TunTrafficEngine {
             val tunFd = realTunPfd.fileDescriptor
             val proxyFd = enginePfd.fileDescriptor
 
+            startPacingDispatcher()
+
             uploadThread = Thread(
                 { relayUploadLoop(tunFd, proxyFd, maxOf(mtu + 128, BUFFER_SIZE)) },
                 "shizzi-tun-upload",
@@ -292,8 +553,14 @@ object TunTrafficEngine {
                 start()
             }
 
+            bpfReader.configure(
+                enabled = isExperimentalBpfEnabled,
+                intervalMs = bpfPollIntervalMs,
+                sessionActive = true,
+            )
+
             SessionLog.info(
-                "Datapath: mode=USERSPACE_PROXY attached=true upstream=$upstreamInterfaceName mtu=$mtu",
+                "Datapath: mode=USERSPACE_PROXY attached=true upstream=$upstreamInterfaceName mtu=$mtu bpfExperimental=$isExperimentalBpfEnabled",
             )
             datapathPfd
         }.onFailure { err ->
@@ -323,6 +590,9 @@ object TunTrafficEngine {
 
     private fun stopInternal() {
         running.set(false)
+        bpfReader.stopWorker()
+        stopPacingDispatcher()
+        clearPacingQueues()
         runCatching { engineEndPfd?.close() }
         runCatching { datapathEndPfd?.close() }
         engineEndPfd = null
@@ -335,6 +605,8 @@ object TunTrafficEngine {
     }
 
     fun clearAll() {
+        bpfReader.stopWorker()
+        clearPacingQueues()
         policiesByMac.clear()
         policiesByIp.clear()
         activeConnectedMacs.clear()
@@ -350,7 +622,18 @@ object TunTrafficEngine {
         totalUploadPackets.set(0L)
         totalDownloadPackets.set(0L)
         unmatchedPackets.set(0L)
+        postNatUnmatchedPackets.set(0L)
+        unknownForwardedBytes.set(0L)
+        directAttributedPackets.set(0L)
+        bpfAttributedPackets.set(0L)
+        ambiguousOrStaleLookups.set(0L)
+        localControlPackets.set(0L)
+        unsupportedOrFragmentPackets.set(0L)
+        bpfAttributor.onSessionOrUpstreamChanged("", "")
         isConntrackAvailable = false
+        lastConntrackReadStatus = "NOT_TESTED"
+        lastConntrackPollLatencyMs = 0L
+        lastConntrackParsedFlows = 0
         isMultiClientDegraded = false
     }
 
@@ -358,11 +641,53 @@ object TunTrafficEngine {
         val cleanMac = mac.uppercase().trim()
         countersByMac[cleanMac]?.let { counters ->
             counters.droppedPackets.set(0L)
+            counters.blockedDropPackets.set(0L)
+            counters.shapingDropPackets.set(0L)
             counters.droppedBytes.set(0L)
             counters.matchedPackets.set(0L)
             counters.shapedPackets.set(0L)
             counters.shapedBytes.set(0L)
+            counters.policyVersion.incrementAndGet()
+            counters.policyVersionBlockedDrops.set(0L)
+            counters.policyVersionShapedPackets.set(0L)
+            counters.policyBaselinePostNatUnmatched = postNatUnmatchedPackets.get()
         }
+    }
+
+    fun purgeFlowsForMac(mac: String): Int {
+        val cleanMac = mac.uppercase().trim()
+        var removed = 0
+        for ((flowKey, mappedMac) in flowToMacCache.entries.toList()) {
+            if (mappedMac == cleanMac) {
+                if (flowToMacCache.remove(flowKey, mappedMac)) {
+                    removed++
+                }
+                flowTimestamps.remove(flowKey)
+            }
+        }
+        countersByMac[cleanMac]?.let { counters ->
+            counters.policyVersion.incrementAndGet()
+            counters.policyVersionBlockedDrops.set(0L)
+            counters.policyVersionShapedPackets.set(0L)
+            counters.policyBaselinePostNatUnmatched = postNatUnmatchedPackets.get()
+        }
+        return removed
+    }
+
+    fun clearFlowCache() {
+        flowToMacCache.clear()
+        flowTimestamps.clear()
+    }
+
+    fun getAttributedFlowCount(mac: String? = null): Int {
+        val snap = bpfAttributor.currentSnapshot()
+        if (mac.isNullOrBlank()) {
+            return flowToMacCache.size + snap.flowsByTuple.size
+        }
+        val clean = mac.uppercase().trim()
+        val cacheCount = flowToMacCache.values.count { it == clean }
+        val bpfCount = snap.flowsByTuple.values.count { it.verifiedMac == clean }
+        return cacheCount + bpfCount
     }
 
     /**
@@ -378,7 +703,13 @@ object TunTrafficEngine {
             .filter { it.length == 17 && it != "00:00:00:00:00:00" }
             .toSet()
 
-        // 1. Evict disconnected MACs from active mappings and flow cache
+        val previousConnectedMacs = HashSet(activeConnectedMacs)
+        val previousIpToMac = HashMap(ipToMac)
+
+        // 1. Evict disconnected MACs from active mappings, pacing queues, and flow cache
+        for (disconnectedMac in previousConnectedMacs - currentConnectedMacs) {
+            pacingQueuesByMac.remove(disconnectedMac)?.drainAll()
+        }
         activeConnectedMacs.retainAll(currentConnectedMacs)
         activeConnectedMacs.addAll(currentConnectedMacs)
 
@@ -398,9 +729,13 @@ object TunTrafficEngine {
         }
 
         // 2. Bind verified downstream IPs for each currently connected host
+        var detectedDownstreamIface = activeDownstreamName
         for (host in connectedHosts) {
             val mac = host.mac.uppercase().trim()
             if (mac !in currentConnectedMacs) continue
+            if (host.interfaceName.isNotBlank() && host.interfaceName != "saved rule") {
+                detectedDownstreamIface = host.interfaceName.trim()
+            }
 
             val verifiedIps = LinkedHashSet<String>()
             fun addVerifiedIp(raw: String) {
@@ -417,7 +752,6 @@ object TunTrafficEngine {
             }
 
             val existingSet = macToIps.getOrPut(mac) { ConcurrentHashMap.newKeySet() }
-            // Remove any IP that is no longer verified for this MAC (fixes stale IP leak across reassignments)
             existingSet.removeIf { oldIp ->
                 if (oldIp !in verifiedIps) {
                     ipToMac.remove(oldIp, mac)
@@ -444,6 +778,14 @@ object TunTrafficEngine {
             }
         }
 
+        if (detectedDownstreamIface.isNotBlank() && detectedDownstreamIface != activeDownstreamName) {
+            activeDownstreamName = detectedDownstreamIface
+            bpfAttributor.syncInterfaces(activeDownstreamName, activeUpstreamName)
+        }
+        if (previousConnectedMacs != currentConnectedMacs || previousIpToMac != ipToMac) {
+            bpfAttributor.onClientBindingsUpdated()
+        }
+
         // 3. Rebuild MAC and IP policy tables
         val newMacPolicies = HashMap<String, EnforcedClientPolicy>()
         val newIpPolicies = HashMap<String, EnforcedClientPolicy>()
@@ -454,9 +796,21 @@ object TunTrafficEngine {
             val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
 
             val oldPolicy = policiesByMac[mac]
+            val policyChanged = oldPolicy == null ||
+                oldPolicy.isBlocked != policy.isBlocked ||
+                oldPolicy.bandwidthLimitKbps != policy.bandwidthLimitKbps
+            if (policyChanged) {
+                counters.policyVersion.incrementAndGet()
+                counters.policyVersionBlockedDrops.set(0L)
+                counters.policyVersionShapedPackets.set(0L)
+                counters.policyBaselinePostNatUnmatched = postNatUnmatchedPackets.get()
+                reconcileQueuedPacketsForPolicyChange(mac, policy, counters)
+            }
             if (oldPolicy != null && oldPolicy.isBlocked && !policy.isBlocked) {
                 // Client transitioned from blocked to allowed: reset drop/match counters and purge cached flows
                 counters.droppedPackets.set(0L)
+                counters.blockedDropPackets.set(0L)
+                counters.shapingDropPackets.set(0L)
                 counters.droppedBytes.set(0L)
                 counters.matchedPackets.set(0L)
                 for ((flowKey, mappedMac) in flowToMacCache.entries.toList()) {
@@ -487,6 +841,15 @@ object TunTrafficEngine {
             }
         }
 
+        // For any MAC whose policy was removed entirely, flush its pacing queue immediately
+        for (removedMac in policiesByMac.keys - newMacPolicies.keys) {
+            countersByMac[removedMac]?.let { c ->
+                c.policyVersion.incrementAndGet()
+                c.policyVersionBlockedDrops.set(0L)
+                c.policyVersionShapedPackets.set(0L)
+            }
+        }
+
         policiesByMac.keys.retainAll(newMacPolicies.keys)
         policiesByMac.putAll(newMacPolicies)
 
@@ -509,11 +872,22 @@ object TunTrafficEngine {
 
         // 5. Update degraded multi-client state
         val hasRestricted = newMacPolicies.values.any { it.isBlocked || it.bandwidthLimitKbps > 0 }
-        val degraded = currentConnectedMacs.size > 1 && hasRestricted && !isConntrackAvailable && !HostFirewall.isKernelNetfilterAvailable
+        val bpfHasFreshMappings = isExperimentalBpfEnabled &&
+            bpfAttributor.currentSnapshot().let { snap ->
+                (snap.collectionStatus == BpfCollectionStatus.OK || snap.collectionStatus == BpfCollectionStatus.EMPTY_VALID) &&
+                    ((System.nanoTime() / 1_000_000L) - snap.collectedAtMonotonicMs) <= bpfAttributor.maxFreshnessMs
+            }
+        val degraded = currentConnectedMacs.size > 1 &&
+            hasRestricted &&
+            !isConntrackAvailable &&
+            !HostFirewall.isKernelNetfilterAvailable &&
+            !bpfHasFreshMappings
         if (degraded != isMultiClientDegraded) {
             isMultiClientDegraded = degraded
             if (degraded) {
-                SessionLog.warn("Degraded: multi-client userspace NAT isolation degraded (conntrack and kernel netfilter unavailable)")
+                SessionLog.warn(
+                    "Degraded: multi-client userspace NAT isolation degraded (conntrack, kernel netfilter, and fresh BPF mappings unavailable)",
+                )
             }
         }
 
@@ -529,13 +903,41 @@ object TunTrafficEngine {
                 counters.lastLoggedPackets = totalPkts
                 counters.lastCounterLogAt = now
                 SessionLog.info(
-                    "Counters: mac=$mac seenPackets=${counters.seenPackets.get()} " +
+                    "Counters: mac=$mac policyVer=${counters.policyVersion.get()} seenPackets=${counters.seenPackets.get()} " +
                         "matchedPackets=${counters.matchedPackets.get()} " +
-                        "droppedPackets=${counters.droppedPackets.get()} " +
+                        "directPkts=${counters.directAttributedPackets.get()} " +
+                        "bpfPkts=${counters.bpfAttributedPackets.get()} " +
+                        "blockedDrops=${counters.blockedDropPackets.get()} " +
+                        "shapeDrops=${counters.shapingDropPackets.get()} " +
                         "shapedBytes=${counters.shapedBytes.get()}",
                 )
             }
         }
+    }
+
+    /**
+     * Cancels or re-evaluates queued paced packets when a client's policy changes so queued packets
+     * can never escape using an outdated policy.
+     */
+    private fun reconcileQueuedPacketsForPolicyChange(
+        mac: String,
+        newPolicy: EnforcedClientPolicy,
+        counters: ClientTrafficCounters,
+    ) {
+        val queue = pacingQueuesByMac[mac] ?: return
+        if (newPolicy.isBlocked) {
+            val cancelled = queue.drainAll()
+            for (pkt in cancelled) {
+                counters.droppedPackets.incrementAndGet()
+                counters.blockedDropPackets.incrementAndGet()
+                counters.policyVersionBlockedDrops.incrementAndGet()
+                counters.droppedBytes.addAndGet(pkt.length.toLong())
+            }
+        }
+    }
+
+    fun getQueuedPacketCountForClient(mac: String): Int {
+        return pacingQueuesByMac[mac.uppercase().trim()]?.queuedCount?.get() ?: 0
     }
 
     fun getCounterSnapshot(mac: String): CounterSnapshot {
@@ -555,8 +957,19 @@ object TunTrafficEngine {
                 droppedBytes = 0L,
                 shapedBytes = 0L,
                 policyInstalled = policyInstalled,
+                blockedDropPackets = 0L,
+                shapingDropPackets = 0L,
+                policyVersion = 1L,
+                policyVersionBlockedDrops = 0L,
+                unattributedPostNatObserved = false,
+                directAttributedPackets = 0L,
+                bpfAttributedPackets = 0L,
+                policyVersionShapedPackets = 0L,
             )
         } else {
+            val unattributedSincePolicy =
+                (postNatUnmatchedPackets.get() - c.policyBaselinePostNatUnmatched) > 0L &&
+                    !HostFirewall.isKernelNetfilterAvailable
             CounterSnapshot(
                 mac = cleanMac,
                 seenPackets = c.seenPackets.get(),
@@ -569,6 +982,14 @@ object TunTrafficEngine {
                 droppedBytes = c.droppedBytes.get(),
                 shapedBytes = c.shapedBytes.get(),
                 policyInstalled = policyInstalled,
+                blockedDropPackets = c.blockedDropPackets.get(),
+                shapingDropPackets = c.shapingDropPackets.get(),
+                policyVersion = c.policyVersion.get(),
+                policyVersionBlockedDrops = c.policyVersionBlockedDrops.get(),
+                unattributedPostNatObserved = unattributedSincePolicy,
+                directAttributedPackets = c.directAttributedPackets.get(),
+                bpfAttributedPackets = c.bpfAttributedPackets.get(),
+                policyVersionShapedPackets = c.policyVersionShapedPackets.get(),
             )
         }
     }
@@ -576,6 +997,65 @@ object TunTrafficEngine {
     fun getClientTraffic(mac: String, ips: Collection<String>): Pair<Long, Long> {
         val snapshot = getCounterSnapshot(mac)
         return snapshot.rxBytes to snapshot.txBytes
+    }
+
+    private fun startPacingDispatcher() {
+        stopPacingDispatcher()
+        val exec = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "shizzi-pacing-dispatcher").apply {
+                isDaemon = true
+                priority = Thread.MAX_PRIORITY
+            }
+        }
+        pacingExecutor = exec
+        exec.scheduleWithFixedDelay(
+            { drainDuePacedPackets(System.nanoTime()) },
+            2L,
+            4L,
+            java.util.concurrent.TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun stopPacingDispatcher() {
+        pacingExecutor?.shutdownNow()
+        pacingExecutor = null
+    }
+
+    private fun clearPacingQueues() {
+        for (q in pacingQueuesByMac.values) {
+            q.drainAll()
+        }
+        pacingQueuesByMac.clear()
+    }
+
+    internal fun drainDuePacedPackets(nowNs: Long = System.nanoTime()): Int {
+        var sentCount = 0
+        for ((mac, queue) in pacingQueuesByMac) {
+            while (true) {
+                val pkt = queue.pollIfDue(nowNs) ?: break
+                val currentPolicy = policiesByMac[mac]
+                val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
+                // Re-evaluate current policy before releasing a queued packet
+                if (currentPolicy != null && currentPolicy.isBlocked) {
+                    counters.droppedPackets.incrementAndGet()
+                    counters.blockedDropPackets.incrementAndGet()
+                    counters.policyVersionBlockedDrops.incrementAndGet()
+                    counters.droppedBytes.addAndGet(pkt.length.toLong())
+                    continue
+                }
+                counters.forwardedPackets.incrementAndGet()
+                if (pkt.isUpload) {
+                    counters.txBytes.addAndGet(pkt.length.toLong())
+                } else {
+                    counters.rxBytes.addAndGet(pkt.length.toLong())
+                }
+                pkt.targetFd?.let { fd ->
+                    runCatching { writePacket(fd, pkt.data, pkt.length) }
+                }
+                sentCount++
+            }
+        }
+        return sentCount
     }
 
     private fun relayUploadLoop(tunFd: FileDescriptor, proxyFd: FileDescriptor, bufSize: Int) {
@@ -595,9 +1075,24 @@ object TunTrafficEngine {
                 totalUploadPackets.incrementAndGet()
                 val meta = parsePacketMeta(buf, n)
                 if (meta != null) {
-                    val matchedMac = resolveClientMacForPacket(meta, isUpload = true)
-                    val decision = evaluateAndShape(meta, matchedMac, isUpload = true)
-                    if (decision == PacketDecision.DROP || decision == PacketDecision.DROP_AQM) {
+                    val attr = resolveClientMacWithSource(meta, isUpload = true)
+                    val detail = evaluateAndShapeDetailed(meta, attr.mac, isUpload = true, attributionSource = attr.source)
+                    if (detail.decision == PacketDecision.DROP || detail.decision == PacketDecision.DROP_AQM) {
+                        continue
+                    }
+                    if (detail.decision == PacketDecision.RATE_LIMIT && attr.mac != null && detail.paceDelayMs > 0L) {
+                        val enqueued = enqueuePacedPacket(
+                            mac = attr.mac,
+                            isUpload = true,
+                            buf = buf,
+                            length = n,
+                            paceDelayMs = detail.paceDelayMs,
+                            policyVersion = detail.policyVersion,
+                            targetFd = proxyFd,
+                        )
+                        if (!enqueued) {
+                            recordQueueOverflowDrop(attr.mac, n)
+                        }
                         continue
                     }
                 }
@@ -632,9 +1127,24 @@ object TunTrafficEngine {
                 totalDownloadPackets.incrementAndGet()
                 val meta = parsePacketMeta(buf, n)
                 if (meta != null) {
-                    val matchedMac = resolveClientMacForPacket(meta, isUpload = false)
-                    val decision = evaluateAndShape(meta, matchedMac, isUpload = false)
-                    if (decision == PacketDecision.DROP || decision == PacketDecision.DROP_AQM) {
+                    val attr = resolveClientMacWithSource(meta, isUpload = false)
+                    val detail = evaluateAndShapeDetailed(meta, attr.mac, isUpload = false, attributionSource = attr.source)
+                    if (detail.decision == PacketDecision.DROP || detail.decision == PacketDecision.DROP_AQM) {
+                        continue
+                    }
+                    if (detail.decision == PacketDecision.RATE_LIMIT && attr.mac != null && detail.paceDelayMs > 0L) {
+                        val enqueued = enqueuePacedPacket(
+                            mac = attr.mac,
+                            isUpload = false,
+                            buf = buf,
+                            length = n,
+                            paceDelayMs = detail.paceDelayMs,
+                            policyVersion = detail.policyVersion,
+                            targetFd = tunFd,
+                        )
+                        if (!enqueued) {
+                            recordQueueOverflowDrop(attr.mac, n)
+                        }
                         continue
                     }
                 }
@@ -650,6 +1160,38 @@ object TunTrafficEngine {
                 if (!running.get()) break
             }
         }
+    }
+
+    internal fun enqueuePacedPacket(
+        mac: String,
+        isUpload: Boolean,
+        buf: ByteArray,
+        length: Int,
+        paceDelayMs: Long,
+        policyVersion: Long,
+        targetFd: FileDescriptor?,
+        nowNs: Long = System.nanoTime(),
+    ): Boolean {
+        val cleanMac = mac.uppercase().trim()
+        val queue = pacingQueuesByMac.getOrPut(cleanMac) { ClientPacingQueue(cleanMac) }
+        val copy = buf.copyOfRange(0, length)
+        val pkt = QueuedPacedPacket(
+            mac = cleanMac,
+            isUpload = isUpload,
+            data = copy,
+            length = length,
+            releaseAtMonoNs = nowNs + paceDelayMs * 1_000_000L,
+            policyVersionAtEnqueue = policyVersion,
+            targetFd = targetFd,
+        )
+        return queue.tryEnqueue(pkt)
+    }
+
+    private fun recordQueueOverflowDrop(mac: String, packetLength: Int) {
+        val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
+        counters.droppedPackets.incrementAndGet()
+        counters.shapingDropPackets.incrementAndGet()
+        counters.droppedBytes.addAndGet(packetLength.toLong())
     }
 
     private fun readPacketWithPoll(
@@ -694,16 +1236,21 @@ object TunTrafficEngine {
         }
     }
 
+    internal fun resolveClientMacForPacket(meta: PacketMeta, isUpload: Boolean): String? =
+        resolveClientMacWithSource(meta, isUpload).mac
+
     /**
-     * Resolves which verified connected client MAC owns [meta].
-     *
-     * Handles all three packet representations observed on Android TestNetwork tethering:
-     * 1. Pre-NAT / directly routed IPv4 or IPv6 (`tetherSideIp` is in [ipToMac]).
-     * 2. IPv6 SLAAC / EUI-64 or temporary addresses in `2001:db8::/64` or `fe80::/64`.
-     * 3. Post-NAT MASQUERADE packets where Android Tethering rewrote the client's source IP
-     *    to `192.0.2.2` (on upload) or destination IP to `192.0.2.2` (on download).
+     * Resolves which verified connected client MAC owns [meta] and records the attribution source.
      */
-    internal fun resolveClientMacForPacket(meta: PacketMeta, isUpload: Boolean): String? {
+    internal fun resolveClientMacWithSource(meta: PacketMeta, isUpload: Boolean): PacketAttribution {
+        if (isLinkLocalMulticastControl(meta)) {
+            return PacketAttribution(null, AttributionSource.UNMATCHED_UNKNOWN)
+        }
+        if (meta.isNonInitialFragment) {
+            unsupportedOrFragmentPackets.incrementAndGet()
+            return PacketAttribution(null, AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT)
+        }
+
         val tetherSideIp = if (isUpload) meta.srcIp else meta.dstIp
         val tetherSidePort = if (isUpload) meta.srcPort else meta.dstPort
         val remoteSideIp = if (isUpload) meta.dstIp else meta.srcIp
@@ -713,86 +1260,186 @@ object TunTrafficEngine {
 
         // 1. Direct lookup in verified IP -> MAC table
         ipToMac[tetherSideIp]?.let { mac ->
-            if (mac in activeConnectedMacs) return mac
+            if (mac in activeConnectedMacs) {
+                return PacketAttribution(mac, AttributionSource.DIRECT_IP)
+            }
         }
         if (normalizedTetherIp.isNotEmpty() && normalizedTetherIp != tetherSideIp) {
             ipToMac[normalizedTetherIp]?.let { mac ->
-                if (mac in activeConnectedMacs) return mac
+                if (mac in activeConnectedMacs) {
+                    return PacketAttribution(mac, AttributionSource.DIRECT_IP)
+                }
             }
         }
 
         // 2. Post-NAT MASQUERADE on testtun (`192.0.2.2` or `2001:db8::2`)
         if (tetherSideIp == TUN_LOCAL_V4 || tetherSideIp == TUN_LOCAL_V6 || normalizedTetherIp == TUN_LOCAL_V6_NORMALIZED) {
+            // Non-TCP/UDP protocols on post-NAT cannot be disambiguated by transport ports
+            if (meta.protocol != 6 && meta.protocol != 17) {
+                unsupportedOrFragmentPackets.incrementAndGet()
+                return PacketAttribution(null, AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT)
+            }
+            if (tetherSidePort !in 1..65535 || remoteSidePort !in 1..65535) {
+                unsupportedOrFragmentPackets.incrementAndGet()
+                return PacketAttribution(null, AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT)
+            }
+
+            // 2a. Experimental BPF NAT flow attribution (never caches ALLOW decisions; resolves owner per packet)
+            if (isExperimentalBpfEnabled && meta.version == 4) {
+                val outcome = bpfAttributor.resolveTranslatedPacket(
+                    family = meta.version,
+                    protocol = meta.protocol,
+                    packetSrcIp = meta.srcIp,
+                    packetSrcPort = meta.srcPort,
+                    packetDstIp = meta.dstIp,
+                    packetDstPort = meta.dstPort,
+                    isUpload = isUpload,
+                    isTcpSyn = meta.isTcpSyn,
+                    ipToMac = ipToMac,
+                    activeConnectedMacs = activeConnectedMacs,
+                )
+                when (outcome) {
+                    is AttributionOutcome.Matched -> {
+                        return PacketAttribution(outcome.mac, AttributionSource.BPF_NAT)
+                    }
+                    is AttributionOutcome.Ambiguous,
+                    is AttributionOutcome.StaleSnapshot,
+                    is AttributionOutcome.StaleOrInvalidated,
+                    -> {
+                        ambiguousOrStaleLookups.incrementAndGet()
+                        return PacketAttribution(null, AttributionSource.UNMATCHED_AMBIGUOUS_OR_STALE)
+                    }
+                    AttributionOutcome.Unknown -> {
+                        // Fall through to check procfs conntrack if readable
+                    }
+                }
+            }
+
+            // 2b. Procfs conntrack fallback (when readable on the device)
+            val normalizedRemoteIp = normalizeIp(remoteSideIp).ifEmpty { remoteSideIp }
             val flowKey = FlowKey(
+                version = meta.version,
                 protocol = meta.protocol,
                 natPort = tetherSidePort,
-                remoteIp = remoteSideIp,
+                remoteIp = normalizedRemoteIp,
                 remotePort = remoteSidePort,
             )
 
             flowToMacCache[flowKey]?.let { cachedMac ->
                 if (cachedMac in activeConnectedMacs) {
                     flowTimestamps[flowKey] = System.currentTimeMillis()
-                    return cachedMac
+                    return PacketAttribution(cachedMac, AttributionSource.CONNTRACK_PROCFS)
                 }
                 flowToMacCache.remove(flowKey, cachedMac)
                 flowTimestamps.remove(flowKey)
             }
 
-            // Consult conntrack table for verified connection tracking
             maybeResolveConntrackFlows()
             flowToMacCache[flowKey]?.let { resolvedMac ->
                 if (resolvedMac in activeConnectedMacs) {
                     flowTimestamps[flowKey] = System.currentTimeMillis()
-                    return resolvedMac
+                    return PacketAttribution(resolvedMac, AttributionSource.CONNTRACK_PROCFS)
                 }
             }
-            return null
+            return PacketAttribution(null, AttributionSource.UNMATCHED_UNKNOWN)
         }
 
         // 3. IPv6 SLAAC in testtun prefix (`2001:db8::/64`) or link-local (`fe80::/64`)
         if (meta.version == 6 && (tetherSideIp.lowercase().startsWith(TUN_PREFIX_V6) || tetherSideIp.lowercase().startsWith("fe80:"))) {
-            // 3a. Check if the IPv6 address embeds the client's EUI-64 MAC address
             extractMacFromIpv6Eui64(tetherSideIp)?.let { euiMac ->
                 if (euiMac in activeConnectedMacs) {
                     bindClientIp(euiMac, tetherSideIp)
-                    return euiMac
+                    return PacketAttribution(euiMac, AttributionSource.DIRECT_IP)
                 }
             }
 
-            // 3b. Refresh neighbor cache to see if `ip neigh` now lists this IPv6 address
-            maybeRefreshNeighborCache()
             ipToMac[tetherSideIp]?.let { neighborMac ->
-                if (neighborMac in activeConnectedMacs) return neighborMac
+                if (neighborMac in activeConnectedMacs) {
+                    return PacketAttribution(neighborMac, AttributionSource.DIRECT_IP)
+                }
+            }
+            if (normalizedTetherIp.isNotEmpty()) {
+                ipToMac[normalizedTetherIp]?.let { neighborMac ->
+                    if (neighborMac in activeConnectedMacs) {
+                        return PacketAttribution(neighborMac, AttributionSource.DIRECT_IP)
+                    }
+                }
             }
         }
 
-        // 4. Unmapped private IPv4 address (e.g. DHCP just completed before neighbor poll)
+        // 4. Unmapped private IPv4 address lookup against control-plane neighbor table
         if (meta.version == 4 && isPrivateIpv4(tetherSideIp)) {
-            maybeRefreshNeighborCache()
             ipToMac[tetherSideIp]?.let { neighborMac ->
-                if (neighborMac in activeConnectedMacs) return neighborMac
+                if (neighborMac in activeConnectedMacs) {
+                    return PacketAttribution(neighborMac, AttributionSource.DIRECT_IP)
+                }
             }
         }
 
-        return null
+        return PacketAttribution(null, AttributionSource.UNMATCHED_UNKNOWN)
+    }
+
+    internal fun isLinkLocalMulticastControl(meta: PacketMeta): Boolean {
+        if (meta.version != 6) return false
+        val srcLower = meta.srcIp.lowercase()
+        val dstLower = meta.dstIp.lowercase()
+        return (srcLower.startsWith("fe80:") || srcLower == "::") && dstLower.startsWith("ff02:")
     }
 
     internal fun evaluateAndShape(
         meta: PacketMeta,
         matchedMac: String?,
         isUpload: Boolean,
-    ): PacketDecision {
+        attributionSource: AttributionSource = AttributionSource.DIRECT_IP,
+    ): PacketDecision = evaluateAndShapeDetailed(meta, matchedMac, isUpload, attributionSource).decision
+
+    internal fun evaluateAndShapeDetailed(
+        meta: PacketMeta,
+        matchedMac: String?,
+        isUpload: Boolean,
+        attributionSource: AttributionSource = AttributionSource.DIRECT_IP,
+    ): EvaluationDetail {
+        // Local IPv6 multicast control frames (fe80:: -> ff02::2 RS/RA/MLD) are link-local
+        // control traffic, not internet browsing traffic.
+        if (isLinkLocalMulticastControl(meta)) {
+            localControlPackets.incrementAndGet()
+            return EvaluationDetail(PacketDecision.ALLOW)
+        }
+
         if (matchedMac == null) {
             unmatchedPackets.incrementAndGet()
+            unknownForwardedBytes.addAndGet(meta.length.toLong())
+            val srcNorm = normalizeIp(meta.srcIp)
+            val dstNorm = normalizeIp(meta.dstIp)
+            val isPostNat = meta.srcIp == TUN_LOCAL_V4 ||
+                meta.dstIp == TUN_LOCAL_V4 ||
+                meta.srcIp == TUN_LOCAL_V6 ||
+                meta.dstIp == TUN_LOCAL_V6 ||
+                srcNorm == TUN_LOCAL_V6_NORMALIZED ||
+                dstNorm == TUN_LOCAL_V6_NORMALIZED
+            if (isPostNat) {
+                postNatUnmatchedPackets.incrementAndGet()
+            }
             maybeLogTrafficSample(meta, isUpload, matchedMac = null, decision = PacketDecision.ALLOW)
-            return PacketDecision.ALLOW
+            return EvaluationDetail(PacketDecision.ALLOW)
         }
 
         val counters = countersByMac.getOrPut(matchedMac) { ClientTrafficCounters(matchedMac) }
         counters.lastSeenAt = System.currentTimeMillis()
         counters.seenPackets.incrementAndGet()
+        when (attributionSource) {
+            AttributionSource.BPF_NAT -> {
+                bpfAttributedPackets.incrementAndGet()
+                counters.bpfAttributedPackets.incrementAndGet()
+            }
+            AttributionSource.DIRECT_IP, AttributionSource.CONNTRACK_PROCFS -> {
+                directAttributedPackets.incrementAndGet()
+                counters.directAttributedPackets.incrementAndGet()
+            }
+            else -> {}
+        }
 
+        val currentPolicyVersion = counters.policyVersion.get()
         val policy = policiesByMac[matchedMac]
         if (policy == null || (!policy.isBlocked && policy.bandwidthLimitKbps <= 0)) {
             counters.forwardedPackets.incrementAndGet()
@@ -801,49 +1448,58 @@ object TunTrafficEngine {
             } else {
                 counters.rxBytes.addAndGet(meta.length.toLong())
             }
-            return PacketDecision.ALLOW
+            return EvaluationDetail(PacketDecision.ALLOW, policyVersion = currentPolicyVersion)
         }
 
         counters.matchedPackets.incrementAndGet()
 
-        // 1. Hard block enforcement (manual block, schedule restriction, or connection time limit)
+        // 1. Hard block enforcement (evaluated freshly on every packet; never caches ALLOW)
         if (policy.isBlocked) {
             counters.droppedPackets.incrementAndGet()
+            counters.blockedDropPackets.incrementAndGet()
+            counters.policyVersionBlockedDrops.incrementAndGet()
             counters.droppedBytes.addAndGet(meta.length.toLong())
             maybeLogTrafficSample(meta, isUpload, matchedMac = matchedMac, decision = PacketDecision.DROP)
             maybeLogCountersOnMilestone(counters)
-            return PacketDecision.DROP
+            return EvaluationDetail(PacketDecision.DROP, policyVersion = currentPolicyVersion)
         }
 
-        // 2. Per-direction calibrated Token Bucket bandwidth limiting
+        // 2. Non-blocking per-client calibrated Token Bucket bandwidth limiting
         val limitKbps = policy.bandwidthLimitKbps
         if (limitKbps > 0) {
             val bucketMap = if (isUpload) uploadBucketsByMac else downloadBucketsByMac
             val bucket = bucketMap.getOrPut(matchedMac) { TokenBucket(limitKbps) }
             bucket.updateRate(limitKbps)
 
-            // Keep pacing delay tight when multiple clients are active so one client never delays another
-            val maxQueueDelayMs = if (activeConnectedMacs.size > 1) 35L else 150L
             val waitMs = bucket.consume(
                 packetBytes = meta.length,
                 isSmallControlPacket = meta.isSmallControlPacket,
-                maxQueueDelayMs = maxQueueDelayMs,
+                maxQueueDelayMs = DEFAULT_MAX_QUEUE_DELAY_MS,
             )
 
             if (waitMs < 0L) {
                 counters.droppedPackets.incrementAndGet()
+                counters.shapingDropPackets.incrementAndGet()
                 counters.droppedBytes.addAndGet(meta.length.toLong())
                 counters.shapedPackets.incrementAndGet()
+                counters.policyVersionShapedPackets.incrementAndGet()
                 maybeLogTrafficSample(meta, isUpload, matchedMac = matchedMac, decision = PacketDecision.DROP_AQM)
                 maybeLogCountersOnMilestone(counters)
-                return PacketDecision.DROP_AQM
+                return EvaluationDetail(PacketDecision.DROP_AQM, policyVersion = currentPolicyVersion)
             }
 
             if (waitMs > 0L) {
                 counters.shapedPackets.incrementAndGet()
+                counters.policyVersionShapedPackets.incrementAndGet()
                 counters.shapedBytes.addAndGet(meta.length.toLong())
                 maybeLogTrafficSample(meta, isUpload, matchedMac = matchedMac, decision = PacketDecision.RATE_LIMIT)
-                Thread.sleep(waitMs)
+                maybeLogCountersOnMilestone(counters)
+                // Do NOT sleep on the shared forwarding thread; return paceDelayMs for per-client queue
+                return EvaluationDetail(
+                    decision = PacketDecision.RATE_LIMIT,
+                    paceDelayMs = waitMs,
+                    policyVersion = currentPolicyVersion,
+                )
             } else {
                 counters.shapedBytes.addAndGet(meta.length.toLong())
             }
@@ -856,7 +1512,7 @@ object TunTrafficEngine {
             counters.rxBytes.addAndGet(meta.length.toLong())
         }
         maybeLogCountersOnMilestone(counters)
-        return PacketDecision.ALLOW
+        return EvaluationDetail(PacketDecision.ALLOW, policyVersion = currentPolicyVersion)
     }
 
     private fun maybeLogTrafficSample(
@@ -891,9 +1547,12 @@ object TunTrafficEngine {
             counters.lastLoggedPackets = seen
             counters.lastCounterLogAt = now
             SessionLog.info(
-                "Counters: mac=${counters.mac} seenPackets=$seen " +
+                "Counters: mac=${counters.mac} policyVer=${counters.policyVersion.get()} seenPackets=$seen " +
                     "matchedPackets=${counters.matchedPackets.get()} " +
-                    "droppedPackets=${counters.droppedPackets.get()} " +
+                    "directPkts=${counters.directAttributedPackets.get()} " +
+                    "bpfPkts=${counters.bpfAttributedPackets.get()} " +
+                    "blockedDrops=${counters.blockedDropPackets.get()} " +
+                    "shapeDrops=${counters.shapingDropPackets.get()} " +
                     "shapedBytes=${counters.shapedBytes.get()}",
             )
         }
@@ -959,98 +1618,136 @@ object TunTrafficEngine {
         }.getOrNull()
     }
 
-    private fun maybeRefreshNeighborCache() {
-        val now = System.currentTimeMillis()
-        if (now - lastNeighborResolveMs < 1_000L) return
-        lastNeighborResolveMs = now
+    val CONNTRACK_PATHS = listOf(
+        "/proc/net/nf_conntrack",
+        "/proc/self/net/nf_conntrack",
+        "/proc/net/ip_conntrack",
+        "/proc/self/net/ip_conntrack",
+    )
 
-        runCatching {
-            val process = ProcessBuilder("ip", "neigh").start()
-            val output = process.inputStream.bufferedReader().use { it.readText() }
-            if (!process.waitFor(1, TimeUnit.SECONDS)) {
-                process.destroyForcibly()
-            }
-            for (record in DownstreamInspector.parseIpNeighOutput(output)) {
-                val mac = record.mac.uppercase()
-                if (mac in activeConnectedMacs && isUsableClientIp(record.ip)) {
-                    bindClientIp(mac, record.ip)
+    /**
+     * Directly inspects all candidate conntrack procfs paths inside the current process
+     * without spawning shell subprocesses or requesting `su`.
+     */
+    fun inspectConntrackPaths(maxBytesPerFile: Int = 65_536): List<ConntrackPathObservation> {
+        val observations = ArrayList<ConntrackPathObservation>(CONNTRACK_PATHS.size)
+        val startNs = System.nanoTime()
+        var anyReadable = false
+        var totalRelevantFlows = 0
+        var primaryStatus = "UNAVAILABLE"
+
+        for (path in CONNTRACK_PATHS) {
+            val file = File(path)
+            val exists = runCatching { file.exists() }.getOrDefault(false)
+            var status = "FILE_MISSING"
+            var rawErr = ""
+            var bytesRead = 0
+            var totalLines = 0
+            var relevantFlows = 0
+            val samples = mutableListOf<String>()
+
+            try {
+                file.inputStream().use { input ->
+                    val buffer = ByteArray(maxBytesPerFile)
+                    var offset = 0
+                    while (offset < maxBytesPerFile) {
+                        val n = input.read(buffer, offset, maxBytesPerFile - offset)
+                        if (n <= 0) break
+                        offset += n
+                    }
+                    bytesRead = offset
+                    val content = String(buffer, 0, offset, Charsets.UTF_8)
+                    val lines = if (content.isBlank()) emptyList() else content.lines().filter { it.isNotBlank() }
+                    totalLines = lines.size
+                    for (line in lines) {
+                        if (parseConntrackLine(line)) {
+                            relevantFlows++
+                            if (samples.size < 5) {
+                                samples.add(sanitizeConntrackTupleSummary(line))
+                            }
+                        }
+                    }
+                    status = if (bytesRead > 0) "READ_OK" else "EMPTY"
+                    anyReadable = true
+                    totalRelevantFlows += relevantFlows
+                    if (primaryStatus == "UNAVAILABLE" || status == "READ_OK") {
+                        primaryStatus = status
+                    }
+                }
+            } catch (e: Throwable) {
+                rawErr = "${e.javaClass.simpleName}: ${e.message ?: "unknown error"}"
+                val msg = rawErr.lowercase()
+                status = when {
+                    msg.contains("eacces") || msg.contains("eperm") || msg.contains("permission denied") || msg.contains("operation not permitted") ->
+                        "PERMISSION_DENIED"
+                    msg.contains("enoent") || msg.contains("no such file") ->
+                        "FILE_MISSING"
+                    else -> "IO_ERROR"
+                }
+                if (primaryStatus == "UNAVAILABLE") {
+                    primaryStatus = status
                 }
             }
+
+            observations.add(
+                ConntrackPathObservation(
+                    path = path,
+                    existsObserved = exists,
+                    openReadStatus = status,
+                    rawError = rawErr,
+                    bytesRead = bytesRead,
+                    totalLines = totalLines,
+                    relevantParsedFlows = relevantFlows,
+                    sampleTuples = samples,
+                ),
+            )
+        }
+
+        lastConntrackPollLatencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
+        lastConntrackReadStatus = primaryStatus
+        lastConntrackParsedFlows = totalRelevantFlows
+        isConntrackAvailable = anyReadable && totalRelevantFlows > 0
+        if (isConntrackAvailable) {
+            isMultiClientDegraded = false
+        }
+        return observations
+    }
+
+    private fun sanitizeConntrackTupleSummary(line: String): String {
+        val srcs = CONNTRACK_SRC_REGEX.findAll(line).map { it.groupValues[1] }.toList()
+        val dsts = CONNTRACK_DST_REGEX.findAll(line).map { it.groupValues[1] }.toList()
+        val sports = CONNTRACK_SPORT_REGEX.findAll(line).map { it.groupValues[1] }.toList()
+        val dports = CONNTRACK_DPORT_REGEX.findAll(line).map { it.groupValues[1] }.toList()
+        val proto = when {
+            line.contains("tcp") -> "tcp"
+            line.contains("udp") -> "udp"
+            line.contains("icmp") -> "icmp"
+            else -> "other"
+        }
+        return if (srcs.size >= 2 && dsts.size >= 2 && sports.size >= 2 && dports.size >= 2) {
+            "$proto orig=${srcs[0]}:${sports[0]}->${dsts[0]}:${dports[0]} reply=${srcs[1]}:${sports[1]}->${dsts[1]}:${dports[1]}"
+        } else {
+            line.take(120)
         }
     }
 
     /**
-     * Parses `/proc/net/nf_conntrack`, `/proc/self/net/nf_conntrack`, or runs shell cat
-     * to attribute post-NAT `192.0.2.2:natPort` flows to the exact downstream client IP/MAC.
+     * Reads procfs conntrack directly in-process (never spawns shell subprocesses on packet threads).
      */
     private fun maybeResolveConntrackFlows() {
         val now = System.currentTimeMillis()
         if (now - lastConntrackResolveMs < 500L) return
         lastConntrackResolveMs = now
-
-        var flowsParsed = 0
-        val conntrackPaths = listOf(
-            "/proc/net/nf_conntrack",
-            "/proc/self/net/nf_conntrack",
-            "/proc/net/ip_conntrack",
-            "/proc/self/net/ip_conntrack",
-        )
-
-        for (path in conntrackPaths) {
-            val file = File(path)
-            if (!file.exists()) continue
-            runCatching {
-                file.bufferedReader().useLines { lines ->
-                    lines.forEach { line ->
-                        if (parseConntrackLine(line)) {
-                            flowsParsed++
-                        }
-                    }
-                }
-            }
-            if (flowsParsed > 0) break
-        }
-
-        if (flowsParsed == 0) {
-            // Try reading via process cat
-            runCatching {
-                val p = ProcessBuilder("cat", "/proc/net/nf_conntrack").start()
-                val text = p.inputStream.bufferedReader().use { it.readText() }
-                p.waitFor(500, TimeUnit.MILLISECONDS)
-                if (text.isNotBlank()) {
-                    text.lines().forEach { line ->
-                        if (parseConntrackLine(line)) {
-                            flowsParsed++
-                        }
-                    }
-                }
-            }
-        }
-
-        if (flowsParsed == 0 && HostFirewall.isSuAvailable) {
-            runCatching {
-                val res = HostFirewall.executePrivilegedCommand("cat", "/proc/net/nf_conntrack")
-                if (res.isSuccess && res.stdout.isNotBlank()) {
-                    res.stdout.lines().forEach { line ->
-                        if (parseConntrackLine(line)) {
-                            flowsParsed++
-                        }
-                    }
-                }
-            }
-        }
-
-        isConntrackAvailable = flowsParsed > 0
-        if (flowsParsed > 0) {
-            isMultiClientDegraded = false
-        }
+        inspectConntrackPaths(maxBytesPerFile = 32_768)
     }
 
     internal fun parseConntrackLine(line: String): Boolean {
-        if (!line.contains(TUN_LOCAL_V4) && !line.contains(TUN_LOCAL_V6)) return false
+        if (!line.contains(TUN_LOCAL_V4) && !line.contains(TUN_LOCAL_V6) && !line.contains(TUN_LOCAL_V6_NORMALIZED)) return false
         val proto = when {
             line.contains("tcp") -> 6
             line.contains("udp") -> 17
+            line.contains("icmpv6") -> 58
+            line.contains("icmp") -> 1
             else -> return false
         }
         val srcs = CONNTRACK_SRC_REGEX.findAll(line).map { it.groupValues[1] }.toList()
@@ -1070,10 +1767,13 @@ object TunTrafficEngine {
                 val origSrcNorm = normalizeIp(origSrcIp)
                 val mac = ipToMac[origSrcIp] ?: (if (origSrcNorm.isNotEmpty()) ipToMac[origSrcNorm] else null) ?: return false
                 if (mac in activeConnectedMacs) {
+                    val ver = if (origSrcIp.contains(':') || line.trimStart().startsWith("ipv6")) 6 else 4
+                    val normalizedRemoteIp = normalizeIp(origDstIp).ifEmpty { origDstIp }
                     val key = FlowKey(
+                        version = ver,
                         protocol = proto,
                         natPort = replyDstPort,
-                        remoteIp = origDstIp,
+                        remoteIp = normalizedRemoteIp,
                         remotePort = origDstPort,
                     )
                     flowToMacCache[key] = mac
@@ -1092,15 +1792,24 @@ object TunTrafficEngine {
             4 -> {
                 val ihl = (packet[0].toInt() and 0x0F) * 4
                 if (ihl < 20 || length < ihl) return null
+                val flagsAndFragOffset = ((packet[6].toInt() and 0xFF) shl 8) or (packet[7].toInt() and 0xFF)
+                val fragOffset = flagsAndFragOffset and 0x1FFF
+                val isNonInitialFrag = fragOffset != 0
+
                 val proto = packet[9].toInt() and 0xFF
                 val srcIp = "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
                 val dstIp = "${packet[16].toInt() and 0xFF}.${packet[17].toInt() and 0xFF}.${packet[18].toInt() and 0xFF}.${packet[19].toInt() and 0xFF}"
 
                 var srcPort = 0
                 var dstPort = 0
-                if ((proto == 6 || proto == 17) && length >= ihl + 4) {
+                var isTcpSyn = false
+                if (!isNonInitialFrag && (proto == 6 || proto == 17) && length >= ihl + 4) {
                     srcPort = ((packet[ihl].toInt() and 0xFF) shl 8) or (packet[ihl + 1].toInt() and 0xFF)
                     dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or (packet[ihl + 3].toInt() and 0xFF)
+                    if (proto == 6 && length >= ihl + 14) {
+                        val tcpFlags = packet[ihl + 13].toInt() and 0xFF
+                        isTcpSyn = (tcpFlags and 0x12) == 0x02 // SYN=1, ACK=0
+                    }
                 }
                 val isControl = (proto == 6 && length <= ihl + 32) || srcPort == 53 || dstPort == 53 || proto == 1
                 PacketMeta(
@@ -1112,6 +1821,8 @@ object TunTrafficEngine {
                     dstPort = dstPort,
                     length = length,
                     isSmallControlPacket = isControl,
+                    isNonInitialFragment = isNonInitialFrag,
+                    isTcpSyn = isTcpSyn,
                 )
             }
             6 -> {
@@ -1123,22 +1834,42 @@ object TunTrafficEngine {
                 val dstIp = runCatching { InetAddress.getByAddress(dstBytes).hostAddress.orEmpty() }.getOrDefault("")
                 if (srcIp.isEmpty() || dstIp.isEmpty()) return null
 
+                var isNonInitialFrag = false
+                var effectiveHeader = nextHeader
+                var transportOffset = 40
+                if (nextHeader == 44) { // IPv6 Fragment Header
+                    if (length < 48) return null
+                    effectiveHeader = packet[40].toInt() and 0xFF
+                    val fragOffAndFlags = ((packet[42].toInt() and 0xFF) shl 8) or (packet[43].toInt() and 0xFF)
+                    val fragOffset = (fragOffAndFlags ushr 3) and 0x1FFF
+                    isNonInitialFrag = fragOffset != 0
+                    transportOffset = 48
+                }
+
                 var srcPort = 0
                 var dstPort = 0
-                if ((nextHeader == 6 || nextHeader == 17) && length >= 44) {
-                    srcPort = ((packet[40].toInt() and 0xFF) shl 8) or (packet[41].toInt() and 0xFF)
-                    dstPort = ((packet[42].toInt() and 0xFF) shl 8) or (packet[43].toInt() and 0xFF)
+                var isTcpSyn = false
+                if (!isNonInitialFrag && (effectiveHeader == 6 || effectiveHeader == 17) && length >= transportOffset + 4) {
+                    srcPort = ((packet[transportOffset].toInt() and 0xFF) shl 8) or (packet[transportOffset + 1].toInt() and 0xFF)
+                    dstPort = ((packet[transportOffset + 2].toInt() and 0xFF) shl 8) or (packet[transportOffset + 3].toInt() and 0xFF)
+                    if (effectiveHeader == 6 && length >= transportOffset + 14) {
+                        val tcpFlags = packet[transportOffset + 13].toInt() and 0xFF
+                        isTcpSyn = (tcpFlags and 0x12) == 0x02
+                    }
                 }
-                val isControl = (nextHeader == 6 && length <= 72) || srcPort == 53 || dstPort == 53 || nextHeader == 58
+                val isControl = (effectiveHeader == 6 && length <= transportOffset + 32) ||
+                    srcPort == 53 || dstPort == 53 || effectiveHeader == 58
                 PacketMeta(
                     version = 6,
-                    protocol = nextHeader,
+                    protocol = effectiveHeader,
                     srcIp = srcIp,
                     dstIp = dstIp,
                     srcPort = srcPort,
                     dstPort = dstPort,
                     length = length,
                     isSmallControlPacket = isControl,
+                    isNonInitialFragment = isNonInitialFrag,
+                    isTcpSyn = isTcpSyn,
                 )
             }
             else -> null

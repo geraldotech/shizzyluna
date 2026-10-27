@@ -6,8 +6,12 @@ import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import dev.shizzi.ui.AutomationActions
+import dev.shizzi.ui.AutomationState
 import dev.shizzi.ui.DiagnosticsToast
 import dev.shizzi.ui.EasterEggPage
+import dev.shizzi.ui.FirewallDiagnosticActions
+import dev.shizzi.ui.FirewallDiagnosticPage
 import dev.shizzi.ui.HandleBack
 import dev.shizzi.ui.HomeActions
 import dev.shizzi.ui.HomePage
@@ -15,14 +19,12 @@ import dev.shizzi.ui.LogActions
 import dev.shizzi.ui.LogPage
 import dev.shizzi.ui.Screen
 import dev.shizzi.ui.ScreenHost
-import dev.shizzi.ui.ToastState
 import dev.shizzi.ui.SessionToasts
-import dev.shizzi.ui.AutomationActions
-import dev.shizzi.ui.AutomationState
 import dev.shizzi.ui.SettingsActions
 import dev.shizzi.ui.SettingsPage
 import dev.shizzi.ui.SettingsState
 import dev.shizzi.ui.ToastHost
+import dev.shizzi.ui.ToastState
 import dev.shizzi.ui.rememberLogEntries
 import dev.shizzi.ui.rememberNavigator
 import dev.shizzi.ui.rememberToastState
@@ -55,8 +57,13 @@ data class AppActions(
     val onSaveClientRule: (ClientRule) -> Unit,
     val onRemoveClientRule: (String) -> Unit,
     val onRefreshClients: () -> Unit,
+    val onRunFirewallReadOnlyProbes: () -> Unit = {},
+    val onRunFirewallClientPoc: (String, String, Int) -> Unit = { _, _, _ -> },
+    val onCleanupFirewallRules: () -> Unit = {},
+    val onSetExperimentalBpfEnabled: (Boolean) -> Unit = {},
+    val onSetBpfPollIntervalMs: (Int) -> Unit = {},
+    val onCollectBpfSnapshotNow: () -> Unit = {},
 )
-
 
 /** Routes the navigator's current screen and hosts the toast overlay. */
 @Composable
@@ -67,6 +74,7 @@ fun HomeScreen(state: AppState, actions: AppActions) {
     val goBack = {
         current.value = when (current.value) {
             Screen.LOG -> Screen.SETTINGS
+            Screen.FIREWALL_DIAGNOSTIC -> Screen.CLIENTS
             Screen.CLIENTS -> Screen.HOME
             else -> Screen.HOME
         }
@@ -123,6 +131,7 @@ private fun ScreenBody(screen: Screen, context: ScreenContext) {
         Screen.SETTINGS -> SettingsRoute(context)
         Screen.CLIENTS -> ClientsRoute(context)
         Screen.LOG -> LogRoute(context)
+        Screen.FIREWALL_DIAGNOSTIC -> FirewallDiagnosticRoute(context)
         Screen.EASTER_EGG -> EasterEggPage(onDismiss = context.navigation.goHome)
     }
 }
@@ -152,13 +161,40 @@ private fun ClientsRoute(context: ScreenContext) {
         clients = context.state.clients,
         savedRules = context.state.settings.clientRules,
         sessionState = context.state.session,
+        experimentalBpfEnabled = context.state.settings.experimentalBpfEnabled,
+        bpfPollIntervalMs = context.state.settings.bpfPollIntervalMs,
         actions = dev.shizzi.ui.ClientActions(
             onToggleBlock = actions.onToggleBlockClient,
             onSaveRule = actions.onSaveClientRule,
             onRemoveRule = actions.onRemoveClientRule,
             onRefresh = actions.onRefreshClients,
+            onOpenFirewallDiagnostic = { navigation.open(Screen.FIREWALL_DIAGNOSTIC) },
+            onSetExperimentalBpfEnabled = actions.onSetExperimentalBpfEnabled,
+            onCollectBpfSnapshotNow = actions.onCollectBpfSnapshotNow,
         ),
         onBack = navigation.goBack,
+    )
+}
+
+@Composable
+private fun FirewallDiagnosticRoute(context: ScreenContext) {
+    val actions = context.actions
+    FirewallDiagnosticPage(
+        diagState = context.state.firewallDiag,
+        connectedClients = context.state.clients,
+        sessionBpfReport = context.state.session.bpfAttribution,
+        experimentalBpfEnabled = context.state.settings.experimentalBpfEnabled,
+        bpfPollIntervalMs = context.state.settings.bpfPollIntervalMs,
+        actions = FirewallDiagnosticActions(
+            onRunReadOnlyProbes = actions.onRunFirewallReadOnlyProbes,
+            onRunTemporaryClientPoc = actions.onRunFirewallClientPoc,
+            onCleanupOrphanRules = actions.onCleanupFirewallRules,
+            onSetExperimentalBpfEnabled = actions.onSetExperimentalBpfEnabled,
+            onSetBpfPollIntervalMs = actions.onSetBpfPollIntervalMs,
+            onCollectBpfSnapshotNow = actions.onCollectBpfSnapshotNow,
+        ),
+        toasts = context.toasts,
+        onBack = context.navigation.goBack,
     )
 }
 
@@ -190,6 +226,7 @@ private fun settingsState(state: AppState): SettingsState {
             token = settings.automationToken,
         ),
         dnsSettings = settings.dnsSettings,
+        experimentalBpfEnabled = settings.experimentalBpfEnabled,
     )
 }
 
@@ -207,6 +244,8 @@ private fun settingsActions(context: ScreenContext): SettingsActions {
         onSetCustomDns = actions.onSetCustomDns,
         onOpenClients = { context.navigation.open(Screen.CLIENTS) },
         onOpenLog = { context.navigation.open(Screen.LOG) },
+        onOpenFirewallDiagnostic = { context.navigation.open(Screen.FIREWALL_DIAGNOSTIC) },
+        onSetExperimentalBpfEnabled = actions.onSetExperimentalBpfEnabled,
         onRunProbes = actions.onRunProbes,
         onGrantPermission = actions.onGrantPermission,
         onShizukuAction = actions.onShizukuAction,
@@ -230,10 +269,7 @@ private fun LogRoute(context: ScreenContext) {
         actions = LogActions(
             onClear = actions.onClearLog,
             onEnableLogging = { actions.onSetLogging(true) },
-            onStartSession = {
-                navigation.goHome()
-                actions.onToggle()
-            },
+            onStartSession = actions.onToggle,
             onBack = navigation.goBack,
         ),
     )

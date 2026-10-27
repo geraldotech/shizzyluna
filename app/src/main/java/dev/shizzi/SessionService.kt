@@ -102,6 +102,12 @@ class SessionService : Service() {
             announceOutcome()
 
             if (internalState.value.status == UiStatus.CONNECTED) {
+                runCatching {
+                    controller.setExperimentalBpfConfig(
+                        settings.experimentalBpfEnabled,
+                        settings.bpfPollIntervalMs,
+                    )
+                }
                 val rulesJson = ClientRule.serializeList(settings.clientRules)
                 runCatching { controller.updateRules(rulesJson) }
             }
@@ -115,6 +121,17 @@ class SessionService : Service() {
             val rulesJson = ClientRule.serializeList(rules)
             sessionLock.withLock {
                 runCatching { controller.updateRules(rulesJson) }
+            }
+        }
+    }
+
+    fun applyExperimentalBpfConfig(enabled: Boolean, pollIntervalMs: Int) {
+        scope.launch {
+            sessionLock.withLock {
+                runCatching {
+                    val report = controller.setExperimentalBpfConfig(enabled, pollIntervalMs)
+                    internalState.update { it.copy(bpfAttribution = report) }
+                }
             }
         }
     }
@@ -249,6 +266,10 @@ class SessionService : Service() {
 
         fun updateRules(rules: List<ClientRule>) {
             liveService?.applyRules(rules)
+        }
+
+        fun updateExperimentalBpfConfig(enabled: Boolean, pollIntervalMs: Int) {
+            liveService?.applyExperimentalBpfConfig(enabled, pollIntervalMs)
         }
 
         private fun Intent.reporting(command: AutomationCommand?): Intent = when (command) {

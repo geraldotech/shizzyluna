@@ -51,6 +51,9 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private val localClients = MutableStateFlow<List<ConnectedClient>>(emptyList())
     val clientsState: StateFlow<List<ConnectedClient>> = localClients.asStateFlow()
 
+    private val localFirewallDiag = MutableStateFlow(FirewallDiagnosticUiState())
+    val firewallDiagState: StateFlow<FirewallDiagnosticUiState> = localFirewallDiag.asStateFlow()
+
     private var sessionCollector: Job? = null
     private var clientsCollector: Job? = null
     private var settingsCollector: Job? = null
@@ -182,6 +185,59 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun setExperimentalBpfEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.setExperimentalBpfEnabled(enabled)
+            val interval = settings.value?.bpfPollIntervalMs ?: 1000
+            SessionService.updateExperimentalBpfConfig(enabled, interval)
+            runCatching {
+                val report = diagnostics.setExperimentalBpfConfig(enabled, interval)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun setBpfPollIntervalMs(intervalMs: Int) {
+        viewModelScope.launch {
+            val clamped = intervalMs.coerceIn(500, 5000)
+            settingsStore.setBpfPollIntervalMs(clamped)
+            val enabled = settings.value?.experimentalBpfEnabled ?: false
+            SessionService.updateExperimentalBpfConfig(enabled, clamped)
+            runCatching {
+                val report = diagnostics.setExperimentalBpfConfig(enabled, clamped)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }
+        }
+    }
+
+    fun collectBpfSnapshotNow() {
+        if (localFirewallDiag.value.isCollectingBpf) return
+        localFirewallDiag.update { it.copy(isCollectingBpf = true, error = "") }
+        viewModelScope.launch {
+            runCatching { diagnostics.collectBpfSnapshotNow() }
+                .fold(
+                    onSuccess = { report ->
+                        localState.update { it.copy(bpfAttribution = report) }
+                        localFirewallDiag.update {
+                            it.copy(isCollectingBpf = false, bpfReport = report, error = "")
+                        }
+                    },
+                    onFailure = { err ->
+                        localFirewallDiag.update {
+                            it.copy(
+                                isCollectingBpf = false,
+                                error = "${err.javaClass.simpleName}: ${err.message}",
+                            )
+                        }
+                    },
+                )
+            refreshClients()
+        }
+    }
+
     fun saveClientRule(rule: ClientRule) {
         viewModelScope.launch {
             settingsStore.saveClientRule(rule)
@@ -274,6 +330,69 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun runFirewallReadOnlyProbes() {
+        if (localFirewallDiag.value.isRunningProbes || localFirewallDiag.value.isRunningClientPoc) return
+        localFirewallDiag.update { it.copy(isRunningProbes = true, error = "") }
+        viewModelScope.launch {
+            runCatching { diagnostics.runFirewallDiagnostics() }
+                .fold(
+                    onSuccess = { report ->
+                        localFirewallDiag.update {
+                            it.copy(isRunningProbes = false, report = report, error = "")
+                        }
+                    },
+                    onFailure = { err ->
+                        localFirewallDiag.update {
+                            it.copy(
+                                isRunningProbes = false,
+                                error = "${err.javaClass.simpleName}: ${err.message}",
+                            )
+                        }
+                    },
+                )
+            refreshShizukuState()
+            refreshClients()
+        }
+    }
+
+    fun runFirewallClientPoc(clientAMac: String, clientBMac: String, durationSec: Int = 5) {
+        if (localFirewallDiag.value.isRunningProbes || localFirewallDiag.value.isRunningClientPoc) return
+        localFirewallDiag.update { it.copy(isRunningClientPoc = true, error = "") }
+        viewModelScope.launch {
+            runCatching { diagnostics.runFirewallClientPoc(clientAMac, clientBMac, durationSec) }
+                .fold(
+                    onSuccess = { report ->
+                        localFirewallDiag.update {
+                            it.copy(
+                                isRunningClientPoc = false,
+                                report = report,
+                                lastCleanupResult = report.temporaryRuleTest.cleanupStatus,
+                                error = "",
+                            )
+                        }
+                    },
+                    onFailure = { err ->
+                        localFirewallDiag.update {
+                            it.copy(
+                                isRunningClientPoc = false,
+                                error = "${err.javaClass.simpleName}: ${err.message}",
+                            )
+                        }
+                    },
+                )
+            refreshShizukuState()
+            refreshClients()
+        }
+    }
+
+    fun cleanupFirewallTestRules() {
+        viewModelScope.launch {
+            val res = runCatching { diagnostics.cleanupFirewallTestRules() }
+                .getOrElse { err -> "ERROR: ${err.javaClass.simpleName}: ${err.message}" }
+            localFirewallDiag.update { it.copy(lastCleanupResult = res) }
+        }
+    }
+
     fun checkCompatibility() = compatibility.check()
 
     fun downloadTetheringApex() = compatibility.downloadApex()
@@ -309,3 +428,13 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         super.onCleared()
     }
 }
+
+data class FirewallDiagnosticUiState(
+    val isRunningProbes: Boolean = false,
+    val isRunningClientPoc: Boolean = false,
+    val isCollectingBpf: Boolean = false,
+    val report: FirewallDiagnosticReport? = null,
+    val bpfReport: BpfAttributionStatusReport? = null,
+    val lastCleanupResult: String = "",
+    val error: String = "",
+)

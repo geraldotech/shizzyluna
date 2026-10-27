@@ -1,8 +1,8 @@
 package dev.shizzi
 
+import java.util.Calendar
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Calendar
 
 data class ClientRule(
     val mac: String,
@@ -91,8 +91,16 @@ data class ConnectedClient(
     val seenPackets: Long = 0,
     val matchedPackets: Long = 0,
     val droppedPackets: Long = 0,
+    val blockedDropPackets: Long = 0,
+    val shapingDropPackets: Long = 0,
+    val policyVersionBlockedDrops: Long = -1L,
     val shapedBytes: Long = 0,
     val policyInstalled: Boolean = false,
+    val unattributedPostNatObserved: Boolean = false,
+    val mappingSource: String = "softap_dump+downstream_neigh",
+    val directAttributedPackets: Long = 0,
+    val bpfAttributedPackets: Long = 0,
+    val policyVersion: Long = 1L,
     val datapathMode: DatapathMode = DatapathMode.INACTIVE,
     val firewallBackend: FirewallBackend = FirewallBackend.NONE,
     val kernelNetfilterAvailable: Boolean = false,
@@ -129,6 +137,15 @@ data class ConnectedClient(
         return false to null
     }
 
+    val effectivePolicyVersionDrops: Long
+        get() = if (policyVersionBlockedDrops >= 0L) {
+            policyVersionBlockedDrops
+        } else if (blockedDropPackets > 0L || shapingDropPackets > 0L) {
+            blockedDropPackets
+        } else {
+            droppedPackets
+        }
+
     val enforcementState: EnforcementState
         get() {
             val (restricted, _) = isRestricted()
@@ -138,12 +155,19 @@ data class ConnectedClient(
                 matchedPackets = matchedPackets,
                 forwardedPackets = (seenPackets - droppedPackets).coerceAtLeast(0L),
                 droppedPackets = droppedPackets,
+                blockedDropPackets = if (blockedDropPackets > 0L) blockedDropPackets else effectivePolicyVersionDrops,
+                shapingDropPackets = shapingDropPackets,
                 shapedPackets = if (shapedBytes > 0L) 1L else 0L,
                 rxBytes = rxBytes,
                 txBytes = txBytes,
                 droppedBytes = 0L,
                 shapedBytes = shapedBytes,
                 policyInstalled = policyInstalled,
+                policyVersion = policyVersion,
+                policyVersionBlockedDrops = effectivePolicyVersionDrops,
+                unattributedPostNatObserved = unattributedPostNatObserved,
+                directAttributedPackets = directAttributedPackets,
+                bpfAttributedPackets = bpfAttributedPackets,
             )
             return HostFirewall.computeClientEnforcementState(
                 isRestricted = restricted,
@@ -151,6 +175,7 @@ data class ConnectedClient(
                 counters = snapshot,
                 datapathMode = datapathMode,
                 kernelAvailable = kernelNetfilterAvailable,
+                isDegradedMultiClient = unattributedPostNatObserved,
             )
         }
 
@@ -159,16 +184,18 @@ data class ConnectedClient(
         if (!restricted) return "Connected (${formattedUptime()})"
         return when (enforcementState) {
             EnforcementState.PACKETS_DROPPED ->
-                "Blocked (verified • $droppedPackets pkts dropped)"
+                "Blocked (verified • $effectivePolicyVersionDrops pkts dropped in policy v$policyVersion)"
+            EnforcementState.PARTIAL_BPF_ENFORCEMENT ->
+                "Block requested • Partial enforcement ($effectivePolicyVersionDrops BPF-mapped pkts dropped; initial/unknown flows possible)"
             EnforcementState.PACKETS_MATCHED,
             EnforcementState.POLICY_INSTALLED,
-            -> "Block policy active (${reason ?: "Blocked"} • awaiting packets)"
+            -> "Block requested (${reason ?: "Blocked"} • awaiting mapped traffic)"
             EnforcementState.DEGRADED_MULTI_CLIENT ->
-                "Block degraded — multi-client isolation requires conntrack or root"
+                "Block requested — degraded (post-NAT traffic unattributed; enable Experimental BPF or run Diagnostic)"
             EnforcementState.ENFORCEMENT_UNAVAILABLE ->
-                "Block configured — not enforced (direct-TUN fallback)"
+                "Block requested — not enforced (direct-TUN fallback)"
             else ->
-                "Block configured — syncing policy"
+                "Block requested — syncing policy"
         }
     }
 
@@ -177,14 +204,16 @@ data class ConnectedClient(
         if (!isCurrentlyConnected) return "Cap: $cap (saved)"
         return when (enforcementState) {
             EnforcementState.THROTTLING_OBSERVED ->
-                "Cap: $cap (verified • ${Traffic.format(shapedBytes)} shaped)"
+                "Cap: $cap (shaped • ${Traffic.format(shapedBytes)})"
+            EnforcementState.PARTIAL_BPF_ENFORCEMENT ->
+                "Cap: $cap (partial BPF • ${Traffic.format(shapedBytes)} shaped)"
             EnforcementState.PACKETS_MATCHED ->
-                "Cap: $cap (verified • $matchedPackets pkts matched)"
+                "Cap: $cap (matched • $matchedPackets pkts)"
             EnforcementState.POLICY_INSTALLED,
             EnforcementState.DATAPATH_ACTIVE,
-            -> "Cap: $cap (policy active)"
+            -> "Cap: $cap (requested • policy active)"
             EnforcementState.DEGRADED_MULTI_CLIENT ->
-                "Cap: $cap — degraded (multi-client)"
+                "Cap: $cap — degraded (post-NAT unattributed)"
             EnforcementState.ENFORCEMENT_UNAVAILABLE ->
                 "Cap: $cap — not enforced"
             else -> "Cap: $cap (configured)"
@@ -267,8 +296,16 @@ object ClientDiscovery {
                     seenPackets = host.seenPackets,
                     matchedPackets = host.matchedPackets,
                     droppedPackets = host.droppedPackets,
+                    blockedDropPackets = host.blockedDropPackets,
+                    shapingDropPackets = host.shapingDropPackets,
+                    policyVersionBlockedDrops = host.policyVersionBlockedDrops,
                     shapedBytes = host.shapedBytes,
                     policyInstalled = host.policyInstalled,
+                    unattributedPostNatObserved = host.unattributedPostNatObserved,
+                    mappingSource = host.mappingSource,
+                    directAttributedPackets = host.directAttributedPackets,
+                    bpfAttributedPackets = host.bpfAttributedPackets,
+                    policyVersion = host.policyVersion,
                     datapathMode = datapathMode,
                     firewallBackend = firewallBackend,
                     kernelNetfilterAvailable = kernelNetfilterAvailable,
@@ -276,7 +313,6 @@ object ClientDiscovery {
             )
         }
 
-        // Remove stale firstSeenAt timestamps for clients that have disconnected
         seenTimes.keys.retainAll(seenMacs)
 
         return foundClients

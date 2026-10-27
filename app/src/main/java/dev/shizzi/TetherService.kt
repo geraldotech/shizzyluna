@@ -85,6 +85,40 @@ class TetherService : ITetherService.Stub {
                 .getOrElse { failure -> errorReport("runProbes", failure) },
         )
 
+    override fun runFirewallDiagnostics(): String =
+        runCatching {
+            val json = session.runFirewallDiagnostics()
+            runCatching { java.io.File(FIREWALL_DIAG_REPORT_PATH).writeText(json) }
+            json
+        }.getOrElse { failure -> errorReport("runFirewallDiagnostics", failure) }
+
+    override fun runFirewallClientPoc(
+        clientAMac: String?,
+        clientBMac: String?,
+        durationSec: Int,
+    ): String =
+        runCatching {
+            val json = session.runFirewallClientPoc(
+                clientAMac = clientAMac.orEmpty(),
+                clientBMac = clientBMac.orEmpty(),
+                durationSec = durationSec,
+            )
+            runCatching { java.io.File(FIREWALL_DIAG_REPORT_PATH).writeText(json) }
+            json
+        }.getOrElse { failure -> errorReport("runFirewallClientPoc", failure) }
+
+    override fun cleanupFirewallTestRules(): String =
+        runCatching { session.cleanupFirewallTestRules() }
+            .getOrElse { failure -> "CLEANUP_FAILED: ${failure.javaClass.simpleName}: ${failure.message}" }
+
+    override fun setExperimentalBpfConfig(enabled: Boolean, pollIntervalMs: Int): String =
+        runCatching { session.setExperimentalBpfConfig(enabled, pollIntervalMs) }
+            .getOrElse { failure -> errorReport("setExperimentalBpfConfig", failure) }
+
+    override fun collectBpfSnapshotNow(): String =
+        runCatching { session.collectBpfSnapshotNow() }
+            .getOrElse { failure -> errorReport("collectBpfSnapshotNow", failure) }
+
     private fun publish(report: String): String {
         runCatching { java.io.File(REPORT_PATH).writeText(report) }
             .onFailure { failure -> Log.w(TAG, "publish: ${failure.message}") }
@@ -131,6 +165,7 @@ class TetherService : ITetherService.Stub {
         private const val STACK_TRACE_CHARS = 4000
 
         const val REPORT_PATH = "/data/local/tmp/shizzi-probe-report.json"
+        const val FIREWALL_DIAG_REPORT_PATH = "/data/local/tmp/shizzi-firewall-diagnostic.json"
 
         private const val SHELL_PACKAGE = "com.android.shell"
 

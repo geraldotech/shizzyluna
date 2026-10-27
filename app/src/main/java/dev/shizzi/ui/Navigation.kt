@@ -24,6 +24,7 @@ enum class Screen(val depth: Int) {
     SETTINGS(1),
     CLIENTS(1),
     LOG(2),
+    FIREWALL_DIAGNOSTIC(2),
     EASTER_EGG(1),
 }
 

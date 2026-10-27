@@ -2,8 +2,10 @@ package dev.shizzi
 
 import android.system.Os
 import android.util.Log
+import java.io.InputStream
 import java.util.Calendar
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 enum class EnforcementState {
     UNRESTRICTED,
@@ -12,6 +14,7 @@ enum class EnforcementState {
     POLICY_INSTALLED,
     PACKETS_MATCHED,
     PACKETS_DROPPED,
+    PARTIAL_BPF_ENFORCEMENT,
     THROTTLING_OBSERVED,
     ENFORCEMENT_UNAVAILABLE,
     DEGRADED_MULTI_CLIENT,
@@ -24,10 +27,22 @@ enum class FirewallBackend {
     KERNEL_ONLY,
 }
 
+enum class ProbeErrorKind {
+    NONE,
+    PERMISSION_DENIED,
+    COMMAND_MISSING,
+    FILE_MISSING,
+    TIMEOUT,
+    EMPTY_RESPONSE,
+    PARSE_FAILURE,
+    EXECUTION_FAILED,
+}
+
 object HostFirewall {
 
     private const val TAG = "HostFirewall"
-    private const val CMD_TIMEOUT_MS = 1_500L
+    private const val CMD_TIMEOUT_MS = 2_000L
+    private const val MAX_CAPTURED_BYTES = 16 * 1024
 
     data class CommandResult(
         val command: String,
@@ -35,8 +50,30 @@ object HostFirewall {
         val stdout: String,
         val stderr: String,
         val timedOut: Boolean,
+        val errorKind: ProbeErrorKind = classifyError(exitCode, stdout, stderr, timedOut),
     ) {
         val isSuccess: Boolean get() = !timedOut && exitCode == 0
+    }
+
+    data class KernelCapabilityMatrix(
+        val uid: Int = -1,
+        val canReadNetfilterV4: Boolean = false,
+        val canReadNetfilterV6: Boolean = false,
+        val canWriteNetfilterV4: Boolean = false,
+        val canWriteNetfilterV6: Boolean = false,
+        val canReadIpRuleV4: Boolean = false,
+        val canReadIpRuleV6: Boolean = false,
+        val canWriteIpRuleV4: Boolean = false,
+        val canWriteIpRuleV6: Boolean = false,
+        val netfilterV4WriteError: String = "",
+        val netfilterV6WriteError: String = "",
+        val ipRuleV4WriteError: String = "",
+        val ipRuleV6WriteError: String = "",
+    ) {
+        val canWriteBothFamiliesNetfilter: Boolean
+            get() = canWriteNetfilterV4 && canWriteNetfilterV6
+        val canWriteBothFamiliesIpRule: Boolean
+            get() = canWriteIpRuleV4 && canWriteIpRuleV6
     }
 
     data class EnforcementSummary(
@@ -63,6 +100,10 @@ object HostFirewall {
     private var kernelCapabilityChecked = false
 
     @Volatile
+    var capabilityMatrix: KernelCapabilityMatrix = KernelCapabilityMatrix()
+        private set
+
+    @Volatile
     var isKernelNetfilterAvailable: Boolean = false
         private set
 
@@ -81,6 +122,34 @@ object HostFirewall {
     @Volatile
     private var lastLoggedBackendSignature: String = ""
 
+    fun classifyError(
+        exitCode: Int,
+        stdout: String,
+        stderr: String,
+        timedOut: Boolean,
+    ): ProbeErrorKind {
+        if (timedOut) return ProbeErrorKind.TIMEOUT
+        if (exitCode == 0) return ProbeErrorKind.NONE
+        val combined = "$stderr $stdout".lowercase()
+        return when {
+            combined.contains("permission denied") ||
+                combined.contains("operation not permitted") ||
+                combined.contains("eperm") ||
+                combined.contains("eacces") ||
+                combined.contains("must be root") ||
+                combined.contains("can't initialize iptables table") ||
+                combined.contains("you must be root") -> ProbeErrorKind.PERMISSION_DENIED
+            combined.contains("inaccessible or not found") ||
+                combined.contains("command not found") ||
+                combined.contains("cannot run program") ||
+                combined.contains("error=2,") ||
+                combined.contains("error=13,") && combined.contains("cannot run program") -> ProbeErrorKind.COMMAND_MISSING
+            combined.contains("no such file or directory") ||
+                combined.contains("enoent") -> ProbeErrorKind.FILE_MISSING
+            else -> ProbeErrorKind.EXECUTION_FAILED
+        }
+    }
+
     private fun resolveUid(): Int {
         if (processUid >= 0) return processUid
         processUid = runCatching { Os.getuid() }.getOrDefault(2000)
@@ -95,42 +164,110 @@ object HostFirewall {
             "/data/adb/ksu/bin/su",
             "/data/adb/ap/bin/su",
         )
-        return suPaths.any { java.io.File(it).exists() } || runCatching {
-            val p = ProcessBuilder("which", "su").start()
-            val finished = p.waitFor(500, TimeUnit.MILLISECONDS)
-            finished && p.exitValue() == 0
-        }.getOrDefault(false)
+        return suPaths.any { java.io.File(it).exists() }
+    }
+
+    /**
+     * Evaluates kernel netfilter and policy routing capabilities WITHOUT treating read-only listing
+     * (`ip rule show` or `iptables -S`) as proof of write/enforcement capability, and WITHOUT
+     * invoking `su` automatically in rootless ADB mode.
+     */
+    @Synchronized
+    fun probeKernelCapabilities(force: Boolean = false): KernelCapabilityMatrix {
+        val uid = resolveUid()
+        if (kernelCapabilityChecked && !force) {
+            return capabilityMatrix
+        }
+        kernelCapabilityChecked = true
+        isSuAvailable = checkSuPresence()
+
+        // 1. Read probes (listing only - NEVER treated as write/enforcement capability)
+        val readIptV4 = executeCommand("iptables", "-S", "FORWARD")
+        val readIptV6 = executeCommand("ip6tables", "-S", "FORWARD")
+        val readRuleV4 = executeCommand("ip", "rule", "show")
+        val readRuleV6 = executeCommand("ip", "-6", "rule", "show")
+
+        // 2. Write probes using isolated owned structures (never touching system rules or traffic)
+        val testChain = "SHIZZI_CAP_CHK"
+        executeCommand("iptables", "-F", testChain)
+        executeCommand("iptables", "-X", testChain)
+        val writeIptV4Create = executeCommand("iptables", "-N", testChain)
+        val canWriteV4 = if (writeIptV4Create.isSuccess) {
+            val del = executeCommand("iptables", "-X", testChain)
+            del.isSuccess
+        } else {
+            false
+        }
+
+        executeCommand("ip6tables", "-F", testChain)
+        executeCommand("ip6tables", "-X", testChain)
+        val writeIptV6Create = executeCommand("ip6tables", "-N", testChain)
+        val canWriteV6 = if (writeIptV6Create.isSuccess) {
+            val del = executeCommand("ip6tables", "-X", testChain)
+            del.isSuccess
+        } else {
+            false
+        }
+
+        // 3. Policy routing write probe using RFC 5737 / RFC 3849 documentation-only addresses
+        // at priority 19899, immediately deleted.
+        executeCommand("ip", "rule", "del", "from", "198.51.100.254/32", "priority", "19899")
+        val writeRuleV4Add = executeCommand("ip", "rule", "add", "from", "198.51.100.254/32", "lookup", "main", "priority", "19899")
+        val canWriteRuleV4 = if (writeRuleV4Add.isSuccess) {
+            executeCommand("ip", "rule", "del", "from", "198.51.100.254/32", "lookup", "main", "priority", "19899").isSuccess
+        } else {
+            false
+        }
+
+        executeCommand("ip", "-6", "rule", "del", "from", "2001:db8::fffe/128", "priority", "19899")
+        val writeRuleV6Add = executeCommand("ip", "-6", "rule", "add", "from", "2001:db8::fffe/128", "lookup", "main", "priority", "19899")
+        val canWriteRuleV6 = if (writeRuleV6Add.isSuccess) {
+            executeCommand("ip", "-6", "rule", "del", "from", "2001:db8::fffe/128", "lookup", "main", "priority", "19899").isSuccess
+        } else {
+            false
+        }
+
+        val matrix = KernelCapabilityMatrix(
+            uid = uid,
+            canReadNetfilterV4 = readIptV4.isSuccess,
+            canReadNetfilterV6 = readIptV6.isSuccess,
+            canWriteNetfilterV4 = canWriteV4,
+            canWriteNetfilterV6 = canWriteV6,
+            canReadIpRuleV4 = readRuleV4.isSuccess,
+            canReadIpRuleV6 = readRuleV6.isSuccess,
+            canWriteIpRuleV4 = canWriteRuleV4,
+            canWriteIpRuleV6 = canWriteRuleV6,
+            netfilterV4WriteError = writeIptV4Create.stderr.ifBlank { "exit=${writeIptV4Create.exitCode}" },
+            netfilterV6WriteError = writeIptV6Create.stderr.ifBlank { "exit=${writeIptV6Create.exitCode}" },
+            ipRuleV4WriteError = writeRuleV4Add.stderr.ifBlank { "exit=${writeRuleV4Add.exitCode}" },
+            ipRuleV6WriteError = writeRuleV6Add.stderr.ifBlank { "exit=${writeRuleV6Add.exitCode}" },
+        )
+
+        capabilityMatrix = matrix
+        // CRITICAL: Only mark kernel netfilter or ip rule available when WRITE is confirmed on BOTH IPv4 and IPv6.
+        // Never mark available based on `ip rule show` (read-only).
+        isIpRuleAvailable = matrix.canWriteBothFamiliesIpRule
+        isKernelNetfilterAvailable = matrix.canWriteBothFamiliesNetfilter || matrix.canWriteBothFamiliesIpRule
+
+        return matrix
     }
 
     private fun ensureKernelCapabilityChecked() {
         val uid = resolveUid()
         if (!kernelCapabilityChecked) {
-            kernelCapabilityChecked = true
-            isSuAvailable = checkSuPresence()
-
-            // 1. Probe iptables (direct and via su if available)
-            val iptablesProbe = executePrivilegedCommand("iptables", "-L", "FORWARD", "-n")
-
-            // 2. Probe ip rule policy routing (direct and via su if available)
-            val ipRuleProbe = executePrivilegedCommand("ip", "rule", "show")
-            isIpRuleAvailable = ipRuleProbe.isSuccess
-
-            isKernelNetfilterAvailable = iptablesProbe.isSuccess || isIpRuleAvailable
-
-            if (!isKernelNetfilterAvailable && uid == 0) {
-                SessionLog.warn(
-                    "Firewall: root uid=0 iptables/ip-rule probe failed: ${iptablesProbe.stderr} | ${ipRuleProbe.stderr}",
-                )
-            }
+            probeKernelCapabilities(force = false)
         }
 
         val userspaceActive = TunTrafficEngine.isAttached
         val backend = currentBackend(userspaceActive, isKernelNetfilterAvailable)
-        val sig = "${backend.name}:$isKernelNetfilterAvailable:$isIpRuleAvailable:$isSuAvailable:$uid:${TunTrafficEngine.datapathMode.name}"
+        val m = capabilityMatrix
+        val sig = "${backend.name}:$isKernelNetfilterAvailable:$isIpRuleAvailable:${m.canReadIpRuleV4}:${m.canWriteIpRuleV4}:$uid:${TunTrafficEngine.datapathMode.name}"
         if (lastLoggedBackendSignature != sig) {
             lastLoggedBackendSignature = sig
             SessionLog.info(
-                "Firewall: backend=${backend.name} kernelNetfilterAvailable=$isKernelNetfilterAvailable ipRuleAvailable=$isIpRuleAvailable suAvailable=$isSuAvailable uid=$uid datapath=${TunTrafficEngine.datapathMode.name}",
+                "Firewall: backend=${backend.name} uid=$uid datapath=${TunTrafficEngine.datapathMode.name} " +
+                    "netfilter(readV4=${m.canReadNetfilterV4},writeV4=${m.canWriteNetfilterV4},writeV6=${m.canWriteNetfilterV6}) " +
+                    "ipRule(readV4=${m.canReadIpRuleV4},writeV4=${m.canWriteIpRuleV4},writeV6=${m.canWriteIpRuleV6})",
             )
         }
     }
@@ -145,6 +282,12 @@ object HostFirewall {
         else -> FirewallBackend.NONE
     }
 
+    /**
+     * Computes honest per-client enforcement status.
+     * - Never reports PACKETS_DROPPED (`Blocked (verified)`) from cumulative/stale counters or shaping drops.
+     * - Requires `policyVersionBlockedDrops > 0` in the current policy version AND no unattributed
+     *   post-NAT bypass traffic (`!counters.unattributedPostNatObserved && !isDegradedMultiClient`).
+     */
     fun computeClientEnforcementState(
         isRestricted: Boolean,
         bandwidthLimitKbps: Int,
@@ -166,12 +309,16 @@ object HostFirewall {
             }
         }
 
+        val postNatBypassObserved = !kernelAvailable && (isDegradedMultiClient || counters.unattributedPostNatObserved)
+        val bpfMappedActive = !kernelAvailable && counters.bpfAttributedPackets > 0L
+
         if (isRestricted) {
             return when {
-                counters.droppedPackets > 0 -> EnforcementState.PACKETS_DROPPED
-                counters.matchedPackets > 0 -> EnforcementState.PACKETS_MATCHED
+                bpfMappedActive && counters.policyVersionBlockedDrops > 0L -> EnforcementState.PARTIAL_BPF_ENFORCEMENT
+                postNatBypassObserved -> EnforcementState.DEGRADED_MULTI_CLIENT
+                counters.policyVersionBlockedDrops > 0L -> EnforcementState.PACKETS_DROPPED
+                counters.matchedPackets > 0L -> EnforcementState.PACKETS_MATCHED
                 kernelAvailable -> EnforcementState.POLICY_INSTALLED
-                isDegradedMultiClient -> EnforcementState.DEGRADED_MULTI_CLIENT
                 counters.policyInstalled -> EnforcementState.POLICY_INSTALLED
                 userspaceActive -> EnforcementState.DATAPATH_ACTIVE
                 else -> EnforcementState.CONFIGURED
@@ -180,10 +327,12 @@ object HostFirewall {
 
         // Bandwidth limit active (and not blocked)
         return when {
-            counters.shapedPackets > 0 || counters.shapedBytes > 0 -> EnforcementState.THROTTLING_OBSERVED
-            counters.matchedPackets > 0 -> EnforcementState.PACKETS_MATCHED
+            bpfMappedActive && (counters.shapingDropPackets > 0L || counters.shapedPackets > 0L || counters.shapedBytes > 0L) && postNatBypassObserved ->
+                EnforcementState.PARTIAL_BPF_ENFORCEMENT
+            postNatBypassObserved -> EnforcementState.DEGRADED_MULTI_CLIENT
+            counters.shapingDropPackets > 0L || counters.shapedPackets > 0L || counters.shapedBytes > 0L -> EnforcementState.THROTTLING_OBSERVED
+            counters.matchedPackets > 0L -> EnforcementState.PACKETS_MATCHED
             kernelAvailable -> EnforcementState.POLICY_INSTALLED
-            isDegradedMultiClient -> EnforcementState.DEGRADED_MULTI_CLIENT
             counters.policyInstalled -> EnforcementState.POLICY_INSTALLED
             userspaceActive -> EnforcementState.DATAPATH_ACTIVE
             else -> EnforcementState.CONFIGURED
@@ -203,7 +352,6 @@ object HostFirewall {
 
         val activeHostMacs = connectedHosts.map { it.mac.uppercase().trim() }.toSet()
 
-        // Track first-seen times for currently connected hosts; prune disconnected hosts
         for (mac in activeHostMacs) {
             clientConnectTimes.putIfAbsent(mac, nowMillis)
         }
@@ -215,7 +363,7 @@ object HostFirewall {
 
         val targetBlockMacs = mutableSetOf<String>()
         val targetBlockIps = mutableSetOf<String>()
-        val targetThrottleIps = mutableMapOf<String, Int>() // IP -> kbps
+        val targetThrottleIps = mutableMapOf<String, Int>()
 
         val userspacePolicies = mutableMapOf<String, TunTrafficEngine.EnforcedClientPolicy>()
 
@@ -224,7 +372,6 @@ object HostFirewall {
         var blockedConnected = 0
         var throttledConnected = 0
 
-        // 1. Evaluate rules for all verified connected clients
         for (host in connectedHosts) {
             val upperMac = host.mac.uppercase().trim()
             val rule = rulesByMac[upperMac] ?: continue
@@ -239,7 +386,6 @@ object HostFirewall {
             var shouldBlock = rule.isBlocked
             var blockReason: String? = if (rule.isBlocked) "manual block" else null
 
-            // Schedule check
             if (!shouldBlock && rule.scheduleEnabled) {
                 val allowed = if (rule.scheduleStartHour <= rule.scheduleEndHour) {
                     currentHour in rule.scheduleStartHour until rule.scheduleEndHour
@@ -252,7 +398,6 @@ object HostFirewall {
                 }
             }
 
-            // Connection time limit check
             if (!shouldBlock && rule.connectionTimeLimitMinutes > 0) {
                 val connectTime = clientConnectTimes[upperMac] ?: nowMillis
                 val elapsedMinutes = (nowMillis - connectTime) / 60_000
@@ -283,8 +428,6 @@ object HostFirewall {
             )
         }
 
-        // 2. Also register pre-configured rules for offline MACs in TunTrafficEngine
-        // so if they connect, their first packet is immediately subject to the policy
         for ((mac, rule) in rulesByMac) {
             if (!userspacePolicies.containsKey(mac)) {
                 if (rule.isBlocked || rule.bandwidthLimitKbps > 0) {
@@ -301,16 +444,12 @@ object HostFirewall {
             }
         }
 
-        // 3. Push policies and verified connected hosts to TunTrafficEngine FIRST
         TunTrafficEngine.updatePolicies(userspacePolicies, connectedHosts)
 
-        // 4. If kernel netfilter is available (UID 0 / CAP_NET_ADMIN), synchronize kernel rules
-        // and verify command exit codes before recording them as applied
         if (isKernelNetfilterAvailable) {
             syncKernelRules(targetBlockIps, targetBlockMacs, targetThrottleIps)
         }
 
-        // 5. Compute honest per-client enforcement states from actual datapath & packet counters
         for (host in connectedHosts) {
             val upperMac = host.mac.uppercase().trim()
             val policy = userspacePolicies[upperMac] ?: continue
@@ -326,19 +465,20 @@ object HostFirewall {
                 if (enforcementState == EnforcementState.POLICY_INSTALLED ||
                     enforcementState == EnforcementState.PACKETS_MATCHED ||
                     enforcementState == EnforcementState.PACKETS_DROPPED ||
+                    enforcementState == EnforcementState.PARTIAL_BPF_ENFORCEMENT ||
                     enforcementState == EnforcementState.THROTTLING_OBSERVED
                 ) {
                     policyInstalledCount++
                 }
                 if (enforcementState == EnforcementState.PACKETS_DROPPED ||
-                    enforcementState == EnforcementState.THROTTLING_OBSERVED ||
-                    enforcementState == EnforcementState.PACKETS_MATCHED
+                    enforcementState == EnforcementState.PARTIAL_BPF_ENFORCEMENT ||
+                    enforcementState == EnforcementState.THROTTLING_OBSERVED
                 ) {
                     verifiedEnforcedCount++
                 }
             }
 
-            val stateKey = "${policy.isBlocked}:${policy.blockReason}:${policy.bandwidthLimitKbps}:${enforcementState.name}"
+            val stateKey = "${policy.isBlocked}:${policy.blockReason}:${policy.bandwidthLimitKbps}:${enforcementState.name}:${counters.policyVersion}"
             if (lastLoggedStateByMac[upperMac] != stateKey) {
                 lastLoggedStateByMac[upperMac] = stateKey
                 val ipLabel = host.ip.ifBlank { "pending-ip" }
@@ -347,13 +487,20 @@ object HostFirewall {
                         "TrafficControl: mac=$upperMac ($ipLabel) state=ENFORCEMENT_UNAVAILABLE " +
                             "reason=${TunTrafficEngine.fallbackReason ?: "datapath proxy inactive and kernel netfilter unavailable"}",
                     )
+                    enforcementState == EnforcementState.DEGRADED_MULTI_CLIENT -> SessionLog.warn(
+                        "TrafficControl: mac=$upperMac ($ipLabel) state=DEGRADED_MULTI_CLIENT " +
+                            "policyVersion=${counters.policyVersion} policyBlockedDrops=${counters.policyVersionBlockedDrops} " +
+                            "unattributedPostNat=true (post-NAT traffic observed without selective attribution)",
+                    )
                     policy.isBlocked -> SessionLog.info(
                         "TrafficControl: mac=$upperMac ($ipLabel) policy=BLOCK(${policy.blockReason}) " +
-                            "state=${enforcementState.name} droppedPackets=${counters.droppedPackets}",
+                            "state=${enforcementState.name} policyVersion=${counters.policyVersion} " +
+                            "policyBlockedDrops=${counters.policyVersionBlockedDrops} totalBlockedDrops=${counters.blockedDropPackets}",
                     )
                     policy.bandwidthLimitKbps > 0 -> SessionLog.info(
                         "TrafficControl: mac=$upperMac ($ipLabel) policy=RATE_LIMIT(${policy.bandwidthLimitKbps}kbps) " +
-                            "state=${enforcementState.name} matchedPackets=${counters.matchedPackets} shapedBytes=${counters.shapedBytes}",
+                            "state=${enforcementState.name} matchedPackets=${counters.matchedPackets} " +
+                            "shapeDrops=${counters.shapingDropPackets} shapedBytes=${counters.shapedBytes}",
                     )
                     else -> SessionLog.info(
                         "TrafficControl: mac=$upperMac ($ipLabel) policy=UNRESTRICTED state=${enforcementState.name}",
@@ -387,7 +534,7 @@ object HostFirewall {
                 "Rules sync: configured=${summary.activeRulesCount}/${summary.configuredRulesCount} " +
                     "connectedClients=${summary.connectedClientsCount} " +
                     "policyInstalled=${summary.policyInstalledOnConnectedCount} " +
-                    "verifiedPacketMatches=${summary.verifiedEnforcedOnConnectedCount} " +
+                    "verifiedEnforced=${summary.verifiedEnforcedOnConnectedCount} " +
                     "backend=${summary.firewallBackend.name} datapath=${summary.datapathMode.name}",
             )
         }
@@ -474,18 +621,22 @@ object HostFirewall {
         val isIpv6 = ip.contains(':')
         var blocked = false
         if (isIpv6) {
-            val r1 = executePrivilegedCommand("ip6tables", "-I", "FORWARD", "-s", ip, "-j", "DROP")
-            val r2 = executePrivilegedCommand("ip6tables", "-I", "FORWARD", "-d", ip, "-j", "DROP")
-            if (r1.isSuccess || r2.isSuccess) blocked = true
-            if (isIpRuleAvailable) {
+            if (capabilityMatrix.canWriteNetfilterV6) {
+                val r1 = executePrivilegedCommand("ip6tables", "-I", "FORWARD", "-s", ip, "-j", "DROP")
+                val r2 = executePrivilegedCommand("ip6tables", "-I", "FORWARD", "-d", ip, "-j", "DROP")
+                if (r1.isSuccess && r2.isSuccess) blocked = true
+            }
+            if (capabilityMatrix.canWriteIpRuleV6) {
                 val r3 = executePrivilegedCommand("ip", "-6", "rule", "add", "from", "$ip/128", "unreachable", "priority", "100")
                 if (r3.isSuccess) blocked = true
             }
         } else {
-            val r1 = executePrivilegedCommand("iptables", "-I", "FORWARD", "-s", ip, "-j", "DROP")
-            val r2 = executePrivilegedCommand("iptables", "-I", "FORWARD", "-d", ip, "-j", "DROP")
-            if (r1.isSuccess || r2.isSuccess) blocked = true
-            if (isIpRuleAvailable) {
+            if (capabilityMatrix.canWriteNetfilterV4) {
+                val r1 = executePrivilegedCommand("iptables", "-I", "FORWARD", "-s", ip, "-j", "DROP")
+                val r2 = executePrivilegedCommand("iptables", "-I", "FORWARD", "-d", ip, "-j", "DROP")
+                if (r1.isSuccess && r2.isSuccess) blocked = true
+            }
+            if (capabilityMatrix.canWriteIpRuleV4) {
                 val r3 = executePrivilegedCommand("ip", "rule", "add", "from", "$ip/32", "unreachable", "priority", "100")
                 if (r3.isSuccess) blocked = true
             }
@@ -496,34 +647,48 @@ object HostFirewall {
     private fun removeIpBlock(ip: String) {
         val isIpv6 = ip.contains(':')
         if (isIpv6) {
-            executePrivilegedCommand("ip6tables", "-D", "FORWARD", "-s", ip, "-j", "DROP")
-            executePrivilegedCommand("ip6tables", "-D", "FORWARD", "-d", ip, "-j", "DROP")
-            if (isIpRuleAvailable) {
+            if (capabilityMatrix.canWriteNetfilterV6) {
+                executePrivilegedCommand("ip6tables", "-D", "FORWARD", "-s", ip, "-j", "DROP")
+                executePrivilegedCommand("ip6tables", "-D", "FORWARD", "-d", ip, "-j", "DROP")
+            }
+            if (capabilityMatrix.canWriteIpRuleV6) {
                 executePrivilegedCommand("ip", "-6", "rule", "del", "from", "$ip/128", "unreachable", "priority", "100")
             }
         } else {
-            executePrivilegedCommand("iptables", "-D", "FORWARD", "-s", ip, "-j", "DROP")
-            executePrivilegedCommand("iptables", "-D", "FORWARD", "-d", ip, "-j", "DROP")
-            if (isIpRuleAvailable) {
+            if (capabilityMatrix.canWriteNetfilterV4) {
+                executePrivilegedCommand("iptables", "-D", "FORWARD", "-s", ip, "-j", "DROP")
+                executePrivilegedCommand("iptables", "-D", "FORWARD", "-d", ip, "-j", "DROP")
+            }
+            if (capabilityMatrix.canWriteIpRuleV4) {
                 executePrivilegedCommand("ip", "rule", "del", "from", "$ip/32", "unreachable", "priority", "100")
             }
         }
     }
 
     private fun applyMacBlock(mac: String): Boolean {
+        if (!capabilityMatrix.canWriteNetfilterV4) return false
         val r1 = executePrivilegedCommand("iptables", "-I", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP")
-        executePrivilegedCommand("ip6tables", "-I", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP")
+        if (capabilityMatrix.canWriteNetfilterV6) {
+            executePrivilegedCommand("ip6tables", "-I", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP")
+        }
         return r1.isSuccess
     }
 
     private fun removeMacBlock(mac: String) {
-        executePrivilegedCommand("iptables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP")
-        executePrivilegedCommand("ip6tables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP")
+        if (capabilityMatrix.canWriteNetfilterV4) {
+            executePrivilegedCommand("iptables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP")
+        }
+        if (capabilityMatrix.canWriteNetfilterV6) {
+            executePrivilegedCommand("ip6tables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP")
+        }
     }
 
     private fun applyThrottle(ip: String, limitPkt: Int): Boolean {
+        val isV6 = ip.contains(':')
+        if (isV6 && !capabilityMatrix.canWriteNetfilterV6) return false
+        if (!isV6 && !capabilityMatrix.canWriteNetfilterV4) return false
         val burst = maxOf(4, limitPkt * 2)
-        val cmdBin = if (ip.contains(':')) "ip6tables" else "iptables"
+        val cmdBin = if (isV6) "ip6tables" else "iptables"
         val r1 = executePrivilegedCommand(cmdBin, "-I", "FORWARD", "-s", ip, "-j", "DROP")
         val r2 = executePrivilegedCommand(cmdBin, "-I", "FORWARD", "-s", ip, "-m", "limit", "--limit", "${limitPkt}/s", "--limit-burst", "$burst", "-j", "ACCEPT")
         val r3 = executePrivilegedCommand(cmdBin, "-I", "FORWARD", "-d", ip, "-j", "DROP")
@@ -532,23 +697,21 @@ object HostFirewall {
     }
 
     private fun removeThrottle(ip: String, limitPkt: Int) {
+        val isV6 = ip.contains(':')
+        if (isV6 && !capabilityMatrix.canWriteNetfilterV6) return
+        if (!isV6 && !capabilityMatrix.canWriteNetfilterV4) return
         val burst = maxOf(4, limitPkt * 2)
-        val cmdBin = if (ip.contains(':')) "ip6tables" else "iptables"
+        val cmdBin = if (isV6) "ip6tables" else "iptables"
         executePrivilegedCommand(cmdBin, "-D", "FORWARD", "-s", ip, "-m", "limit", "--limit", "${limitPkt}/s", "--limit-burst", "$burst", "-j", "ACCEPT")
         executePrivilegedCommand(cmdBin, "-D", "FORWARD", "-s", ip, "-j", "DROP")
         executePrivilegedCommand(cmdBin, "-D", "FORWARD", "-d", ip, "-m", "limit", "--limit", "${limitPkt}/s", "--limit-burst", "$burst", "-j", "ACCEPT")
         executePrivilegedCommand(cmdBin, "-D", "FORWARD", "-d", ip, "-j", "DROP")
     }
 
-    internal fun executePrivilegedCommand(vararg cmd: String): CommandResult {
-        val direct = executeCommand(*cmd)
-        if (direct.isSuccess) return direct
-        if (isSuAvailable) {
-            val suRes = executeCommand("su", "-c", cmd.joinToString(" "))
-            if (suRes.isSuccess) return suRes
-        }
-        return direct
-    }
+    /**
+     * Executes a command directly in the current Shizuku UserService identity without invoking `su`.
+     */
+    internal fun executePrivilegedCommand(vararg cmd: String): CommandResult = executeCommand(*cmd)
 
     private fun isValidIp(ip: String): Boolean =
         ip.isNotBlank() &&
@@ -558,40 +721,78 @@ object HostFirewall {
             !ip.startsWith("DHCP") &&
             !ip.startsWith("Offline")
 
-    internal fun executeCommand(vararg cmd: String): CommandResult {
+    internal fun readBoundedStream(stream: InputStream, maxBytes: Int = MAX_CAPTURED_BYTES): String {
+        return runCatching {
+            val buffer = ByteArray(1024)
+            val out = java.io.ByteArrayOutputStream()
+            var total = 0
+            while (total < maxBytes) {
+                val toRead = minOf(buffer.size, maxBytes - total)
+                val read = stream.read(buffer, 0, toRead)
+                if (read <= 0) break
+                out.write(buffer, 0, read)
+                total += read
+            }
+            // Drain any remaining bytes without storing so the child process never blocks on pipe buffer
+            while (stream.read(buffer) > 0) {
+                // discard beyond limit
+            }
+            out.toString(Charsets.UTF_8.name()).trim()
+        }.getOrDefault("")
+    }
+
+    internal fun executeCommand(
+        vararg cmd: String,
+        timeoutMs: Long = CMD_TIMEOUT_MS,
+        maxBytes: Int = MAX_CAPTURED_BYTES,
+    ): CommandResult {
         val joined = cmd.joinToString(" ")
         return runCatching {
             val process = ProcessBuilder(*cmd).start()
-            val finished = process.waitFor(CMD_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            var stdoutText = ""
+            var stderrText = ""
+            val outReader = thread(start = true, isDaemon = true, name = "cmd-stdout") {
+                stdoutText = readBoundedStream(process.inputStream, maxBytes)
+            }
+            val errReader = thread(start = true, isDaemon = true, name = "cmd-stderr") {
+                stderrText = readBoundedStream(process.errorStream, maxBytes)
+            }
+
+            val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
             if (!finished) {
                 process.destroyForcibly()
+                outReader.join(200)
+                errReader.join(200)
                 return CommandResult(
                     command = joined,
                     exitCode = -1,
-                    stdout = "",
-                    stderr = "Command timed out after ${CMD_TIMEOUT_MS}ms",
+                    stdout = stdoutText,
+                    stderr = stderrText.ifBlank { "Command timed out after ${timeoutMs}ms" },
                     timedOut = true,
+                    errorKind = ProbeErrorKind.TIMEOUT,
                 )
             }
-            val stdout = runCatching { process.inputStream.bufferedReader().use { it.readText().trim() } }.getOrDefault("")
-            val stderr = runCatching { process.errorStream.bufferedReader().use { it.readText().trim() } }.getOrDefault("")
+
+            outReader.join(300)
+            errReader.join(300)
             val code = process.exitValue()
             if (code != 0) {
-                Log.d(TAG, "Kernel command non-zero ($code): $joined -> $stderr")
+                Log.d(TAG, "Command non-zero ($code): $joined -> $stderrText")
             }
             CommandResult(
                 command = joined,
                 exitCode = code,
-                stdout = stdout,
-                stderr = stderr,
+                stdout = stdoutText,
+                stderr = stderrText,
                 timedOut = false,
             )
         }.getOrElse { err ->
+            val msg = err.message ?: err.javaClass.simpleName
             CommandResult(
                 command = joined,
                 exitCode = -1,
                 stdout = "",
-                stderr = err.message ?: err.javaClass.simpleName,
+                stderr = msg,
                 timedOut = false,
             )
         }

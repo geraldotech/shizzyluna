@@ -28,6 +28,7 @@ data class AppState(
     val diagnostics: DiagnosticsState,
     val permissions: List<PermissionStatus>,
     val clients: List<ConnectedClient> = emptyList(),
+    val firewallDiag: FirewallDiagnosticUiState = FirewallDiagnosticUiState(),
 )
 
 private const val HandoffScale = 0.94f

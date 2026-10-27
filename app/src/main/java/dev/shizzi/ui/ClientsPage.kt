@@ -75,6 +75,7 @@ import dev.shizzi.ClientRule
 import dev.shizzi.ConnectedClient
 import dev.shizzi.DatapathMode
 import dev.shizzi.EnforcementState
+import dev.shizzi.ExperimentalBpfState
 import dev.shizzi.SessionUiState
 import dev.shizzi.Traffic
 import dev.shizzi.UiStatus
@@ -86,6 +87,9 @@ data class ClientActions(
     val onSaveRule: (rule: ClientRule) -> Unit,
     val onRemoveRule: (mac: String) -> Unit,
     val onRefresh: () -> Unit,
+    val onOpenFirewallDiagnostic: () -> Unit = {},
+    val onSetExperimentalBpfEnabled: (Boolean) -> Unit = {},
+    val onCollectBpfSnapshotNow: () -> Unit = {},
 )
 
 @Composable
@@ -96,6 +100,8 @@ fun ClientsPage(
     modifier: Modifier = Modifier,
     savedRules: List<ClientRule> = emptyList(),
     sessionState: SessionUiState = SessionUiState(),
+    experimentalBpfEnabled: Boolean = false,
+    bpfPollIntervalMs: Int = 1000,
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var selectedClientForEdit by remember { mutableStateOf<ConnectedClient?>(null) }
@@ -152,7 +158,7 @@ fun ClientsPage(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 12.dp),
+                    .padding(bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
@@ -211,6 +217,101 @@ fun ClientsPage(
                         Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("Add MAC")
+                    }
+                }
+            }
+
+            val bpfReport = sessionState.bpfAttribution
+            Card(
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = ShizziTheme.colors.surfaceVariant.copy(alpha = 0.55f),
+                ),
+                border = BorderStroke(1.dp, ShizziTheme.colors.border),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 10.dp)
+                    .testTag("experimental_bpf_card"),
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Experimental BPF NAT Attribution",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp,
+                                color = ShizziTheme.colors.onSurface,
+                            )
+                            Text(
+                                text = "State: ${bpfReport.state.name} • Poll: ${bpfPollIntervalMs}ms",
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                color = ShizziTheme.colors.primary,
+                            )
+                        }
+                        Switch(
+                            checked = experimentalBpfEnabled,
+                            onCheckedChange = actions.onSetExperimentalBpfEnabled,
+                            modifier = Modifier.testTag("experimental_bpf_switch"),
+                        )
+                    }
+                    if (experimentalBpfEnabled) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "Collection: ${bpfReport.collectionStatus.name} (age ${bpfReport.snapshotAgeMs}ms, gen ${bpfReport.sessionGeneration}/${bpfReport.bindingGeneration}) • " +
+                                "Mapped flows: ${bpfReport.activeMappedFlows} (up=${bpfReport.totalUpstreamEntries}, rev=${bpfReport.reverseMatchedCount})",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            color = ShizziTheme.colors.onSurfaceMuted,
+                        )
+                        Text(
+                            text = "Pkts: bpf=${bpfReport.bpfAttributedPackets} direct=${bpfReport.directAttributedPackets} " +
+                                "unknownFwd=${bpfReport.unknownForwardedPackets} (${Traffic.format(bpfReport.unknownForwardedBytes)}) " +
+                                "ambiguous/stale=${bpfReport.ambiguousOrStaleLookups}",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            color = ShizziTheme.colors.onSurfaceMuted,
+                        )
+                        if (bpfReport.state == ExperimentalBpfState.PARTIAL_ENFORCEMENT) {
+                            Text(
+                                text = "Note: Established flows mapped via BPF are filtered, but initial packets before BPF offload remain unattributed.",
+                                fontSize = 10.sp,
+                                color = Color(0xFFFFA000),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = actions.onOpenFirewallDiagnostic,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("open_firewall_diagnostic_button"),
+                        ) {
+                            Text(
+                                text = "BPF & Firewall Diagnostics",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                        if (experimentalBpfEnabled) {
+                            OutlinedButton(
+                                onClick = actions.onCollectBpfSnapshotNow,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.testTag("collect_bpf_now_clients_button"),
+                            ) {
+                                Text(
+                                    text = "Collect BPF",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -509,9 +610,10 @@ private fun ClientCard(
                         color = ShizziTheme.colors.onSurfaceMuted,
                     )
                     if (isCurrentlyConnected && client.seenPackets > 0L) {
-                        val dropSummary = if (isRestricted) " • ${client.droppedPackets} dropped" else ""
+                        val dropSummary = if (isRestricted) " • ${client.effectivePolicyVersionDrops} blockDrop" else ""
+                        val shapeSummary = if (client.shapingDropPackets > 0L) " • ${client.shapingDropPackets} shapeDrop" else ""
                         Text(
-                            text = "pkts: ${client.seenPackets} seen • ${client.matchedPackets} matched$dropSummary",
+                            text = "v${client.policyVersion} • seen=${client.seenPackets} (bpf=${client.bpfAttributedPackets}, direct=${client.directAttributedPackets})$dropSummary$shapeSummary",
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp,
                             color = ShizziTheme.colors.onSurfaceMuted,
@@ -540,7 +642,7 @@ private fun ClientCard(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                // Status badge (honest packet-verified vs configured vs unavailable vs degraded)
+                // Status badge (honest packet-verified vs partial BPF vs configured vs unavailable vs degraded)
                 if (!isCurrentlyConnected) {
                     BadgeChip(
                         label = if (isRestricted) "Offline • ${restrictReason ?: "Blocked"} (saved)" else "Offline • Saved Rule",
@@ -550,6 +652,7 @@ private fun ClientCard(
                 } else if (isRestricted) {
                     val badgeColor = when (state) {
                         EnforcementState.PACKETS_DROPPED -> Color(0xFFFF5252)
+                        EnforcementState.PARTIAL_BPF_ENFORCEMENT -> Color(0xFFFF7043)
                         EnforcementState.ENFORCEMENT_UNAVAILABLE,
                         EnforcementState.DEGRADED_MULTI_CLIENT -> Color(0xFFFFA000)
                         else -> Color(0xFFFF7043)

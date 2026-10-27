@@ -58,6 +58,7 @@ data class SettingsState(
     val isRunningDiagnostics: Boolean,
     val automation: AutomationState,
     val dnsSettings: dev.shizzi.DnsSettings,
+    val experimentalBpfEnabled: Boolean = false,
 )
 
 data class SettingsActions(
@@ -71,6 +72,8 @@ data class SettingsActions(
     val onSetCustomDns: (String, String) -> Unit,
     val onOpenClients: () -> Unit,
     val onOpenLog: () -> Unit,
+    val onOpenFirewallDiagnostic: () -> Unit = {},
+    val onSetExperimentalBpfEnabled: (Boolean) -> Unit = {},
     val onRunProbes: () -> Unit,
     val onGrantPermission: (AppPermission) -> Unit,
     val onShizukuAction: () -> Unit,
@@ -181,7 +184,11 @@ private fun settingsSections(
     },
 
     SettingsSectionSpec("Developer") {
-        DeveloperSection(isLogging = state.isLogging, actions = actions)
+        DeveloperSection(
+            isLogging = state.isLogging,
+            experimentalBpfEnabled = state.experimentalBpfEnabled,
+            actions = actions,
+        )
     },
 
     SettingsSectionSpec("About") { AboutSection() },
@@ -231,16 +238,37 @@ private fun Modifier.inert(isBusy: Boolean): Modifier = when {
 }
 
 @Composable
-private fun DeveloperSection(isLogging: Boolean, actions: SettingsActions) {
+private fun DeveloperSection(
+    isLogging: Boolean,
+    experimentalBpfEnabled: Boolean,
+    actions: SettingsActions,
+) {
     SettingsToggle(
         label = SettingsText(title = "Logging"),
         isChecked = isLogging,
         onCheckedChange = actions.onSetLogging,
     )
 
+    SettingsToggle(
+        label = SettingsText(
+            title = "Experimental BPF NAT Attribution",
+            subtitle = "Use dumpsys tethering bpf for post-NAT flow attribution (established flows only; first-packet traffic remains unattributed)",
+        ),
+        isChecked = experimentalBpfEnabled,
+        onCheckedChange = actions.onSetExperimentalBpfEnabled,
+    )
+
     SettingsAction(
         label = SettingsText(title = "View logs"),
         onClick = actions.onOpenLog,
+    )
+
+    SettingsAction(
+        label = SettingsText(
+            title = "Diagnóstico do firewall & BPF NAT",
+            subtitle = "Probes Opção A/B, telemetria BPF NAT e exportação de relatório",
+        ),
+        onClick = actions.onOpenFirewallDiagnostic,
     )
 
     SettingsAction(
