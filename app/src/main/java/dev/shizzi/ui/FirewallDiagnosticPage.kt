@@ -194,14 +194,20 @@ fun FirewallDiagnosticPage(
                         )
                         Text(
                             text = "Gen: session=${bpfReport.sessionGeneration} binding=${bpfReport.bindingGeneration} • " +
-                                "Ifaces: ${bpfReport.downstreamIface.ifBlank { "?" }}(dump=${bpfReport.downstreamIfIndex}/host=${bpfReport.resolvedDownstreamIfIndex}) -> " +
-                                "${bpfReport.upstreamIface.ifBlank { "?" }}(dump=${bpfReport.upstreamIfIndex}/host=${bpfReport.resolvedUpstreamIfIndex})",
+                                "Ifaces: ${bpfReport.downstreamIface.ifBlank { "?" }}(inferred=${bpfReport.inferredDownstreamIfIndex ?: "n/a"}/os=${bpfReport.osDownstreamIfIndex ?: "n/a"}) -> " +
+                                "${bpfReport.upstreamIface.ifBlank { "?" }}(inferred=${bpfReport.inferredUpstreamIfIndex ?: "n/a"}/os=${bpfReport.osUpstreamIfIndex ?: "n/a"})",
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp,
                             color = ShizziTheme.colors.onSurfaceMuted,
                         )
                         Text(
                             text = "Published Flows: mapped=${bpfReport.activeMappedFlows} (up4=${bpfReport.totalUpstreamEntries}, down4=${bpfReport.totalDownstreamEntries}, revOk=${bpfReport.reverseMatchedCount}, ambig=${bpfReport.ambiguousTupleCount}, ifIdxErr=${bpfReport.ifIndexMismatchCount})",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            color = ShizziTheme.colors.onSurfaceMuted,
+                        )
+                        Text(
+                            text = "Flow Ages: known=${bpfReport.knownAgeEntries} • unavailable(-)=${bpfReport.unavailableAgeEntries} • negDelta=${bpfReport.negativeDeltaAgeEntries}",
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp,
                             color = ShizziTheme.colors.onSurfaceMuted,

@@ -318,7 +318,7 @@ class BpfFlowAttributionTest {
               tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:99999 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 1000ms
               tcp [82:2d:00:30:5f:2d] 0(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 1000ms
               tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 0 1000ms
-              tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 -5ms
+              tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 -5s
         """.trimIndent()
         // When wasTruncatedByReader == false, incomplete flow syntax is INCOMPLETE_FLOW_LINE (never TRUNCATED_LINE)
         val parsedMalformed = BpfDumpParser.parse(malformedRaw, wasTruncatedByReader = false)

@@ -1,6 +1,7 @@
 package dev.shizzi
 
 import android.os.Binder
+import android.system.Os
 import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -22,6 +23,7 @@ enum class ExperimentalBpfState {
     COLLECTING,
     MAPPINGS_AVAILABLE,
     PARTIAL_ENFORCEMENT,
+    STALE_ENFORCEMENT_DEGRADED,
     STALE_OR_UNAVAILABLE,
 }
 
@@ -54,6 +56,33 @@ enum class BpfRejectionReason {
     INVALID_IFINDEX,
     INVALID_PMTU,
     INVALID_AGE,
+}
+
+/**
+ * Explicit domain representation of the trailing flow age / last-used delta printed by
+ * AOSP `BpfCoordinator.dumpIpv4ForwardingRuleMap`:
+ *
+ * - [KnownNonNegative]: standard non-negative age (`230026ms`, `227s`, `0ms`, `0`).
+ * - [Unavailable]: literal `-` printed when `Tether4Value.lastUsed == 0` (rule installed in map,
+ *   no packet timestamp recorded yet). Never silently coerced to `0ms`.
+ * - [NegativeDelta]: small negative millisecond delta (`-3ms`, `-15ms`) printed when the kernel
+ *   eBPF datapath updates `lastUsed = bpf_ktime_get_boot_ns()` on an in-flight packet a few
+ *   milliseconds after `BpfCoordinator` sampled `now` at the start of map iteration.
+ */
+sealed class BpfFlowAge {
+    abstract val rawAgeMs: Long?
+
+    data class KnownNonNegative(val ageMs: Long) : BpfFlowAge() {
+        override val rawAgeMs: Long = ageMs
+    }
+
+    data object Unavailable : BpfFlowAge() {
+        override val rawAgeMs: Long? = null
+    }
+
+    data class NegativeDelta(val deltaMs: Long) : BpfFlowAge() {
+        override val rawAgeMs: Long = deltaMs
+    }
 }
 
 data class BpfRejectedLine(
@@ -93,7 +122,14 @@ data class BpfIpv4UpstreamEntry(
     val remotePort: Int,
     val outDstMac: String,
     val pmtu: Int,
-    val rawAgeMs: Long,
+    val rawAgeMs: Long?,
+    val flowAge: BpfFlowAge = if (rawAgeMs == null) {
+        BpfFlowAge.Unavailable
+    } else if (rawAgeMs < 0L) {
+        BpfFlowAge.NegativeDelta(rawAgeMs)
+    } else {
+        BpfFlowAge.KnownNonNegative(rawAgeMs)
+    },
 )
 
 /**
@@ -120,7 +156,14 @@ data class BpfIpv4DownstreamEntry(
     val origClientPort: Int,
     val clientOutDstMac: String,
     val pmtu: Int,
-    val rawAgeMs: Long,
+    val rawAgeMs: Long?,
+    val flowAge: BpfFlowAge = if (rawAgeMs == null) {
+        BpfFlowAge.Unavailable
+    } else if (rawAgeMs < 0L) {
+        BpfFlowAge.NegativeDelta(rawAgeMs)
+    } else {
+        BpfFlowAge.KnownNonNegative(rawAgeMs)
+    },
 )
 
 /**
@@ -159,6 +202,18 @@ data class BpfParsedDump(
             ipv4DownstreamEntries.isEmpty() &&
             rejectedLines.isEmpty()
 
+    val knownAgeEntries: Int
+        get() = ipv4UpstreamEntries.count { it.flowAge is BpfFlowAge.KnownNonNegative } +
+            ipv4DownstreamEntries.count { it.flowAge is BpfFlowAge.KnownNonNegative }
+
+    val unavailableAgeEntries: Int
+        get() = ipv4UpstreamEntries.count { it.flowAge is BpfFlowAge.Unavailable } +
+            ipv4DownstreamEntries.count { it.flowAge is BpfFlowAge.Unavailable }
+
+    val negativeDeltaAgeEntries: Int
+        get() = ipv4UpstreamEntries.count { it.flowAge is BpfFlowAge.NegativeDelta } +
+            ipv4DownstreamEntries.count { it.flowAge is BpfFlowAge.NegativeDelta }
+
     fun rejectionCountsByReason(): Map<String, Int> {
         if (rejectedLines.isEmpty()) return emptyMap()
         val counts = LinkedHashMap<String, Int>()
@@ -174,7 +229,14 @@ data class BpfParsedDump(
  */
 object BpfDumpParser {
 
-    const val PARSER_VERSION = 2
+    const val PARSER_VERSION = 3
+
+    /**
+     * Maximum negative age delta (in milliseconds) accepted as a legitimate in-iteration timestamp
+     * skew (`now - value.lastUsed < 0` when the kernel eBPF datapath updates `lastUsed` during map
+     * iteration). Negative values outside this bound or using non-`ms` units are rejected as [BpfRejectionReason.INVALID_AGE].
+     */
+    const val MIN_LEGITIMATE_NEGATIVE_AGE_MS = -30_000L
 
     private enum class Section {
         NONE,
@@ -186,13 +248,24 @@ object BpfDumpParser {
         RAW_MAP_UPSTREAM4,
     }
 
-    // Matches IPv4 Upstream / Downstream rows while allowing negative/zero numbers in numeric groups
-    // so we can classify INVALID_IFINDEX, INVALID_PMTU, INVALID_AGE, and INVALID_PORT accurately:
+    // Matches IPv4 Upstream / Downstream rows while capturing the trailing age token in group 15
+    // so we can validate KnownNonNegative ("230026ms", "227s", "0ms"), Unavailable ("-"),
+    // NegativeDelta ("-3ms", "-15ms"), and reject invalid age tokens as INVALID_AGE:
     // tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 230026ms
     private val IPV4_FLOW_ROW_REGEX = Regex(
-        """^\s*(\S+)\s+\[([^\]]+)]\s+(-?\d+)\(([^)]*)\)\s+([^\s:]+):(-?\d+)\s*->\s*(-?\d+)\(([^)]*)\)\s+([^\s:]+):(-?\d+)\s*->\s*([^\s:]+):(-?\d+)\s+\[([^\]]+)]\s+(-?\d+)\s+(-?\d+)(ms|s)?\s*$""",
+        """^\s*(\S+)\s+\[([^\]]+)]\s+(-?\d+)\(([^)]*)\)\s+([^\s:]+):(-?\d+)\s*->\s*(-?\d+)\(([^)]*)\)\s+([^\s:]+):(-?\d+)\s*->\s*([^\s:]+):(-?\d+)\s+\[([^\]]+)]\s+(-?\d+)\s+(\S+)\s*$""",
         RegexOption.IGNORE_CASE,
     )
+
+    // Strict pattern for the AOSP BpfCoordinator interface forwarding table header:
+    // "ifindex (iface) -> ifindex (iface)"
+    private val IFINDEX_TABLE_HEADER_REGEX = Regex(
+        """^ifindex\s*\(\s*iface\s*\)\s*->\s*ifindex\s*\(\s*iface\s*\)$""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    private val NON_NEGATIVE_AGE_REGEX = Regex("""^(\d+)(ms|s)?$""", RegexOption.IGNORE_CASE)
+    private val NEGATIVE_MS_AGE_REGEX = Regex("""^(-\d+)ms$""", RegexOption.IGNORE_CASE)
 
     private val MAC_REGEX = Regex("""^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$""")
     private val MASK_MAC_REGEX = Regex("""\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b""")
@@ -213,6 +286,40 @@ object BpfDumpParser {
         masked = MASK_IPV6_REGEX.replace(masked, "xxxx::xxxx")
         masked = MASK_TRAILING_PORT_REGEX.replace(masked, ":xxxx")
         return masked
+    }
+
+    /**
+     * Parses the trailing age token from an AOSP `BpfCoordinator` IPv4 flow line:
+     * - `"-"` -> [BpfFlowAge.Unavailable] (`rawAgeMs = null`)
+     * - `"<non-negative>(ms|s)?"` -> [BpfFlowAge.KnownNonNegative] (with overflow check on `s` -> `ms`)
+     * - `"-<digits>ms"` within `[MIN_LEGITIMATE_NEGATIVE_AGE_MS, -1]` -> [BpfFlowAge.NegativeDelta]
+     * - Anything else -> `null` (caller rejects line with [BpfRejectionReason.INVALID_AGE]).
+     */
+    internal fun parseFlowAge(ageToken: String): BpfFlowAge? {
+        val clean = ageToken.trim()
+        if (clean == "-") {
+            return BpfFlowAge.Unavailable
+        }
+        NON_NEGATIVE_AGE_REGEX.matchEntire(clean)?.let { m ->
+            val rawVal = m.groupValues[1].toLongOrNull() ?: return null
+            if (rawVal < 0L) return null
+            val unit = m.groupValues[2].lowercase()
+            val ageMs = if (unit == "s") {
+                if (rawVal > Long.MAX_VALUE / 1_000L) return null
+                rawVal * 1_000L
+            } else {
+                rawVal
+            }
+            return BpfFlowAge.KnownNonNegative(ageMs)
+        }
+        NEGATIVE_MS_AGE_REGEX.matchEntire(clean)?.let { m ->
+            val deltaMs = m.groupValues[1].toLongOrNull() ?: return null
+            if (deltaMs in MIN_LEGITIMATE_NEGATIVE_AGE_MS..-1L) {
+                return BpfFlowAge.NegativeDelta(deltaMs)
+            }
+            return null
+        }
+        return null
     }
 
     fun parse(dumpText: String, wasTruncatedByReader: Boolean = false): BpfParsedDump {
@@ -378,6 +485,9 @@ object BpfDumpParser {
      */
     internal fun isIgnorableSectionLine(trimmed: String): Boolean {
         if (trimmed.isEmpty()) return true
+        if (IFINDEX_TABLE_HEADER_REGEX.matches(trimmed)) {
+            return true
+        }
         val lower = trimmed.lowercase()
         if (lower == "none" || lower == "<empty>" || lower == "(none)" || lower == "(empty)" || lower == "empty") {
             return true
@@ -504,8 +614,7 @@ object BpfDumpParser {
         val port3 = match.groupValues[12].toIntOrNull()
         val mac2 = match.groupValues[13].trim().uppercase()
         val pmtu = match.groupValues[14].toIntOrNull()
-        val ageVal = match.groupValues[15].toLongOrNull()
-        val ageUnit = match.groupValues[16].lowercase()
+        val ageToken = match.groupValues[15].trim()
 
         if (!isValidMac(mac1) || !isValidMac(mac2)) {
             onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_MAC, trimmed.take(160)))
@@ -519,11 +628,11 @@ object BpfDumpParser {
             onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_PMTU, trimmed.take(160)))
             return
         }
-        if (ageVal == null || ageVal < 0L) {
+        val flowAge = parseFlowAge(ageToken)
+        if (flowAge == null) {
             onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_AGE, trimmed.take(160)))
             return
         }
-        val ageMs = if (ageUnit == "s") ageVal * 1_000L else ageVal
 
         if (!isValidIpv4(ip1) || !isValidIpv4(ip2) || !isValidIpv4(ip3)) {
             onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_IP, trimmed.take(160)))
@@ -554,7 +663,8 @@ object BpfDumpParser {
                     remotePort = port3,
                     outDstMac = mac2,
                     pmtu = pmtu,
-                    rawAgeMs = ageMs,
+                    rawAgeMs = flowAge.rawAgeMs,
+                    flowAge = flowAge,
                 ),
             )
         } else {
@@ -575,7 +685,8 @@ object BpfDumpParser {
                     origClientPort = port3,
                     clientOutDstMac = mac2,
                     pmtu = pmtu,
-                    rawAgeMs = ageMs,
+                    rawAgeMs = flowAge.rawAgeMs,
+                    flowAge = flowAge,
                 ),
             )
         }
@@ -649,6 +760,20 @@ data class TranslatedFlowKey(
 )
 
 /**
+ * Result of attempting to resolve a network interface's kernel `ifindex` from the OS.
+ *
+ * - [osIfIndex]: Positive kernel `ifindex` (`> 0`), or `null` if unavailable (`0` is never a valid `ifindex`).
+ * - [source]: `"OS_IF_NAMETOINDEX"`, `"NETWORK_INTERFACE"`, `"SYSFS"`, `"CUSTOM_RESOLVER"`, `"UNSET"`, or `"UNAVAILABLE"`.
+ * - [failureReason]: Diagnostic reason when [osIfIndex] is `null`.
+ */
+data class InterfaceIndexResolution(
+    val ifaceName: String,
+    val osIfIndex: Int?,
+    val source: String,
+    val failureReason: String = "",
+)
+
+/**
  * Immutable validated mapping for a single translated flow.
  */
 data class NatFlowMapping(
@@ -669,7 +794,14 @@ data class NatFlowMapping(
     val verifiedMac: String,
     val reverseMapConfirmed: Boolean,
     val collectedAtMonotonicMs: Long,
-    val rawDumpAgeMs: Long,
+    val rawDumpAgeMs: Long?,
+    val flowAge: BpfFlowAge = if (rawDumpAgeMs == null) {
+        BpfFlowAge.Unavailable
+    } else if (rawDumpAgeMs < 0L) {
+        BpfFlowAge.NegativeDelta(rawDumpAgeMs)
+    } else {
+        BpfFlowAge.KnownNonNegative(rawDumpAgeMs)
+    },
     val source: String = "dumpsys_tethering_bpf",
 )
 
@@ -719,6 +851,9 @@ data class BpfCollectionAttemptDiagnostic(
     val decisionReason: String = "",
     val upstreamEntries: Int = 0,
     val downstreamEntries: Int = 0,
+    val knownAgeEntries: Int = 0,
+    val unavailableAgeEntries: Int = 0,
+    val negativeDeltaAgeEntries: Int = 0,
     val rejectedLineCount: Int = 0,
     val rejectedByReason: Map<String, Int> = emptyMap(),
     val rejectedLines: List<BpfRejectedLine> = emptyList(),
@@ -738,10 +873,21 @@ data class NatFlowSnapshot(
     val downstreamIface: String = "",
     val upstreamIfIndex: Int = 0,
     val upstreamIface: String = "",
-    val resolvedDownstreamIfIndex: Int = 0,
-    val resolvedUpstreamIfIndex: Int = 0,
+    val osDownstreamIfIndex: Int? = null,
+    val osUpstreamIfIndex: Int? = null,
+    val inferredDownstreamIfIndex: Int? = null,
+    val inferredUpstreamIfIndex: Int? = null,
+    val downstreamIfIndexSource: String = "UNSET",
+    val upstreamIfIndexSource: String = "UNSET",
+    val downstreamIfIndexError: String = "",
+    val upstreamIfIndexError: String = "",
+    val resolvedDownstreamIfIndex: Int = osDownstreamIfIndex ?: 0,
+    val resolvedUpstreamIfIndex: Int = osUpstreamIfIndex ?: 0,
     val totalUpstreamEntries: Int = 0,
     val totalDownstreamEntries: Int = 0,
+    val knownAgeEntries: Int = 0,
+    val unavailableAgeEntries: Int = 0,
+    val negativeDeltaAgeEntries: Int = 0,
     val reverseMatchedCount: Int = 0,
     val flowsByTuple: Map<TranslatedFlowKey, NatFlowMapping> = emptyMap(),
     val ambiguousTuples: Map<TranslatedFlowKey, String> = emptyMap(),
@@ -761,7 +907,8 @@ class NatFlowAttributor(
     var maxFreshnessMs: Long = DEFAULT_MAX_FRESHNESS_MS,
     val maxMappedFlows: Int = DEFAULT_MAX_MAPPED_FLOWS,
     var allowSafePartialPublication: Boolean = false,
-    private val interfaceIndexResolver: (String) -> Int = ::defaultResolveIfIndex,
+    private val interfaceIndexResolver: ((String) -> Int)? = null,
+    private val interfaceResolutionProvider: (String) -> InterfaceIndexResolution = ::defaultResolveInterfaceIndex,
 ) {
 
     private val sessionGen = AtomicLong(1L)
@@ -855,6 +1002,38 @@ class NatFlowAttributor(
         bindingGen.incrementAndGet()
     }
 
+    private fun resolveInterface(ifaceName: String): InterfaceIndexResolution {
+        val clean = ifaceName.trim()
+        if (clean.isEmpty()) {
+            return InterfaceIndexResolution(
+                ifaceName = "",
+                osIfIndex = null,
+                source = "UNSET",
+                failureReason = "Interface name not configured",
+            )
+        }
+        val custom = interfaceIndexResolver
+        if (custom != null) {
+            val idx = runCatching { custom(clean) }.getOrDefault(0)
+            return if (idx > 0) {
+                InterfaceIndexResolution(
+                    ifaceName = clean,
+                    osIfIndex = idx,
+                    source = "CUSTOM_RESOLVER",
+                    failureReason = "",
+                )
+            } else {
+                InterfaceIndexResolution(
+                    ifaceName = clean,
+                    osIfIndex = null,
+                    source = "UNAVAILABLE",
+                    failureReason = "custom resolver returned $idx for $clean",
+                )
+            }
+        }
+        return interfaceResolutionProvider(clean)
+    }
+
     /**
      * Validates and publishes a parsed BPF dump for [collectionSessionGeneration].
      *
@@ -864,7 +1043,8 @@ class NatFlowAttributor(
      * 3. Resolves `origClientIp` via [ipToMac] and cross-checks matching reverse downstream
      *    `clientOutDstMac` when present.
      * 4. Validates `ifindex` consistency and reverse parity (`down.inIfIndex == up.outIfIndex` and
-     *    `down.outIfIndex == up.inIfIndex`).
+     *    `down.outIfIndex == up.inIfIndex`). Never trusts an isolated numeric label (`251(251)`)
+     *    unless corroborated by OS `ifindex` or a named interface label + reverse-direction parity.
      * 5. Marks duplicate or contradictory ownership as ambiguous instead of picking the first match.
      * 6. Keeps the last collection attempt diagnostic strictly separate from the last published
      *    valid snapshot; never overwrites a valid fresh snapshot with a failed/rejected attempt.
@@ -908,6 +1088,9 @@ class NatFlowAttributor(
                     decisionReason = "Rejected: collector status ${collectionStatus.name}",
                     upstreamEntries = parsed.ipv4UpstreamEntries.size,
                     downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                    knownAgeEntries = parsed.knownAgeEntries,
+                    unavailableAgeEntries = parsed.unavailableAgeEntries,
+                    negativeDeltaAgeEntries = parsed.negativeDeltaAgeEntries,
                     rejectedLineCount = parsed.rejectedLines.size,
                     rejectedByReason = reasonCounts,
                     rejectedLines = capturedRejectedLines,
@@ -942,6 +1125,9 @@ class NatFlowAttributor(
                     decisionReason = "Rejected: ${effectiveStatus.name}",
                     upstreamEntries = parsed.ipv4UpstreamEntries.size,
                     downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                    knownAgeEntries = parsed.knownAgeEntries,
+                    unavailableAgeEntries = parsed.unavailableAgeEntries,
+                    negativeDeltaAgeEntries = parsed.negativeDeltaAgeEntries,
                     rejectedLineCount = parsed.rejectedLines.size,
                     rejectedByReason = reasonCounts,
                     rejectedLines = capturedRejectedLines,
@@ -971,6 +1157,9 @@ class NatFlowAttributor(
                     decisionReason = "Rejected conservative policy: ${parsed.rejectedLines.size} invalid flow line(s) [$reasonSummary]",
                     upstreamEntries = parsed.ipv4UpstreamEntries.size,
                     downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                    knownAgeEntries = parsed.knownAgeEntries,
+                    unavailableAgeEntries = parsed.unavailableAgeEntries,
+                    negativeDeltaAgeEntries = parsed.negativeDeltaAgeEntries,
                     rejectedLineCount = parsed.rejectedLines.size,
                     rejectedByReason = reasonCounts,
                     rejectedLines = capturedRejectedLines,
@@ -1000,6 +1189,9 @@ class NatFlowAttributor(
                         decisionReason = "Rejected: 0 valid flows and ${parsed.rejectedLines.size} rejected line(s)",
                         upstreamEntries = 0,
                         downstreamEntries = 0,
+                        knownAgeEntries = 0,
+                        unavailableAgeEntries = 0,
+                        negativeDeltaAgeEntries = 0,
                         rejectedLineCount = parsed.rejectedLines.size,
                         rejectedByReason = reasonCounts,
                         rejectedLines = capturedRejectedLines,
@@ -1026,43 +1218,80 @@ class NatFlowAttributor(
             }
         }
 
-        // Resolve kernel ifindex for active interfaces when available on the host
-        val resolvedDownIfIndex = if (activeDownstreamIface.isNotBlank()) {
-            interfaceIndexResolver(activeDownstreamIface)
-        } else {
-            0
-        }
-        val resolvedUpIfIndex = if (activeUpstreamIface.isNotBlank()) {
-            interfaceIndexResolver(activeUpstreamIface)
-        } else {
-            0
-        }
+        // 1. Resolve kernel ifindex from the OS (never treating 0 as a valid index)
+        val downRes = resolveInterface(activeDownstreamIface)
+        val upRes = resolveInterface(activeUpstreamIface)
+        val osDownIfIndex: Int? = downRes.osIfIndex
+        val osUpIfIndex: Int? = upRes.osIfIndex
 
-        // Also infer named interface indices from explicit labels in the dump (e.g. "214(testtun46)")
-        var inferredDownIfIndex = resolvedDownIfIndex
-        var inferredUpIfIndex = resolvedUpIfIndex
+        // 2. Infer interface indices from explicit non-numeric interface labels in the dump (e.g. "250(testtun58)")
+        var namedDumpDownIfIndex: Int? = null
+        var namedDumpUpIfIndex: Int? = null
         for (up in parsed.ipv4UpstreamEntries) {
-            if (inferredDownIfIndex == 0 && !up.inIfaceLabel.all { it.isDigit() } &&
+            if (namedDumpDownIfIndex == null && up.inIfaceLabel.isNotEmpty() && !up.inIfaceLabel.all { it.isDigit() } &&
                 matchesActiveDownstreamLabel(up.inIfaceLabel)
             ) {
-                inferredDownIfIndex = up.inIfIndex
+                namedDumpDownIfIndex = up.inIfIndex
             }
-            if (inferredUpIfIndex == 0 && !up.outIfaceLabel.all { it.isDigit() } &&
+            if (namedDumpUpIfIndex == null && up.outIfaceLabel.isNotEmpty() && !up.outIfaceLabel.all { it.isDigit() } &&
                 matchesActiveUpstreamLabel(up.outIfaceLabel)
             ) {
-                inferredUpIfIndex = up.outIfIndex
+                namedDumpUpIfIndex = up.outIfIndex
             }
         }
         for (down in parsed.ipv4DownstreamEntries) {
-            if (inferredUpIfIndex == 0 && !down.inIfaceLabel.all { it.isDigit() } &&
+            if (namedDumpUpIfIndex == null && down.inIfaceLabel.isNotEmpty() && !down.inIfaceLabel.all { it.isDigit() } &&
                 matchesActiveUpstreamLabel(down.inIfaceLabel)
             ) {
-                inferredUpIfIndex = down.inIfIndex
+                namedDumpUpIfIndex = down.inIfIndex
             }
-            if (inferredDownIfIndex == 0 && !down.outIfaceLabel.all { it.isDigit() } &&
+            if (namedDumpDownIfIndex == null && down.outIfaceLabel.isNotEmpty() && !down.outIfaceLabel.all { it.isDigit() } &&
                 matchesActiveDownstreamLabel(down.outIfaceLabel)
             ) {
-                inferredDownIfIndex = down.outIfIndex
+                namedDumpDownIfIndex = down.outIfIndex
+            }
+        }
+
+        var inferredUpIfIndex: Int? = osUpIfIndex ?: namedDumpUpIfIndex
+        var inferredDownIfIndex: Int? = osDownIfIndex ?: namedDumpDownIfIndex
+
+        // 3. Corroborate numeric labels (e.g. "251(251)" paired with "250(testtun58)") ONLY when:
+        //    - The paired interface has a verified OS or named dump ifindex (or neither active interface was configured), AND
+        //    - Reverse-direction parity confirms the exact reversed pair (down.inIfIndex == up.outIfIndex && down.outIfIndex == up.inIfIndex)
+        //      whenever downstream entries are present.
+        val interfacesConfigured = activeDownstreamIface.isNotBlank() || activeUpstreamIface.isNotBlank()
+        if (inferredDownIfIndex == null && (inferredUpIfIndex != null || !interfacesConfigured)) {
+            val candidateDownIndices = LinkedHashSet<Int>()
+            for (up in parsed.ipv4UpstreamEntries) {
+                val upMatchesKnown = inferredUpIfIndex == null || up.outIfIndex == inferredUpIfIndex
+                if (!upMatchesKnown || up.inIfIndex <= 0 || up.inIfIndex == up.outIfIndex) continue
+                val reverseParityConfirmed = parsed.ipv4DownstreamEntries.isEmpty() ||
+                    parsed.ipv4DownstreamEntries.any { down ->
+                        down.inIfIndex == up.outIfIndex && down.outIfIndex == up.inIfIndex
+                    }
+                if (reverseParityConfirmed) {
+                    candidateDownIndices.add(up.inIfIndex)
+                }
+            }
+            if (candidateDownIndices.size == 1) {
+                inferredDownIfIndex = candidateDownIndices.first()
+            }
+        }
+        if (inferredUpIfIndex == null && (inferredDownIfIndex != null || !interfacesConfigured)) {
+            val candidateUpIndices = LinkedHashSet<Int>()
+            for (up in parsed.ipv4UpstreamEntries) {
+                val downMatchesKnown = inferredDownIfIndex == null || up.inIfIndex == inferredDownIfIndex
+                if (!downMatchesKnown || up.outIfIndex <= 0 || up.inIfIndex == up.outIfIndex) continue
+                val reverseParityConfirmed = parsed.ipv4DownstreamEntries.isEmpty() ||
+                    parsed.ipv4DownstreamEntries.any { down ->
+                        down.inIfIndex == up.outIfIndex && down.outIfIndex == up.inIfIndex
+                    }
+                if (reverseParityConfirmed) {
+                    candidateUpIndices.add(up.outIfIndex)
+                }
+            }
+            if (candidateUpIndices.size == 1) {
+                inferredUpIfIndex = candidateUpIndices.first()
             }
         }
 
@@ -1095,9 +1324,9 @@ class NatFlowAttributor(
         var unverifiedOwners = 0
         var ifIndexMismatches = 0
         var coverageIncomplete = parsed.hasRejections
-        var observedDownIfIndex = inferredDownIfIndex
+        var observedDownIfIndex = inferredDownIfIndex ?: 0
         var observedDownIface = activeDownstreamIface
-        var observedUpIfIndex = inferredUpIfIndex
+        var observedUpIfIndex = inferredUpIfIndex ?: 0
         var observedUpIface = activeUpstreamIface
 
         val perClientTcp = HashMap<String, Int>()
@@ -1114,14 +1343,23 @@ class NatFlowAttributor(
                 remotePort = up.remotePort,
             )
 
+            // Do not trust an isolated numeric label (e.g. "251(251) -> 250(250)") when active interfaces
+            // are configured unless at least one side is corroborated by OS ifindex or an explicit named
+            // interface label and inferredDownIfIndex / inferredUpIfIndex were established.
+            val uncorroboratedNumericWhenConfigured = interfacesConfigured &&
+                (inferredDownIfIndex == null || inferredUpIfIndex == null)
+
             // Validate upstream interface labels and ifindex consistency
             val labelMatches = matchesActiveDownstreamLabel(up.inIfaceLabel) &&
                 matchesActiveUpstreamLabel(up.outIfaceLabel)
-            val upIfIndexValid = up.inIfIndex > 0 && up.outIfIndex > 0 && up.inIfIndex != up.outIfIndex &&
-                (inferredDownIfIndex == 0 || up.inIfIndex == inferredDownIfIndex) &&
-                (inferredUpIfIndex == 0 || up.outIfIndex == inferredUpIfIndex) &&
-                (inferredUpIfIndex == 0 || up.inIfIndex != inferredUpIfIndex) &&
-                (inferredDownIfIndex == 0 || up.outIfIndex != inferredDownIfIndex) &&
+            val upIfIndexValid = !uncorroboratedNumericWhenConfigured &&
+                up.inIfIndex > 0 && up.outIfIndex > 0 && up.inIfIndex != up.outIfIndex &&
+                (osDownIfIndex == null || up.inIfIndex == osDownIfIndex) &&
+                (osUpIfIndex == null || up.outIfIndex == osUpIfIndex) &&
+                (inferredDownIfIndex == null || up.inIfIndex == inferredDownIfIndex) &&
+                (inferredUpIfIndex == null || up.outIfIndex == inferredUpIfIndex) &&
+                (inferredUpIfIndex == null || up.inIfIndex != inferredUpIfIndex) &&
+                (inferredDownIfIndex == null || up.outIfIndex != inferredDownIfIndex) &&
                 (observedDownIfIndex == 0 || up.inIfIndex == observedDownIfIndex) &&
                 (observedUpIfIndex == 0 || up.outIfIndex == observedUpIfIndex)
 
@@ -1269,6 +1507,7 @@ class NatFlowAttributor(
                 reverseMapConfirmed = hasReverseConfirm,
                 collectedAtMonotonicMs = nowMono,
                 rawDumpAgeMs = up.rawAgeMs,
+                flowAge = up.flowAge,
             )
             validFlows[tupleKey] = mapping
             // Clear any pending SYN refresh flag now that a newer snapshot has arrived
@@ -1298,6 +1537,9 @@ class NatFlowAttributor(
             BpfCollectionStatus.OK
         }
 
+        val finalInferredDown = observedDownIfIndex.takeIf { it > 0 } ?: inferredDownIfIndex
+        val finalInferredUp = observedUpIfIndex.takeIf { it > 0 } ?: inferredUpIfIndex
+
         val snapshot = NatFlowSnapshot(
             sessionGeneration = expectedGen,
             bindingGeneration = curBindGen,
@@ -1305,14 +1547,25 @@ class NatFlowAttributor(
             collectionDurationMs = collectionDurationMs,
             collectionStatus = finalStatus,
             collectionError = collectionError,
-            downstreamIfIndex = observedDownIfIndex,
+            downstreamIfIndex = finalInferredDown ?: osDownIfIndex ?: 0,
             downstreamIface = observedDownIface,
-            upstreamIfIndex = observedUpIfIndex,
+            upstreamIfIndex = finalInferredUp ?: osUpIfIndex ?: 0,
             upstreamIface = observedUpIface,
-            resolvedDownstreamIfIndex = resolvedDownIfIndex,
-            resolvedUpstreamIfIndex = resolvedUpIfIndex,
+            osDownstreamIfIndex = osDownIfIndex,
+            osUpstreamIfIndex = osUpIfIndex,
+            inferredDownstreamIfIndex = finalInferredDown,
+            inferredUpstreamIfIndex = finalInferredUp,
+            downstreamIfIndexSource = downRes.source,
+            upstreamIfIndexSource = upRes.source,
+            downstreamIfIndexError = downRes.failureReason,
+            upstreamIfIndexError = upRes.failureReason,
+            resolvedDownstreamIfIndex = osDownIfIndex ?: 0,
+            resolvedUpstreamIfIndex = osUpIfIndex ?: 0,
             totalUpstreamEntries = parsed.ipv4UpstreamEntries.size,
             totalDownstreamEntries = parsed.ipv4DownstreamEntries.size,
+            knownAgeEntries = parsed.knownAgeEntries,
+            unavailableAgeEntries = parsed.unavailableAgeEntries,
+            negativeDeltaAgeEntries = parsed.negativeDeltaAgeEntries,
             reverseMatchedCount = reverseMatched,
             flowsByTuple = validFlows,
             ambiguousTuples = ambiguousTuples,
@@ -1344,6 +1597,9 @@ class NatFlowAttributor(
                 },
                 upstreamEntries = parsed.ipv4UpstreamEntries.size,
                 downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                knownAgeEntries = parsed.knownAgeEntries,
+                unavailableAgeEntries = parsed.unavailableAgeEntries,
+                negativeDeltaAgeEntries = parsed.negativeDeltaAgeEntries,
                 rejectedLineCount = parsed.rejectedLines.size,
                 rejectedByReason = reasonCounts,
                 rejectedLines = capturedRejectedLines,
@@ -1472,14 +1728,14 @@ class NatFlowAttributor(
     private fun matchesActiveDownstreamLabel(dumpIfaceLabel: String): Boolean {
         val active = activeDownstreamIface
         if (active.isEmpty() || dumpIfaceLabel.isEmpty()) return true
-        if (dumpIfaceLabel.all { it.isDigit() }) return true // e.g., 215(215), validated via ifindex parity
+        if (dumpIfaceLabel.all { it.isDigit() }) return true // e.g., 251(251), corroborated via reverse ifindex parity
         return dumpIfaceLabel.equals(active, ignoreCase = true)
     }
 
     private fun matchesActiveUpstreamLabel(dumpIfaceLabel: String): Boolean {
         val active = activeUpstreamIface
         if (active.isEmpty() || dumpIfaceLabel.isEmpty()) return true
-        if (dumpIfaceLabel.all { it.isDigit() }) return true // validated via ifindex parity
+        if (dumpIfaceLabel.all { it.isDigit() }) return true // corroborated via reverse ifindex parity
         return dumpIfaceLabel.equals(active, ignoreCase = true)
     }
 
@@ -1493,18 +1749,91 @@ class NatFlowAttributor(
         private val EXTRACT_MAC_REGEX = Regex("""\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b""")
         private val EXTRACT_ENDPOINT_REGEX = Regex("""\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b""")
 
-        fun defaultResolveIfIndex(ifaceName: String): Int {
+        /**
+         * Resolves the kernel `ifindex` for [ifaceName] using:
+         * 1. `Os.if_nametoindex(clean)` (direct POSIX `SIOCGIFINDEX` ioctl)
+         * 2. `NetworkInterface.getByName(clean)?.index`
+         * 3. `/sys/class/net/<ifaceName>/ifindex`
+         *
+         * Never treats `0` as a valid `ifindex`: returns `osIfIndex = null` with a concrete
+         * [InterfaceIndexResolution.failureReason] when all OS resolution paths fail.
+         */
+        fun defaultResolveInterfaceIndex(ifaceName: String): InterfaceIndexResolution {
             val clean = ifaceName.trim()
-            if (clean.isEmpty()) return 0
-            val fromNetIface = runCatching {
-                java.net.NetworkInterface.getByName(clean)?.index ?: 0
-            }.getOrDefault(0)
-            if (fromNetIface > 0) return fromNetIface
-            return runCatching {
+            if (clean.isEmpty()) {
+                return InterfaceIndexResolution(
+                    ifaceName = "",
+                    osIfIndex = null,
+                    source = "UNSET",
+                    failureReason = "Interface name is blank",
+                )
+            }
+            val errors = ArrayList<String>(3)
+
+            // 1. POSIX Os.if_nametoindex (SIOCGIFINDEX ioctl)
+            try {
+                val osIdx = Os.if_nametoindex(clean)
+                if (osIdx > 0) {
+                    return InterfaceIndexResolution(
+                        ifaceName = clean,
+                        osIfIndex = osIdx,
+                        source = "OS_IF_NAMETOINDEX",
+                        failureReason = "",
+                    )
+                }
+                errors.add("Os.if_nametoindex($clean)=0")
+            } catch (t: Throwable) {
+                errors.add("Os.if_nametoindex: ${t.javaClass.simpleName}(${t.message ?: "error"})")
+            }
+
+            // 2. java.net.NetworkInterface.getByName
+            try {
+                val netIf = java.net.NetworkInterface.getByName(clean)
+                val netIdx = netIf?.index ?: 0
+                if (netIdx > 0) {
+                    return InterfaceIndexResolution(
+                        ifaceName = clean,
+                        osIfIndex = netIdx,
+                        source = "NETWORK_INTERFACE",
+                        failureReason = "",
+                    )
+                }
+                errors.add(if (netIf == null) "NetworkInterface.getByName($clean)=null" else "NetworkInterface.index=$netIdx")
+            } catch (t: Throwable) {
+                errors.add("NetworkInterface: ${t.javaClass.simpleName}(${t.message ?: "error"})")
+            }
+
+            // 3. /sys/class/net/<iface>/ifindex
+            try {
                 val f = java.io.File("/sys/class/net/$clean/ifindex")
-                if (f.isFile && f.canRead()) f.readText().trim().toIntOrNull() ?: 0 else 0
-            }.getOrDefault(0)
+                if (f.isFile && f.canRead()) {
+                    val sysIdx = f.readText().trim().toIntOrNull() ?: 0
+                    if (sysIdx > 0) {
+                        return InterfaceIndexResolution(
+                            ifaceName = clean,
+                            osIfIndex = sysIdx,
+                            source = "SYSFS",
+                            failureReason = "",
+                        )
+                    }
+                    errors.add("sysfs($clean)=$sysIdx")
+                } else {
+                    errors.add("sysfs($clean): exists=${f.exists()}, canRead=${f.canRead()}")
+                }
+            } catch (t: Throwable) {
+                errors.add("sysfs: ${t.javaClass.simpleName}(${t.message ?: "error"})")
+            }
+
+            return InterfaceIndexResolution(
+                ifaceName = clean,
+                osIfIndex = null,
+                source = "UNAVAILABLE",
+                failureReason = errors.joinToString("; "),
+            )
         }
+
+        fun defaultResolveIfIndex(ifaceName: String): Int =
+            defaultResolveInterfaceIndex(ifaceName).osIfIndex ?: 0
     }
 }
 
@@ -1794,7 +2123,7 @@ class BpfMapReader(
                 val durationMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(0L)
                 val msg = "${e.javaClass.simpleName}: ${e.message ?: "unknown error"}"
                 BpfRawCollectionResult(
-                    status = BpfCollectionStatus.COMMAND_FAILED,
+                    status = statusForException(e),
                     exitCode = -1,
                     durationMs = durationMs,
                     stdout = "",
@@ -1805,6 +2134,15 @@ class BpfMapReader(
                 )
             } finally {
                 Binder.restoreCallingIdentity(token)
+            }
+        }
+
+        private fun statusForException(e: Throwable): BpfCollectionStatus {
+            val msg = (e.message ?: "").lowercase()
+            return if (e is SecurityException || msg.contains("permission")) {
+                BpfCollectionStatus.PERMISSION_DENIED
+            } else {
+                BpfCollectionStatus.COMMAND_FAILED
             }
         }
     }
@@ -1855,6 +2193,9 @@ class BpfMapReader(
  * 1. **Last Published Snapshot** (`collectionStatus`, `snapshotAgeMs`, `activeMappedFlows`, etc.)
  * 2. **Last Collection Attempt** (`lastAttemptStatus`, `lastAttemptSnapshotPublished`,
  *    `lastAttemptRejectedLines`, `lastAttemptRejectedByReason`, etc.)
+ * 3. **OS vs. Inferred Interface Index (`ifindex`)**:
+ *    - `osDownstreamIfIndex` / `osUpstreamIfIndex`: `Int?` (`null` when unavailable from OS)
+ *    - `inferredDownstreamIfIndex` / `inferredUpstreamIfIndex`: `Int?` (`null` when not inferred from dump)
  */
 data class BpfAttributionStatusReport(
     val experimentalEnabled: Boolean = false,
@@ -1871,10 +2212,21 @@ data class BpfAttributionStatusReport(
     val downstreamIfIndex: Int = 0,
     val upstreamIface: String = "",
     val upstreamIfIndex: Int = 0,
-    val resolvedDownstreamIfIndex: Int = 0,
-    val resolvedUpstreamIfIndex: Int = 0,
+    val osDownstreamIfIndex: Int? = null,
+    val osUpstreamIfIndex: Int? = null,
+    val inferredDownstreamIfIndex: Int? = null,
+    val inferredUpstreamIfIndex: Int? = null,
+    val downstreamIfIndexSource: String = "UNSET",
+    val upstreamIfIndexSource: String = "UNSET",
+    val downstreamIfIndexError: String = "",
+    val upstreamIfIndexError: String = "",
+    val resolvedDownstreamIfIndex: Int = osDownstreamIfIndex ?: 0,
+    val resolvedUpstreamIfIndex: Int = osUpstreamIfIndex ?: 0,
     val totalUpstreamEntries: Int = 0,
     val totalDownstreamEntries: Int = 0,
+    val knownAgeEntries: Int = 0,
+    val unavailableAgeEntries: Int = 0,
+    val negativeDeltaAgeEntries: Int = 0,
     val reverseMatchedCount: Int = 0,
     val activeMappedFlows: Int = 0,
     val ambiguousTupleCount: Int = 0,
@@ -1892,6 +2244,9 @@ data class BpfAttributionStatusReport(
     val lastAttemptDecisionReason: String = "",
     val lastAttemptUpstreamEntries: Int = 0,
     val lastAttemptDownstreamEntries: Int = 0,
+    val lastAttemptKnownAgeEntries: Int = 0,
+    val lastAttemptUnavailableAgeEntries: Int = 0,
+    val lastAttemptNegativeDeltaAgeEntries: Int = 0,
     val lastAttemptRejectedLineCount: Int = 0,
     val lastAttemptRejectedByReason: Map<String, Int> = emptyMap(),
     val lastAttemptRejectedLines: List<BpfRejectedLine> = emptyList(),
@@ -1927,10 +2282,21 @@ data class BpfAttributionStatusReport(
         put("downstreamIfIndex", downstreamIfIndex)
         put("upstreamIface", upstreamIface)
         put("upstreamIfIndex", upstreamIfIndex)
+        put("osDownstreamIfIndex", osDownstreamIfIndex ?: JSONObject.NULL)
+        put("osUpstreamIfIndex", osUpstreamIfIndex ?: JSONObject.NULL)
+        put("inferredDownstreamIfIndex", inferredDownstreamIfIndex ?: JSONObject.NULL)
+        put("inferredUpstreamIfIndex", inferredUpstreamIfIndex ?: JSONObject.NULL)
+        put("downstreamIfIndexSource", downstreamIfIndexSource)
+        put("upstreamIfIndexSource", upstreamIfIndexSource)
+        put("downstreamIfIndexError", downstreamIfIndexError)
+        put("upstreamIfIndexError", upstreamIfIndexError)
         put("resolvedDownstreamIfIndex", resolvedDownstreamIfIndex)
         put("resolvedUpstreamIfIndex", resolvedUpstreamIfIndex)
         put("totalUpstreamEntries", totalUpstreamEntries)
         put("totalDownstreamEntries", totalDownstreamEntries)
+        put("knownAgeEntries", knownAgeEntries)
+        put("unavailableAgeEntries", unavailableAgeEntries)
+        put("negativeDeltaAgeEntries", negativeDeltaAgeEntries)
         put("reverseMatchedCount", reverseMatchedCount)
         put("activeMappedFlows", activeMappedFlows)
         put("ambiguousTupleCount", ambiguousTupleCount)
@@ -1947,6 +2313,9 @@ data class BpfAttributionStatusReport(
         put("lastAttemptDecisionReason", lastAttemptDecisionReason)
         put("lastAttemptUpstreamEntries", lastAttemptUpstreamEntries)
         put("lastAttemptDownstreamEntries", lastAttemptDownstreamEntries)
+        put("lastAttemptKnownAgeEntries", lastAttemptKnownAgeEntries)
+        put("lastAttemptUnavailableAgeEntries", lastAttemptUnavailableAgeEntries)
+        put("lastAttemptNegativeDeltaAgeEntries", lastAttemptNegativeDeltaAgeEntries)
         put("lastAttemptRejectedLineCount", lastAttemptRejectedLineCount)
         put("omittedRejectedLineCount", omittedRejectedLineCount)
         val reasonsObj = JSONObject()
@@ -2017,15 +2386,22 @@ data class BpfAttributionStatusReport(
         appendLine("- **Parser Version**: `$parserVersion`")
         appendLine("- **Session / Binding Generation**: `session=$sessionGeneration`, `binding=$bindingGeneration`")
         appendLine(
-            "- **Interfaces**: downstream `${downstreamIface.ifBlank { "unknown" }}` " +
-                "(dump ifindex `$downstreamIfIndex`, host ifindex `$resolvedDownstreamIfIndex`) -> " +
-                "upstream `${upstreamIface.ifBlank { "unknown" }}` " +
-                "(dump ifindex `$upstreamIfIndex`, host ifindex `$resolvedUpstreamIfIndex`)",
+            "- **Downstream Interface**: `${downstreamIface.ifBlank { "unknown" }}` " +
+                "(inferred ifindex `${inferredDownstreamIfIndex ?: "unavailable"}`, " +
+                "OS ifindex `${osDownstreamIfIndex ?: "unavailable"}` [$downstreamIfIndexSource]" +
+                (if (downstreamIfIndexError.isNotBlank()) " — `$downstreamIfIndexError`" else "") + ")",
+        )
+        appendLine(
+            "- **Upstream Interface**: `${upstreamIface.ifBlank { "unknown" }}` " +
+                "(inferred ifindex `${inferredUpstreamIfIndex ?: "unavailable"}`, " +
+                "OS ifindex `${osUpstreamIfIndex ?: "unavailable"}` [$upstreamIfIndexSource]" +
+                (if (upstreamIfIndexError.isNotBlank()) " — `$upstreamIfIndexError`" else "") + ")",
         )
         appendLine()
         appendLine("## 1. Last Published Valid Snapshot Summary")
         appendLine("- **IPv4 Upstream Entries (Published)**: `$totalUpstreamEntries`")
         appendLine("- **IPv4 Downstream Entries (Published)**: `$totalDownstreamEntries`")
+        appendLine("- **Flow Age Distribution (Published)**: knownNonNegative=`$knownAgeEntries`, unavailable(`-`)=`$unavailableAgeEntries`, negativeDelta=`$negativeDeltaAgeEntries`")
         appendLine("- **Reverse-Confirmed Mappings**: `$reverseMatchedCount`")
         appendLine("- **Active Validated Flow Mappings**: `$activeMappedFlows`")
         appendLine("- **Ambiguous / Conflicting Tuples**: `$ambiguousTupleCount`")
@@ -2057,7 +2433,7 @@ data class BpfAttributionStatusReport(
         if (lastAttemptError.isNotBlank()) {
             appendLine("- **Last Attempt Error**: `$lastAttemptError`")
         }
-        appendLine("- **Parsed Entries in Last Attempt**: upstream `$lastAttemptUpstreamEntries`, downstream `$lastAttemptDownstreamEntries`")
+        appendLine("- **Parsed Entries in Last Attempt**: upstream `$lastAttemptUpstreamEntries`, downstream `$lastAttemptDownstreamEntries` (knownAge=`$lastAttemptKnownAgeEntries`, unavailable(`-`)=`$lastAttemptUnavailableAgeEntries`, negativeDelta=`$lastAttemptNegativeDeltaAgeEntries`)")
         appendLine("- **Rejected Flow Lines in Last Attempt**: `$lastAttemptRejectedLineCount` (omitted from sample: `$omittedRejectedLineCount`)")
         if (lastAttemptRejectedByReason.isNotEmpty()) {
             val summary = lastAttemptRejectedByReason.entries.joinToString(", ") { "`${it.key}`=${it.value}" }
@@ -2094,6 +2470,12 @@ data class BpfAttributionStatusReport(
     }
 
     companion object {
+        private fun JSONObject.optPositiveIntOrNull(key: String): Int? {
+            if (isNull(key)) return null
+            val v = optInt(key, 0)
+            return if (v > 0) v else null
+        }
+
         fun fromJson(json: JSONObject?): BpfAttributionStatusReport {
             if (json == null) return BpfAttributionStatusReport()
             val perClientList = mutableListOf<ClientProtocolFlowCounts>()
@@ -2138,6 +2520,15 @@ data class BpfAttributionStatusReport(
                     )
                 }
             }
+            val osDown = json.optPositiveIntOrNull("osDownstreamIfIndex")
+                ?: json.optPositiveIntOrNull("resolvedDownstreamIfIndex")
+            val osUp = json.optPositiveIntOrNull("osUpstreamIfIndex")
+                ?: json.optPositiveIntOrNull("resolvedUpstreamIfIndex")
+            val inferredDown = json.optPositiveIntOrNull("inferredDownstreamIfIndex")
+                ?: json.optPositiveIntOrNull("downstreamIfIndex")
+            val inferredUp = json.optPositiveIntOrNull("inferredUpstreamIfIndex")
+                ?: json.optPositiveIntOrNull("upstreamIfIndex")
+
             return BpfAttributionStatusReport(
                 experimentalEnabled = json.optBoolean("experimentalEnabled", false),
                 state = runCatching {
@@ -2154,13 +2545,24 @@ data class BpfAttributionStatusReport(
                 sessionGeneration = json.optLong("sessionGeneration", 0L),
                 bindingGeneration = json.optLong("bindingGeneration", 0L),
                 downstreamIface = json.optString("downstreamIface", ""),
-                downstreamIfIndex = json.optInt("downstreamIfIndex", 0),
+                downstreamIfIndex = json.optInt("downstreamIfIndex", inferredDown ?: osDown ?: 0),
                 upstreamIface = json.optString("upstreamIface", ""),
-                upstreamIfIndex = json.optInt("upstreamIfIndex", 0),
-                resolvedDownstreamIfIndex = json.optInt("resolvedDownstreamIfIndex", 0),
-                resolvedUpstreamIfIndex = json.optInt("resolvedUpstreamIfIndex", 0),
+                upstreamIfIndex = json.optInt("upstreamIfIndex", inferredUp ?: osUp ?: 0),
+                osDownstreamIfIndex = osDown,
+                osUpstreamIfIndex = osUp,
+                inferredDownstreamIfIndex = inferredDown,
+                inferredUpstreamIfIndex = inferredUp,
+                downstreamIfIndexSource = json.optString("downstreamIfIndexSource", "UNSET"),
+                upstreamIfIndexSource = json.optString("upstreamIfIndexSource", "UNSET"),
+                downstreamIfIndexError = json.optString("downstreamIfIndexError", ""),
+                upstreamIfIndexError = json.optString("upstreamIfIndexError", ""),
+                resolvedDownstreamIfIndex = osDown ?: 0,
+                resolvedUpstreamIfIndex = osUp ?: 0,
                 totalUpstreamEntries = json.optInt("totalUpstreamEntries", 0),
                 totalDownstreamEntries = json.optInt("totalDownstreamEntries", 0),
+                knownAgeEntries = json.optInt("knownAgeEntries", 0),
+                unavailableAgeEntries = json.optInt("unavailableAgeEntries", 0),
+                negativeDeltaAgeEntries = json.optInt("negativeDeltaAgeEntries", 0),
                 reverseMatchedCount = json.optInt("reverseMatchedCount", 0),
                 activeMappedFlows = json.optInt("activeMappedFlows", 0),
                 ambiguousTupleCount = json.optInt("ambiguousTupleCount", 0),
@@ -2180,6 +2582,9 @@ data class BpfAttributionStatusReport(
                 lastAttemptDecisionReason = json.optString("lastAttemptDecisionReason", ""),
                 lastAttemptUpstreamEntries = json.optInt("lastAttemptUpstreamEntries", 0),
                 lastAttemptDownstreamEntries = json.optInt("lastAttemptDownstreamEntries", 0),
+                lastAttemptKnownAgeEntries = json.optInt("lastAttemptKnownAgeEntries", 0),
+                lastAttemptUnavailableAgeEntries = json.optInt("lastAttemptUnavailableAgeEntries", 0),
+                lastAttemptNegativeDeltaAgeEntries = json.optInt("lastAttemptNegativeDeltaAgeEntries", 0),
                 lastAttemptRejectedLineCount = json.optInt("lastAttemptRejectedLineCount", 0),
                 lastAttemptRejectedByReason = reasonMap,
                 lastAttemptRejectedLines = rejectedList,
