@@ -45,12 +45,15 @@ enum class BpfCollectionStatus {
  */
 enum class BpfRejectionReason {
     TRUNCATED_LINE,
+    INCOMPLETE_FLOW_LINE,
     INVALID_SYNTAX,
     UNSUPPORTED_PROTOCOL,
     INVALID_IP,
     INVALID_PORT,
     INVALID_MAC,
     INVALID_IFINDEX,
+    INVALID_PMTU,
+    INVALID_AGE,
 }
 
 data class BpfRejectedLine(
@@ -58,7 +61,12 @@ data class BpfRejectedLine(
     val section: String,
     val reason: BpfRejectionReason,
     val linePreview: String,
-)
+) {
+    fun maskedPreview(): String = BpfDumpParser.maskSensitiveLinePreview(linePreview)
+
+    fun previewForExport(includeSensitiveEndpoints: Boolean): String =
+        if (includeSensitiveEndpoints) linePreview else maskedPreview()
+}
 
 /**
  * Parsed row from `IPv4 Upstream:` in `dumpsys tethering bpf`.
@@ -141,13 +149,24 @@ data class BpfParsedDump(
     val ipv6Entries: List<BpfIpv6Entry>,
     val rejectedLines: List<BpfRejectedLine>,
     val rawUpstreamMapRowCount: Int = 0,
+    val wasTruncatedByReader: Boolean = false,
 ) {
     val hasRejections: Boolean get() = rejectedLines.isNotEmpty()
     val isEmptyValid: Boolean
         get() = recognizedFormat &&
+            !wasTruncatedByReader &&
             ipv4UpstreamEntries.isEmpty() &&
             ipv4DownstreamEntries.isEmpty() &&
             rejectedLines.isEmpty()
+
+    fun rejectionCountsByReason(): Map<String, Int> {
+        if (rejectedLines.isEmpty()) return emptyMap()
+        val counts = LinkedHashMap<String, Int>()
+        for (item in rejectedLines) {
+            counts[item.reason.name] = (counts[item.reason.name] ?: 0) + 1
+        }
+        return counts
+    }
 }
 
 /**
@@ -155,7 +174,7 @@ data class BpfParsedDump(
  */
 object BpfDumpParser {
 
-    const val PARSER_VERSION = 1
+    const val PARSER_VERSION = 2
 
     private enum class Section {
         NONE,
@@ -167,13 +186,34 @@ object BpfDumpParser {
         RAW_MAP_UPSTREAM4,
     }
 
-    // Matches:
+    // Matches IPv4 Upstream / Downstream rows while allowing negative/zero numbers in numeric groups
+    // so we can classify INVALID_IFINDEX, INVALID_PMTU, INVALID_AGE, and INVALID_PORT accurately:
     // tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 230026ms
     private val IPV4_FLOW_ROW_REGEX = Regex(
-        """^\s*(\S+)\s+\[([^\]]+)]\s+(\d+)\(([^)]*)\)\s+([^\s:]+):(\d+)\s*->\s*(\d+)\(([^)]*)\)\s+([^\s:]+):(\d+)\s*->\s*([^\s:]+):(\d+)\s+\[([^\]]+)]\s+(\d+)\s+(\d+)ms\s*$""",
+        """^\s*(\S+)\s+\[([^\]]+)]\s+(-?\d+)\(([^)]*)\)\s+([^\s:]+):(-?\d+)\s*->\s*(-?\d+)\(([^)]*)\)\s+([^\s:]+):(-?\d+)\s*->\s*([^\s:]+):(-?\d+)\s+\[([^\]]+)]\s+(-?\d+)\s+(-?\d+)(ms|s)?\s*$""",
+        RegexOption.IGNORE_CASE,
     )
 
     private val MAC_REGEX = Regex("""^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$""")
+    private val MASK_MAC_REGEX = Regex("""\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b""")
+    private val MASK_IPV4_PORT_REGEX = Regex("""\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b""")
+    private val MASK_IPV6_REGEX = Regex("""\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b""")
+    private val MASK_TRAILING_PORT_REGEX = Regex("""(?<=[^\s:\]])(:)(-?\d{1,6})\b""")
+
+    /**
+     * Redacts IPv4, IPv6, MAC addresses, and port numbers from a line preview while keeping
+     * the exact token/bracket/arrow syntax structure intact for parser diagnostics.
+     */
+    fun maskSensitiveLinePreview(rawPreview: String): String {
+        if (rawPreview.isBlank()) return rawPreview
+        var masked = MASK_MAC_REGEX.replace(rawPreview, "xx:xx:xx:xx:xx:xx")
+        masked = MASK_IPV4_PORT_REGEX.replace(masked) { match ->
+            if (match.value.contains(':')) "x.x.x.x:xxxx" else "x.x.x.x"
+        }
+        masked = MASK_IPV6_REGEX.replace(masked, "xxxx::xxxx")
+        masked = MASK_TRAILING_PORT_REGEX.replace(masked, ":xxxx")
+        return masked
+    }
 
     fun parse(dumpText: String, wasTruncatedByReader: Boolean = false): BpfParsedDump {
         if (dumpText.isBlank()) {
@@ -183,6 +223,7 @@ object BpfDumpParser {
                 ipv4DownstreamEntries = emptyList(),
                 ipv6Entries = emptyList(),
                 rejectedLines = emptyList(),
+                wasTruncatedByReader = wasTruncatedByReader,
             )
         }
 
@@ -191,50 +232,55 @@ object BpfDumpParser {
         val ipv6List = ArrayList<BpfIpv6Entry>()
         val rejected = ArrayList<BpfRejectedLine>()
         var recognizedHeader = false
-        var rawMapRows = 0
+        val rawMapRows = 0
         var currentSection = Section.NONE
 
         val lines = dumpText.lines()
+        val lastNonBlankIdx = lines.indexOfLast { it.isNotBlank() }
+        var readerTruncationRecordedOnLine = false
+
         for ((idx, rawLine) in lines.withIndex()) {
             val lineNumber = idx + 1
             val trimmed = rawLine.trim()
             if (trimmed.isEmpty()) continue
 
             when {
-                trimmed.startsWith("IPv4 Upstream:") -> {
+                trimmed.startsWith("IPv4 Upstream:", ignoreCase = true) -> {
                     recognizedHeader = true
                     currentSection = Section.IPV4_UPSTREAM
                     continue
                 }
-                trimmed.startsWith("IPv4 Downstream:") -> {
+                trimmed.startsWith("IPv4 Downstream:", ignoreCase = true) -> {
                     recognizedHeader = true
                     currentSection = Section.IPV4_DOWNSTREAM
                     continue
                 }
-                trimmed.startsWith("IPv6 Upstream:") -> {
+                trimmed.startsWith("IPv6 Upstream:", ignoreCase = true) -> {
                     recognizedHeader = true
                     currentSection = Section.IPV6_UPSTREAM
                     continue
                 }
-                trimmed.startsWith("IPv6 Downstream:") -> {
+                trimmed.startsWith("IPv6 Downstream:", ignoreCase = true) -> {
                     recognizedHeader = true
                     currentSection = Section.IPV6_DOWNSTREAM
                     continue
                 }
-                trimmed.startsWith("Client Information:") -> {
+                trimmed.startsWith("Client Information:", ignoreCase = true) -> {
                     recognizedHeader = true
                     currentSection = Section.CLIENT_INFO
                     continue
                 }
-                trimmed.startsWith("BPF offload") ||
-                    trimmed.startsWith("Polling interval:") ||
-                    trimmed.startsWith("Upstream:") ||
-                    trimmed.startsWith("Forwarding rules") ||
-                    trimmed.startsWith("Forwarding stats") ||
-                    trimmed.startsWith("Downstream:") ||
-                    trimmed.startsWith("Tethering BPF") -> {
+                trimmed.startsWith("BPF offload", ignoreCase = true) ||
+                    trimmed.startsWith("Polling interval:", ignoreCase = true) ||
+                    trimmed.startsWith("Upstream:", ignoreCase = true) ||
+                    trimmed.startsWith("Forwarding rules", ignoreCase = true) ||
+                    trimmed.startsWith("Forwarding stats", ignoreCase = true) ||
+                    trimmed.startsWith("Downstream:", ignoreCase = true) ||
+                    trimmed.startsWith("Tethering BPF", ignoreCase = true) -> {
                     recognizedHeader = true
-                    if (!trimmed.startsWith("IPv4 ") && !trimmed.startsWith("IPv6 ")) {
+                    if (!trimmed.startsWith("IPv4 ", ignoreCase = true) &&
+                        !trimmed.startsWith("IPv6 ", ignoreCase = true)
+                    ) {
                         currentSection = Section.NONE
                     }
                     continue
@@ -247,33 +293,47 @@ object BpfDumpParser {
                 continue
             }
 
+            val isFinalCutLine = wasTruncatedByReader && idx == lastNonBlankIdx
+
             when (currentSection) {
                 Section.IPV4_UPSTREAM -> {
-                    if (trimmed.equals("none", ignoreCase = true) || trimmed.startsWith("No ")) continue
+                    if (!isFinalCutLine && isIgnorableSectionLine(trimmed)) continue
                     parseIpv4FlowLine(
                         line = rawLine,
                         lineNumber = lineNumber,
                         sectionName = "IPv4 Upstream",
                         isUpstream = true,
+                        isTruncatedFinalLine = isFinalCutLine,
                         onUpstream = upstream4::add,
                         onDownstream = downstream4::add,
-                        onRejected = rejected::add,
+                        onRejected = { rej ->
+                            if (rej.reason == BpfRejectionReason.TRUNCATED_LINE) {
+                                readerTruncationRecordedOnLine = true
+                            }
+                            rejected.add(rej)
+                        },
                     )
                 }
                 Section.IPV4_DOWNSTREAM -> {
-                    if (trimmed.equals("none", ignoreCase = true) || trimmed.startsWith("No ")) continue
+                    if (!isFinalCutLine && isIgnorableSectionLine(trimmed)) continue
                     parseIpv4FlowLine(
                         line = rawLine,
                         lineNumber = lineNumber,
                         sectionName = "IPv4 Downstream",
                         isUpstream = false,
+                        isTruncatedFinalLine = isFinalCutLine,
                         onUpstream = upstream4::add,
                         onDownstream = downstream4::add,
-                        onRejected = rejected::add,
+                        onRejected = { rej ->
+                            if (rej.reason == BpfRejectionReason.TRUNCATED_LINE) {
+                                readerTruncationRecordedOnLine = true
+                            }
+                            rejected.add(rej)
+                        },
                     )
                 }
                 Section.IPV6_UPSTREAM, Section.IPV6_DOWNSTREAM -> {
-                    if (trimmed.equals("none", ignoreCase = true) || trimmed.startsWith("No ")) continue
+                    if (isIgnorableSectionLine(trimmed)) continue
                     parseIpv6Line(
                         line = trimmed,
                         isDownstream = currentSection == Section.IPV6_DOWNSTREAM,
@@ -289,10 +349,10 @@ object BpfDumpParser {
             }
         }
 
-        if (wasTruncatedByReader) {
+        if (wasTruncatedByReader && !readerTruncationRecordedOnLine) {
             rejected.add(
                 BpfRejectedLine(
-                    lineNumber = lines.size,
+                    lineNumber = lines.size.coerceAtLeast(1),
                     section = currentSection.name,
                     reason = BpfRejectionReason.TRUNCATED_LINE,
                     linePreview = "Reader output hit byte limit and was truncated",
@@ -307,7 +367,47 @@ object BpfDumpParser {
             ipv6Entries = ipv6List,
             rejectedLines = rejected,
             rawUpstreamMapRowCount = rawMapRows,
+            wasTruncatedByReader = wasTruncatedByReader,
         )
+    }
+
+    /**
+     * Returns true when a line inside a flow section is a recognized non-flow marker,
+     * sub-header, comment, or counter summary that should be ignored rather than counted
+     * as a defective flow entry.
+     */
+    internal fun isIgnorableSectionLine(trimmed: String): Boolean {
+        if (trimmed.isEmpty()) return true
+        val lower = trimmed.lowercase()
+        if (lower == "none" || lower == "<empty>" || lower == "(none)" || lower == "(empty)" || lower == "empty") {
+            return true
+        }
+        if (lower.startsWith("no ") ||
+            lower.startsWith("#") ||
+            lower.startsWith("//") ||
+            lower.startsWith("---") ||
+            lower.startsWith("===")
+        ) {
+            return true
+        }
+        // Sub-headers or summary lines that do not contain flow arrow "->"
+        if (!trimmed.contains("->")) {
+            if (trimmed.endsWith(":")) return true
+            if (lower.startsWith("total") ||
+                lower.startsWith("count") ||
+                lower.startsWith("entries") ||
+                lower.startsWith("size") ||
+                lower.startsWith("map ") ||
+                lower.startsWith("limit") ||
+                lower.startsWith("stats") ||
+                lower.startsWith("note:") ||
+                lower.startsWith("offload") ||
+                lower.startsWith("rules")
+            ) {
+                return true
+            }
+        }
+        return false
     }
 
     /**
@@ -334,29 +434,39 @@ object BpfDumpParser {
         lineNumber: Int,
         sectionName: String,
         isUpstream: Boolean,
+        isTruncatedFinalLine: Boolean,
         onUpstream: (BpfIpv4UpstreamEntry) -> Unit,
         onDownstream: (BpfIpv4DownstreamEntry) -> Unit,
         onRejected: (BpfRejectedLine) -> Unit,
     ) {
         val trimmed = line.trim()
-        if (!trimmed.endsWith("ms")) {
-            val reason = if (trimmed.contains("->")) {
-                BpfRejectionReason.TRUNCATED_LINE
-            } else {
-                BpfRejectionReason.INVALID_SYNTAX
-            }
-            onRejected(BpfRejectedLine(lineNumber, sectionName, reason, trimmed.take(120)))
-            return
-        }
-
         val match = IPV4_FLOW_ROW_REGEX.matchEntire(line)
         if (match == null) {
+            val reason = when {
+                isTruncatedFinalLine -> BpfRejectionReason.TRUNCATED_LINE
+                trimmed.contains("->") -> BpfRejectionReason.INCOMPLETE_FLOW_LINE
+                else -> BpfRejectionReason.INVALID_SYNTAX
+            }
             onRejected(
                 BpfRejectedLine(
                     lineNumber = lineNumber,
                     section = sectionName,
-                    reason = BpfRejectionReason.INVALID_SYNTAX,
-                    linePreview = trimmed.take(120),
+                    reason = reason,
+                    linePreview = trimmed.take(160),
+                ),
+            )
+            return
+        }
+
+        // If the reader hit its byte limit on this very last line, never trust the final line even if
+        // its trailing digits happened to match the regex (e.g. "230026ms" cut to "230").
+        if (isTruncatedFinalLine) {
+            onRejected(
+                BpfRejectedLine(
+                    lineNumber = lineNumber,
+                    section = sectionName,
+                    reason = BpfRejectionReason.TRUNCATED_LINE,
+                    linePreview = trimmed.take(160),
                 ),
             )
             return
@@ -372,7 +482,7 @@ object BpfDumpParser {
                         lineNumber = lineNumber,
                         section = sectionName,
                         reason = BpfRejectionReason.UNSUPPORTED_PROTOCOL,
-                        linePreview = trimmed.take(120),
+                        linePreview = trimmed.take(160),
                     ),
                 )
                 return
@@ -380,36 +490,49 @@ object BpfDumpParser {
         }
 
         val mac1 = match.groupValues[2].trim().uppercase()
-        val ifIndex1 = match.groupValues[3].toIntOrNull() ?: -1
+        val ifIndex1 = match.groupValues[3].toIntOrNull()
         val ifaceLabel1 = match.groupValues[4].trim()
         val ip1 = match.groupValues[5].trim()
-        val port1 = match.groupValues[6].toIntOrNull() ?: -1
+        val port1 = match.groupValues[6].toIntOrNull()
 
-        val ifIndex2 = match.groupValues[7].toIntOrNull() ?: -1
+        val ifIndex2 = match.groupValues[7].toIntOrNull()
         val ifaceLabel2 = match.groupValues[8].trim()
         val ip2 = match.groupValues[9].trim()
-        val port2 = match.groupValues[10].toIntOrNull() ?: -1
+        val port2 = match.groupValues[10].toIntOrNull()
 
         val ip3 = match.groupValues[11].trim()
-        val port3 = match.groupValues[12].toIntOrNull() ?: -1
+        val port3 = match.groupValues[12].toIntOrNull()
         val mac2 = match.groupValues[13].trim().uppercase()
-        val pmtu = match.groupValues[14].toIntOrNull() ?: -1
-        val ageMs = match.groupValues[15].toLongOrNull() ?: -1L
+        val pmtu = match.groupValues[14].toIntOrNull()
+        val ageVal = match.groupValues[15].toLongOrNull()
+        val ageUnit = match.groupValues[16].lowercase()
 
         if (!isValidMac(mac1) || !isValidMac(mac2)) {
-            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_MAC, trimmed.take(120)))
+            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_MAC, trimmed.take(160)))
             return
         }
-        if (ifIndex1 <= 0 || ifIndex2 <= 0 || pmtu <= 0 || ageMs < 0L) {
-            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_IFINDEX, trimmed.take(120)))
+        if (ifIndex1 == null || ifIndex2 == null || ifIndex1 <= 0 || ifIndex2 <= 0 || ifIndex1 == ifIndex2) {
+            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_IFINDEX, trimmed.take(160)))
             return
         }
+        if (pmtu == null || pmtu <= 0) {
+            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_PMTU, trimmed.take(160)))
+            return
+        }
+        if (ageVal == null || ageVal < 0L) {
+            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_AGE, trimmed.take(160)))
+            return
+        }
+        val ageMs = if (ageUnit == "s") ageVal * 1_000L else ageVal
+
         if (!isValidIpv4(ip1) || !isValidIpv4(ip2) || !isValidIpv4(ip3)) {
-            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_IP, trimmed.take(120)))
+            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_IP, trimmed.take(160)))
             return
         }
-        if (port1 !in 1..65535 || port2 !in 1..65535 || port3 !in 1..65535) {
-            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_PORT, trimmed.take(120)))
+        if (port1 == null || port2 == null || port3 == null ||
+            port1 !in 1..65535 || port2 !in 1..65535 || port3 !in 1..65535
+        ) {
+            onRejected(BpfRejectedLine(lineNumber, sectionName, BpfRejectionReason.INVALID_PORT, trimmed.take(160)))
             return
         }
 
@@ -581,6 +704,27 @@ data class ClientProtocolFlowCounts(
 }
 
 /**
+ * Diagnostic record of the most recent `dumpsys tethering bpf` collection attempt, kept strictly
+ * separate from the last published valid [NatFlowSnapshot] so failed or rejected attempts never
+ * overwrite or contaminate a fresh published snapshot while still preserving full parser diagnostics.
+ */
+data class BpfCollectionAttemptDiagnostic(
+    val attemptSessionGeneration: Long = 0L,
+    val attemptAtMonotonicMs: Long = 0L,
+    val attemptDurationMs: Long = 0L,
+    val attemptStatus: BpfCollectionStatus = BpfCollectionStatus.IDLE,
+    val attemptError: String = "",
+    val recognizedFormat: Boolean = false,
+    val snapshotPublished: Boolean = false,
+    val decisionReason: String = "",
+    val upstreamEntries: Int = 0,
+    val downstreamEntries: Int = 0,
+    val rejectedLineCount: Int = 0,
+    val rejectedByReason: Map<String, Int> = emptyMap(),
+    val rejectedLines: List<BpfRejectedLine> = emptyList(),
+)
+
+/**
  * Immutable, validated snapshot published atomically by [NatFlowAttributor].
  */
 data class NatFlowSnapshot(
@@ -594,12 +738,15 @@ data class NatFlowSnapshot(
     val downstreamIface: String = "",
     val upstreamIfIndex: Int = 0,
     val upstreamIface: String = "",
+    val resolvedDownstreamIfIndex: Int = 0,
+    val resolvedUpstreamIfIndex: Int = 0,
     val totalUpstreamEntries: Int = 0,
     val totalDownstreamEntries: Int = 0,
     val reverseMatchedCount: Int = 0,
     val flowsByTuple: Map<TranslatedFlowKey, NatFlowMapping> = emptyMap(),
     val ambiguousTuples: Map<TranslatedFlowKey, String> = emptyMap(),
     val unverifiedOwnerEntries: Int = 0,
+    val ifIndexMismatchCount: Int = 0,
     val rejectedLineCount: Int = 0,
     val coverageIncomplete: Boolean = false,
     val perClientCounts: List<ClientProtocolFlowCounts> = emptyList(),
@@ -613,6 +760,8 @@ class NatFlowAttributor(
     private val monotonicClockMs: () -> Long = { System.nanoTime() / 1_000_000L },
     var maxFreshnessMs: Long = DEFAULT_MAX_FRESHNESS_MS,
     val maxMappedFlows: Int = DEFAULT_MAX_MAPPED_FLOWS,
+    var allowSafePartialPublication: Boolean = false,
+    private val interfaceIndexResolver: (String) -> Int = ::defaultResolveIfIndex,
 ) {
 
     private val sessionGen = AtomicLong(1L)
@@ -627,6 +776,7 @@ class NatFlowAttributor(
         private set
 
     private val currentSnapshotRef = AtomicReference(NatFlowSnapshot())
+    private val lastAttemptRef = AtomicReference(BpfCollectionAttemptDiagnostic())
 
     // Tracks translated tuples where a new upload TCP SYN was seen AFTER the current snapshot was collected,
     // preventing tuple-reuse ambiguity from assigning a brand-new connection to a previous owner.
@@ -643,6 +793,7 @@ class NatFlowAttributor(
     val currentBindingGeneration: Long get() = bindingGen.get()
 
     fun currentSnapshot(): NatFlowSnapshot = currentSnapshotRef.get()
+    fun lastAttemptDiagnostic(): BpfCollectionAttemptDiagnostic = lastAttemptRef.get()
 
     /**
      * Bumps the session generation and immediately invalidates all existing BPF mappings.
@@ -657,14 +808,24 @@ class NatFlowAttributor(
         activeDownstreamIface = downstreamIface.trim()
         activeUpstreamIface = upstreamIface.trim()
         synPendingRefreshTuples.clear()
+        val nowMono = monotonicClockMs()
         currentSnapshotRef.set(
             NatFlowSnapshot(
                 sessionGeneration = nextGen,
                 bindingGeneration = bindingGen.get(),
-                collectedAtMonotonicMs = monotonicClockMs(),
+                collectedAtMonotonicMs = 0L,
                 collectionStatus = BpfCollectionStatus.IDLE,
                 downstreamIface = activeDownstreamIface,
                 upstreamIface = activeUpstreamIface,
+            ),
+        )
+        lastAttemptRef.set(
+            BpfCollectionAttemptDiagnostic(
+                attemptSessionGeneration = nextGen,
+                attemptAtMonotonicMs = nowMono,
+                attemptStatus = BpfCollectionStatus.IDLE,
+                snapshotPublished = false,
+                decisionReason = "Session or upstream changed",
             ),
         )
         return nextGen
@@ -702,8 +863,11 @@ class NatFlowAttributor(
      * 2. Never uses upstream `hotspotInDstMac` as client MAC.
      * 3. Resolves `origClientIp` via [ipToMac] and cross-checks matching reverse downstream
      *    `clientOutDstMac` when present.
-     * 4. Marks duplicate or contradictory ownership as ambiguous instead of picking the first match.
-     * 5. Does not overwrite the snapshot with a partial/truncated/corrupt dump.
+     * 4. Validates `ifindex` consistency and reverse parity (`down.inIfIndex == up.outIfIndex` and
+     *    `down.outIfIndex == up.inIfIndex`).
+     * 5. Marks duplicate or contradictory ownership as ambiguous instead of picking the first match.
+     * 6. Keeps the last collection attempt diagnostic strictly separate from the last published
+     *    valid snapshot; never overwrites a valid fresh snapshot with a failed/rejected attempt.
      */
     fun ingestParsedDump(
         parsed: BpfParsedDump,
@@ -722,51 +886,190 @@ class NatFlowAttributor(
 
         val nowMono = monotonicClockMs()
         val curBindGen = bindingGen.get()
+        val reasonCounts = parsed.rejectionCountsByReason()
+        val capturedRejectedLines = parsed.rejectedLines.take(MAX_CAPTURED_REJECTED_LINES)
+        val hasReaderTruncation = parsed.wasTruncatedByReader ||
+            collectionStatus == BpfCollectionStatus.TRUNCATED ||
+            parsed.rejectedLines.any { it.reason == BpfRejectionReason.TRUNCATED_LINE }
 
-        // If collection failed or was truncated/corrupted, do NOT replace a valid recent snapshot
-        // with partial data; instead record the error status if no fresh snapshot exists.
+        // Case 1: Fatal collector error or reader truncation -> never publish snapshot.
         if (collectionStatus != BpfCollectionStatus.OK && collectionStatus != BpfCollectionStatus.EMPTY_VALID) {
             rejectedTruncatedOrCorruptCount.incrementAndGet()
-            val prev = currentSnapshotRef.get()
-            if (prev.sessionGeneration != expectedGen || (nowMono - prev.collectedAtMonotonicMs) > maxFreshnessMs) {
-                currentSnapshotRef.set(
-                    prev.copy(
-                        sessionGeneration = expectedGen,
-                        bindingGeneration = curBindGen,
-                        collectionStatus = collectionStatus,
-                        collectionError = collectionError,
-                        rejectedLineCount = parsed.rejectedLines.size,
-                    ),
-                )
-            }
+            val errMsg = collectionError.ifBlank { "Collector status ${collectionStatus.name}" }
+            lastAttemptRef.set(
+                BpfCollectionAttemptDiagnostic(
+                    attemptSessionGeneration = expectedGen,
+                    attemptAtMonotonicMs = nowMono,
+                    attemptDurationMs = collectionDurationMs,
+                    attemptStatus = collectionStatus,
+                    attemptError = errMsg,
+                    recognizedFormat = parsed.recognizedFormat,
+                    snapshotPublished = false,
+                    decisionReason = "Rejected: collector status ${collectionStatus.name}",
+                    upstreamEntries = parsed.ipv4UpstreamEntries.size,
+                    downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                    rejectedLineCount = parsed.rejectedLines.size,
+                    rejectedByReason = reasonCounts,
+                    rejectedLines = capturedRejectedLines,
+                ),
+            )
             return false
         }
 
-        if (!parsed.recognizedFormat || parsed.hasRejections) {
+        if (!parsed.recognizedFormat || hasReaderTruncation) {
             rejectedTruncatedOrCorruptCount.incrementAndGet()
-            val prev = currentSnapshotRef.get()
-            if (prev.sessionGeneration != expectedGen || (nowMono - prev.collectedAtMonotonicMs) > maxFreshnessMs) {
-                currentSnapshotRef.set(
-                    prev.copy(
-                        sessionGeneration = expectedGen,
-                        bindingGeneration = curBindGen,
-                        collectionStatus = BpfCollectionStatus.PARSE_FAILURE,
-                        collectionError = collectionError.ifBlank {
-                            "Rejected ${parsed.rejectedLines.size} invalid/truncated line(s)"
-                        },
-                        rejectedLineCount = parsed.rejectedLines.size,
-                    ),
-                )
+            val effectiveStatus = if (hasReaderTruncation) {
+                BpfCollectionStatus.TRUNCATED
+            } else {
+                BpfCollectionStatus.PARSE_FAILURE
             }
+            val errMsg = collectionError.ifBlank {
+                if (hasReaderTruncation) {
+                    "Dump truncated by reader (${parsed.rejectedLines.size} rejected line(s))"
+                } else {
+                    "Unrecognized dumpsys tethering bpf format"
+                }
+            }
+            lastAttemptRef.set(
+                BpfCollectionAttemptDiagnostic(
+                    attemptSessionGeneration = expectedGen,
+                    attemptAtMonotonicMs = nowMono,
+                    attemptDurationMs = collectionDurationMs,
+                    attemptStatus = effectiveStatus,
+                    attemptError = errMsg,
+                    recognizedFormat = parsed.recognizedFormat,
+                    snapshotPublished = false,
+                    decisionReason = "Rejected: ${effectiveStatus.name}",
+                    upstreamEntries = parsed.ipv4UpstreamEntries.size,
+                    downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                    rejectedLineCount = parsed.rejectedLines.size,
+                    rejectedByReason = reasonCounts,
+                    rejectedLines = capturedRejectedLines,
+                ),
+            )
             return false
         }
 
-        // Index IPv4 Downstream entries by (protocol, translatedIp, translatedPort, remoteIp, remotePort)
-        // for reverse verification and MAC cross-check.
-        val downstreamByTuple = HashMap<TranslatedFlowKey, MutableList<BpfIpv4DownstreamEntry>>()
+        // Case 3: Flow line parse rejections present.
+        // Conservative default (allowSafePartialPublication == false): reject snapshot publication
+        // and preserve previous valid snapshot while fresh, recording full rejected-line diagnostics.
+        if (parsed.hasRejections && !allowSafePartialPublication) {
+            rejectedTruncatedOrCorruptCount.incrementAndGet()
+            val reasonSummary = reasonCounts.entries.joinToString(", ") { "${it.key}=${it.value}" }
+            val errMsg = collectionError.ifBlank {
+                "Rejected ${parsed.rejectedLines.size} flow line(s) [$reasonSummary]"
+            }
+            lastAttemptRef.set(
+                BpfCollectionAttemptDiagnostic(
+                    attemptSessionGeneration = expectedGen,
+                    attemptAtMonotonicMs = nowMono,
+                    attemptDurationMs = collectionDurationMs,
+                    attemptStatus = BpfCollectionStatus.PARSE_FAILURE,
+                    attemptError = errMsg,
+                    recognizedFormat = true,
+                    snapshotPublished = false,
+                    decisionReason = "Rejected conservative policy: ${parsed.rejectedLines.size} invalid flow line(s) [$reasonSummary]",
+                    upstreamEntries = parsed.ipv4UpstreamEntries.size,
+                    downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                    rejectedLineCount = parsed.rejectedLines.size,
+                    rejectedByReason = reasonCounts,
+                    rejectedLines = capturedRejectedLines,
+                ),
+            )
+            return false
+        }
+
+        // If allowSafePartialPublication == true and there are rejections, require at least one valid flow
+        // and quarantine any client IP, client MAC, or ip:port endpoint mentioned in any rejected line.
+        val quarantinedClientIps = HashSet<String>()
+        val quarantinedMacs = HashSet<String>()
+        val quarantinedEndpoints = HashSet<String>()
+        if (parsed.hasRejections) {
+            if (parsed.ipv4UpstreamEntries.isEmpty() && parsed.ipv4DownstreamEntries.isEmpty()) {
+                rejectedTruncatedOrCorruptCount.incrementAndGet()
+                val reasonSummary = reasonCounts.entries.joinToString(", ") { "${it.key}=${it.value}" }
+                lastAttemptRef.set(
+                    BpfCollectionAttemptDiagnostic(
+                        attemptSessionGeneration = expectedGen,
+                        attemptAtMonotonicMs = nowMono,
+                        attemptDurationMs = collectionDurationMs,
+                        attemptStatus = BpfCollectionStatus.PARSE_FAILURE,
+                        attemptError = "Rejected all lines [$reasonSummary]",
+                        recognizedFormat = true,
+                        snapshotPublished = false,
+                        decisionReason = "Rejected: 0 valid flows and ${parsed.rejectedLines.size} rejected line(s)",
+                        upstreamEntries = 0,
+                        downstreamEntries = 0,
+                        rejectedLineCount = parsed.rejectedLines.size,
+                        rejectedByReason = reasonCounts,
+                        rejectedLines = capturedRejectedLines,
+                    ),
+                )
+                return false
+            }
+            for (rej in parsed.rejectedLines) {
+                EXTRACT_IPV4_REGEX.findAll(rej.linePreview).forEach { m ->
+                    val candidate = m.value
+                    if (BpfDumpParser.isValidIpv4(candidate) && ipToMac.containsKey(candidate)) {
+                        quarantinedClientIps.add(candidate)
+                    }
+                }
+                EXTRACT_MAC_REGEX.findAll(rej.linePreview).forEach { m ->
+                    val candidate = m.value.uppercase()
+                    if (candidate != "00:00:00:00:00:00" && candidate in activeConnectedMacs) {
+                        quarantinedMacs.add(candidate)
+                    }
+                }
+                EXTRACT_ENDPOINT_REGEX.findAll(rej.linePreview).forEach { m ->
+                    quarantinedEndpoints.add(m.value)
+                }
+            }
+        }
+
+        // Resolve kernel ifindex for active interfaces when available on the host
+        val resolvedDownIfIndex = if (activeDownstreamIface.isNotBlank()) {
+            interfaceIndexResolver(activeDownstreamIface)
+        } else {
+            0
+        }
+        val resolvedUpIfIndex = if (activeUpstreamIface.isNotBlank()) {
+            interfaceIndexResolver(activeUpstreamIface)
+        } else {
+            0
+        }
+
+        // Also infer named interface indices from explicit labels in the dump (e.g. "214(testtun46)")
+        var inferredDownIfIndex = resolvedDownIfIndex
+        var inferredUpIfIndex = resolvedUpIfIndex
+        for (up in parsed.ipv4UpstreamEntries) {
+            if (inferredDownIfIndex == 0 && !up.inIfaceLabel.all { it.isDigit() } &&
+                matchesActiveDownstreamLabel(up.inIfaceLabel)
+            ) {
+                inferredDownIfIndex = up.inIfIndex
+            }
+            if (inferredUpIfIndex == 0 && !up.outIfaceLabel.all { it.isDigit() } &&
+                matchesActiveUpstreamLabel(up.outIfaceLabel)
+            ) {
+                inferredUpIfIndex = up.outIfIndex
+            }
+        }
         for (down in parsed.ipv4DownstreamEntries) {
-            if (!matchesActiveUpstreamLabel(down.inIfaceLabel)) continue
-            if (!matchesActiveDownstreamLabel(down.outIfaceLabel)) continue
+            if (inferredUpIfIndex == 0 && !down.inIfaceLabel.all { it.isDigit() } &&
+                matchesActiveUpstreamLabel(down.inIfaceLabel)
+            ) {
+                inferredUpIfIndex = down.inIfIndex
+            }
+            if (inferredDownIfIndex == 0 && !down.outIfaceLabel.all { it.isDigit() } &&
+                matchesActiveDownstreamLabel(down.outIfaceLabel)
+            ) {
+                inferredDownIfIndex = down.outIfIndex
+            }
+        }
+
+        // Index ALL IPv4 Downstream entries by translated tuple so we can detect both matching
+        // reverse entries AND contradictory/swapped ifindex entries for the same tuple.
+        val allDownstreamByTuple = HashMap<TranslatedFlowKey, MutableList<BpfIpv4DownstreamEntry>>()
+        for (down in parsed.ipv4DownstreamEntries) {
             val key = TranslatedFlowKey(
                 family = 4,
                 protocol = down.protocol,
@@ -775,7 +1078,7 @@ class NatFlowAttributor(
                 remoteIp = down.remoteIp,
                 remotePort = down.remotePort,
             )
-            downstreamByTuple.getOrPut(key) { ArrayList(1) }.add(down)
+            allDownstreamByTuple.getOrPut(key) { ArrayList(1) }.add(down)
         }
 
         val normalizedIpToMac = HashMap<String, String>()
@@ -790,10 +1093,11 @@ class NatFlowAttributor(
         val ambiguousTuples = HashMap<TranslatedFlowKey, String>()
         var reverseMatched = 0
         var unverifiedOwners = 0
-        var coverageIncomplete = false
-        var observedDownIfIndex = 0
+        var ifIndexMismatches = 0
+        var coverageIncomplete = parsed.hasRejections
+        var observedDownIfIndex = inferredDownIfIndex
         var observedDownIface = activeDownstreamIface
-        var observedUpIfIndex = 0
+        var observedUpIfIndex = inferredUpIfIndex
         var observedUpIface = activeUpstreamIface
 
         val perClientTcp = HashMap<String, Int>()
@@ -801,8 +1105,33 @@ class NatFlowAttributor(
         val perClientIp = HashMap<String, String>()
 
         for (up in parsed.ipv4UpstreamEntries) {
-            if (!matchesActiveDownstreamLabel(up.inIfaceLabel)) continue
-            if (!matchesActiveUpstreamLabel(up.outIfaceLabel)) continue
+            val tupleKey = TranslatedFlowKey(
+                family = 4,
+                protocol = up.protocol,
+                translatedIp = up.translatedIp,
+                translatedPort = up.translatedPort,
+                remoteIp = up.remoteIp,
+                remotePort = up.remotePort,
+            )
+
+            // Validate upstream interface labels and ifindex consistency
+            val labelMatches = matchesActiveDownstreamLabel(up.inIfaceLabel) &&
+                matchesActiveUpstreamLabel(up.outIfaceLabel)
+            val upIfIndexValid = up.inIfIndex > 0 && up.outIfIndex > 0 && up.inIfIndex != up.outIfIndex &&
+                (inferredDownIfIndex == 0 || up.inIfIndex == inferredDownIfIndex) &&
+                (inferredUpIfIndex == 0 || up.outIfIndex == inferredUpIfIndex) &&
+                (inferredUpIfIndex == 0 || up.inIfIndex != inferredUpIfIndex) &&
+                (inferredDownIfIndex == 0 || up.outIfIndex != inferredDownIfIndex) &&
+                (observedDownIfIndex == 0 || up.inIfIndex == observedDownIfIndex) &&
+                (observedUpIfIndex == 0 || up.outIfIndex == observedUpIfIndex)
+
+            if (!labelMatches || !upIfIndexValid) {
+                ifIndexMismatches++
+                validFlows.remove(tupleKey)
+                ambiguousTuples[tupleKey] =
+                    "Incompatible upstream interface/ifindex: ${up.inIfIndex}(${up.inIfaceLabel}) -> ${up.outIfIndex}(${up.outIfaceLabel})"
+                continue
+            }
 
             if (observedDownIfIndex == 0) observedDownIfIndex = up.inIfIndex
             if (observedDownIface.isEmpty() && !up.inIfaceLabel.all { it.isDigit() }) {
@@ -813,28 +1142,49 @@ class NatFlowAttributor(
                 observedUpIface = up.outIfaceLabel
             }
 
-            val tupleKey = TranslatedFlowKey(
-                family = 4,
-                protocol = up.protocol,
-                translatedIp = up.translatedIp,
-                translatedPort = up.translatedPort,
-                remoteIp = up.remoteIp,
-                remotePort = up.remotePort,
-            )
-
             if (ambiguousTuples.containsKey(tupleKey)) {
                 continue
             }
 
-            val matchingDownList = downstreamByTuple[tupleKey].orEmpty()
-            val exactDown = matchingDownList.filter {
+            // Quarantine check when safe partial publication is enabled
+            val ownerFromIpBinding = normalizedIpToMac[up.origClientIp]
+            val origEndpoint = "${up.origClientIp}:${up.origClientPort}"
+            val translatedEndpoint = "${up.translatedIp}:${up.translatedPort}"
+            if (parsed.hasRejections && (
+                    up.origClientIp in quarantinedClientIps ||
+                        origEndpoint in quarantinedEndpoints ||
+                        translatedEndpoint in quarantinedEndpoints ||
+                        (ownerFromIpBinding != null && ownerFromIpBinding in quarantinedMacs)
+                    )
+            ) {
+                validFlows.remove(tupleKey)
+                ambiguousTuples[tupleKey] = "Quarantined due to rejected flow line touching endpoint"
+                continue
+            }
+
+            val candidateDownList = allDownstreamByTuple[tupleKey].orEmpty()
+            // Check if any downstream entry for this tuple has swapped or incompatible ifindex or labels
+            val hasIncompatibleDownIfIndex = candidateDownList.any { down ->
+                !matchesActiveUpstreamLabel(down.inIfaceLabel) ||
+                    !matchesActiveDownstreamLabel(down.outIfaceLabel) ||
+                    down.inIfIndex != up.outIfIndex ||
+                    down.outIfIndex != up.inIfIndex
+            }
+            if (hasIncompatibleDownIfIndex) {
+                ifIndexMismatches++
+                validFlows.remove(tupleKey)
+                ambiguousTuples[tupleKey] =
+                    "Incompatible or swapped downstream ifindex for tuple $tupleKey"
+                continue
+            }
+
+            val exactDown = candidateDownList.filter {
                 it.origClientIp == up.origClientIp &&
                     it.origClientPort == up.origClientPort &&
                     it.inIfIndex == up.outIfIndex &&
                     it.outIfIndex == up.inIfIndex
             }
 
-            val ownerFromIpBinding = normalizedIpToMac[up.origClientIp]
             val reverseMacs = exactDown
                 .map { it.clientOutDstMac.uppercase().trim() }
                 .filter { it != "00:00:00:00:00:00" && BpfDumpParser.isValidMac(it) }
@@ -847,6 +1197,11 @@ class NatFlowAttributor(
             }
 
             val reverseMac = reverseMacs.firstOrNull()
+            if (parsed.hasRejections && reverseMac != null && reverseMac in quarantinedMacs) {
+                validFlows.remove(tupleKey)
+                ambiguousTuples[tupleKey] = "Quarantined due to rejected flow line touching MAC"
+                continue
+            }
 
             // Cross-check IP binding against reverse downstream outDstMac when both are present
             if (ownerFromIpBinding != null && reverseMac != null && ownerFromIpBinding != reverseMac) {
@@ -954,12 +1309,15 @@ class NatFlowAttributor(
             downstreamIface = observedDownIface,
             upstreamIfIndex = observedUpIfIndex,
             upstreamIface = observedUpIface,
+            resolvedDownstreamIfIndex = resolvedDownIfIndex,
+            resolvedUpstreamIfIndex = resolvedUpIfIndex,
             totalUpstreamEntries = parsed.ipv4UpstreamEntries.size,
             totalDownstreamEntries = parsed.ipv4DownstreamEntries.size,
             reverseMatchedCount = reverseMatched,
             flowsByTuple = validFlows,
             ambiguousTuples = ambiguousTuples,
             unverifiedOwnerEntries = unverifiedOwners,
+            ifIndexMismatchCount = ifIndexMismatches,
             rejectedLineCount = parsed.rejectedLines.size,
             coverageIncomplete = coverageIncomplete,
             perClientCounts = clientSummaries,
@@ -970,6 +1328,27 @@ class NatFlowAttributor(
             return false
         }
         currentSnapshotRef.set(snapshot)
+        lastAttemptRef.set(
+            BpfCollectionAttemptDiagnostic(
+                attemptSessionGeneration = expectedGen,
+                attemptAtMonotonicMs = nowMono,
+                attemptDurationMs = collectionDurationMs,
+                attemptStatus = finalStatus,
+                attemptError = collectionError,
+                recognizedFormat = true,
+                snapshotPublished = true,
+                decisionReason = if (coverageIncomplete) {
+                    "Published partial snapshot with quarantine (coverageIncomplete=true)"
+                } else {
+                    "Published verified snapshot (${validFlows.size} active flow(s))"
+                },
+                upstreamEntries = parsed.ipv4UpstreamEntries.size,
+                downstreamEntries = parsed.ipv4DownstreamEntries.size,
+                rejectedLineCount = parsed.rejectedLines.size,
+                rejectedByReason = reasonCounts,
+                rejectedLines = capturedRejectedLines,
+            ),
+        )
         return true
     }
 
@@ -1019,6 +1398,7 @@ class NatFlowAttributor(
         val snapshot = currentSnapshotRef.get()
         val expectedGen = sessionGen.get()
         if (snapshot.sessionGeneration != expectedGen ||
+            snapshot.collectedAtMonotonicMs <= 0L ||
             (snapshot.collectionStatus != BpfCollectionStatus.OK && snapshot.collectionStatus != BpfCollectionStatus.EMPTY_VALID)
         ) {
             lookupUnknownCount.incrementAndGet()
@@ -1092,20 +1472,39 @@ class NatFlowAttributor(
     private fun matchesActiveDownstreamLabel(dumpIfaceLabel: String): Boolean {
         val active = activeDownstreamIface
         if (active.isEmpty() || dumpIfaceLabel.isEmpty()) return true
-        if (dumpIfaceLabel.all { it.isDigit() }) return true // e.g., 215(215)
+        if (dumpIfaceLabel.all { it.isDigit() }) return true // e.g., 215(215), validated via ifindex parity
         return dumpIfaceLabel.equals(active, ignoreCase = true)
     }
 
     private fun matchesActiveUpstreamLabel(dumpIfaceLabel: String): Boolean {
         val active = activeUpstreamIface
         if (active.isEmpty() || dumpIfaceLabel.isEmpty()) return true
-        if (dumpIfaceLabel.all { it.isDigit() }) return true
+        if (dumpIfaceLabel.all { it.isDigit() }) return true // validated via ifindex parity
         return dumpIfaceLabel.equals(active, ignoreCase = true)
     }
 
     companion object {
         const val DEFAULT_MAX_FRESHNESS_MS = 4_500L
         const val DEFAULT_MAX_MAPPED_FLOWS = 4_096
+        const val MAX_CAPTURED_REJECTED_LINES = 50
+        const val MAX_EXPORTED_REJECTED_LINES = 20
+
+        private val EXTRACT_IPV4_REGEX = Regex("""\b\d{1,3}(?:\.\d{1,3}){3}\b""")
+        private val EXTRACT_MAC_REGEX = Regex("""\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b""")
+        private val EXTRACT_ENDPOINT_REGEX = Regex("""\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b""")
+
+        fun defaultResolveIfIndex(ifaceName: String): Int {
+            val clean = ifaceName.trim()
+            if (clean.isEmpty()) return 0
+            val fromNetIface = runCatching {
+                java.net.NetworkInterface.getByName(clean)?.index ?: 0
+            }.getOrDefault(0)
+            if (fromNetIface > 0) return fromNetIface
+            return runCatching {
+                val f = java.io.File("/sys/class/net/$clean/ifindex")
+                if (f.isFile && f.canRead()) f.readText().trim().toIntOrNull() ?: 0 else 0
+            }.getOrDefault(0)
+        }
     }
 }
 
@@ -1238,7 +1637,7 @@ class BpfMapReader(
             val raw = commandRunner(COMMAND_TIMEOUT_MS, MAX_DUMP_BYTES)
             lastRawResult = raw
 
-            if (raw.status != BpfCollectionStatus.OK) {
+            if (raw.status != BpfCollectionStatus.OK && raw.status != BpfCollectionStatus.TRUNCATED) {
                 totalCollectionsFailed.incrementAndGet()
                 recordFailureAndBackoff(raw.status)
                 attributor.ingestParsedDump(
@@ -1248,6 +1647,7 @@ class BpfMapReader(
                         ipv4DownstreamEntries = emptyList(),
                         ipv6Entries = emptyList(),
                         rejectedLines = emptyList(),
+                        wasTruncatedByReader = raw.wasTruncated,
                     ),
                     collectionSessionGeneration = generationAtStart,
                     collectionStatus = raw.status,
@@ -1261,15 +1661,22 @@ class BpfMapReader(
 
             val parsed = BpfDumpParser.parse(raw.stdout, wasTruncatedByReader = raw.wasTruncated)
             val (ipToMac, connectedMacs) = clientBindingsProvider()
+            val reasonSummary = parsed.rejectionCountsByReason()
+                .entries
+                .joinToString(", ") { "${it.key}=${it.value}" }
             val ingested = attributor.ingestParsedDump(
                 parsed = parsed,
                 collectionSessionGeneration = generationAtStart,
-                collectionStatus = if (parsed.isEmptyValid) BpfCollectionStatus.EMPTY_VALID else BpfCollectionStatus.OK,
+                collectionStatus = when {
+                    raw.wasTruncated || raw.status == BpfCollectionStatus.TRUNCATED -> BpfCollectionStatus.TRUNCATED
+                    parsed.isEmptyValid -> BpfCollectionStatus.EMPTY_VALID
+                    else -> BpfCollectionStatus.OK
+                },
                 collectionDurationMs = raw.durationMs,
-                collectionError = if (parsed.hasRejections) {
-                    "Rejected ${parsed.rejectedLines.size} line(s): ${parsed.rejectedLines.first().reason}"
-                } else {
-                    ""
+                collectionError = when {
+                    raw.errorSummary.isNotBlank() -> raw.errorSummary
+                    parsed.hasRejections -> "Rejected ${parsed.rejectedLines.size} line(s) [$reasonSummary]"
+                    else -> ""
                 },
                 ipToMac = ipToMac,
                 activeConnectedMacs = connectedMacs,
@@ -1282,7 +1689,9 @@ class BpfMapReader(
                 attributor.currentSnapshot().collectionStatus
             } else {
                 totalCollectionsFailed.incrementAndGet()
-                val failStatus = if (!parsed.recognizedFormat || parsed.hasRejections) {
+                val failStatus = attributor.lastAttemptDiagnostic().attemptStatus.takeIf {
+                    it != BpfCollectionStatus.IDLE && it != BpfCollectionStatus.OK && it != BpfCollectionStatus.EMPTY_VALID
+                } ?: if (!parsed.recognizedFormat || parsed.hasRejections) {
                     BpfCollectionStatus.PARSE_FAILURE
                 } else {
                     BpfCollectionStatus.COMMAND_FAILED
@@ -1441,6 +1850,11 @@ class BpfMapReader(
 
 /**
  * Bounded diagnostic summary for the UI and exportable report.
+ *
+ * Explicitly separates:
+ * 1. **Last Published Snapshot** (`collectionStatus`, `snapshotAgeMs`, `activeMappedFlows`, etc.)
+ * 2. **Last Collection Attempt** (`lastAttemptStatus`, `lastAttemptSnapshotPublished`,
+ *    `lastAttemptRejectedLines`, `lastAttemptRejectedByReason`, etc.)
  */
 data class BpfAttributionStatusReport(
     val experimentalEnabled: Boolean = false,
@@ -1457,15 +1871,30 @@ data class BpfAttributionStatusReport(
     val downstreamIfIndex: Int = 0,
     val upstreamIface: String = "",
     val upstreamIfIndex: Int = 0,
+    val resolvedDownstreamIfIndex: Int = 0,
+    val resolvedUpstreamIfIndex: Int = 0,
     val totalUpstreamEntries: Int = 0,
     val totalDownstreamEntries: Int = 0,
     val reverseMatchedCount: Int = 0,
     val activeMappedFlows: Int = 0,
     val ambiguousTupleCount: Int = 0,
     val unverifiedOwnerEntries: Int = 0,
+    val ifIndexMismatchCount: Int = 0,
     val rejectedLineCount: Int = 0,
     val coverageIncomplete: Boolean = false,
     val perClientCounts: List<ClientProtocolFlowCounts> = emptyList(),
+    val lastAttemptStatus: BpfCollectionStatus = BpfCollectionStatus.IDLE,
+    val lastAttemptError: String = "",
+    val lastAttemptAgeMs: Long = 0L,
+    val lastAttemptDurationMs: Long = 0L,
+    val lastAttemptRecognizedFormat: Boolean = false,
+    val lastAttemptSnapshotPublished: Boolean = false,
+    val lastAttemptDecisionReason: String = "",
+    val lastAttemptUpstreamEntries: Int = 0,
+    val lastAttemptDownstreamEntries: Int = 0,
+    val lastAttemptRejectedLineCount: Int = 0,
+    val lastAttemptRejectedByReason: Map<String, Int> = emptyMap(),
+    val lastAttemptRejectedLines: List<BpfRejectedLine> = emptyList(),
     val directAttributedPackets: Long = 0L,
     val bpfAttributedPackets: Long = 0L,
     val unknownForwardedPackets: Long = 0L,
@@ -1479,7 +1908,11 @@ data class BpfAttributionStatusReport(
     val rejectedOldGenerationCount: Long = 0L,
     val tupleReuseGuardTriggeredCount: Long = 0L,
 ) {
-    fun toJson(includeSensitiveEndpoints: Boolean = true): JSONObject = JSONObject().apply {
+    val omittedRejectedLineCount: Int
+        get() = (lastAttemptRejectedLineCount - minOf(lastAttemptRejectedLines.size, NatFlowAttributor.MAX_EXPORTED_REJECTED_LINES))
+            .coerceAtLeast(0)
+
+    fun toJson(includeSensitiveEndpoints: Boolean = false): JSONObject = JSONObject().apply {
         put("experimentalEnabled", experimentalEnabled)
         put("state", state.name)
         put("collectionStatus", collectionStatus.name)
@@ -1494,14 +1927,49 @@ data class BpfAttributionStatusReport(
         put("downstreamIfIndex", downstreamIfIndex)
         put("upstreamIface", upstreamIface)
         put("upstreamIfIndex", upstreamIfIndex)
+        put("resolvedDownstreamIfIndex", resolvedDownstreamIfIndex)
+        put("resolvedUpstreamIfIndex", resolvedUpstreamIfIndex)
         put("totalUpstreamEntries", totalUpstreamEntries)
         put("totalDownstreamEntries", totalDownstreamEntries)
         put("reverseMatchedCount", reverseMatchedCount)
         put("activeMappedFlows", activeMappedFlows)
         put("ambiguousTupleCount", ambiguousTupleCount)
         put("unverifiedOwnerEntries", unverifiedOwnerEntries)
+        put("ifIndexMismatchCount", ifIndexMismatchCount)
         put("rejectedLineCount", rejectedLineCount)
         put("coverageIncomplete", coverageIncomplete)
+        put("lastAttemptStatus", lastAttemptStatus.name)
+        put("lastAttemptError", lastAttemptError)
+        put("lastAttemptAgeMs", lastAttemptAgeMs)
+        put("lastAttemptDurationMs", lastAttemptDurationMs)
+        put("lastAttemptRecognizedFormat", lastAttemptRecognizedFormat)
+        put("lastAttemptSnapshotPublished", lastAttemptSnapshotPublished)
+        put("lastAttemptDecisionReason", lastAttemptDecisionReason)
+        put("lastAttemptUpstreamEntries", lastAttemptUpstreamEntries)
+        put("lastAttemptDownstreamEntries", lastAttemptDownstreamEntries)
+        put("lastAttemptRejectedLineCount", lastAttemptRejectedLineCount)
+        put("omittedRejectedLineCount", omittedRejectedLineCount)
+        val reasonsObj = JSONObject()
+        for ((reasonKey, count) in lastAttemptRejectedByReason) {
+            reasonsObj.put(reasonKey, count)
+        }
+        put("lastAttemptRejectedByReason", reasonsObj)
+
+        val rejectedArr = JSONArray()
+        lastAttemptRejectedLines
+            .take(NatFlowAttributor.MAX_EXPORTED_REJECTED_LINES)
+            .forEach { rej ->
+                rejectedArr.put(
+                    JSONObject().apply {
+                        put("lineNumber", rej.lineNumber)
+                        put("section", rej.section)
+                        put("reason", rej.reason.name)
+                        put("linePreview", rej.previewForExport(includeSensitiveEndpoints))
+                    },
+                )
+            }
+        put("lastAttemptRejectedLines", rejectedArr)
+
         put("directAttributedPackets", directAttributedPackets)
         put("bpfAttributedPackets", bpfAttributedPackets)
         put("unknownForwardedPackets", unknownForwardedPackets)
@@ -1534,7 +2002,7 @@ data class BpfAttributionStatusReport(
         apkVersion: String,
         sourceCommit: String,
         serviceBuildId: Int,
-        includeSensitiveEndpoints: Boolean = true,
+        includeSensitiveEndpoints: Boolean = false,
     ): String = buildString {
         appendLine("# Shizzi — Experimental BPF NAT Flow Attribution Report")
         appendLine()
@@ -1542,27 +2010,33 @@ data class BpfAttributionStatusReport(
         appendLine("- **Base Commit**: `$sourceCommit`")
         appendLine("- **Experimental BPF Enabled**: `$experimentalEnabled`")
         appendLine("- **Feature State**: `${state.name}`")
-        appendLine("- **Collection Status**: `${collectionStatus.name}` (${lastCollectionDurationMs}ms, age ${snapshotAgeMs}ms, poll ${pollIntervalMs}ms)")
+        appendLine("- **Published Snapshot Status**: `${collectionStatus.name}` (${lastCollectionDurationMs}ms, age ${snapshotAgeMs}ms, poll ${pollIntervalMs}ms)")
         if (collectionError.isNotBlank()) {
-            appendLine("- **Collection Error**: `$collectionError`")
+            appendLine("- **Published Snapshot Error**: `$collectionError`")
         }
         appendLine("- **Parser Version**: `$parserVersion`")
         appendLine("- **Session / Binding Generation**: `session=$sessionGeneration`, `binding=$bindingGeneration`")
-        appendLine("- **Interfaces**: downstream `${downstreamIface.ifBlank { "unknown" }}` (ifindex `$downstreamIfIndex`) -> upstream `${upstreamIface.ifBlank { "unknown" }}` (ifindex `$upstreamIfIndex`)")
+        appendLine(
+            "- **Interfaces**: downstream `${downstreamIface.ifBlank { "unknown" }}` " +
+                "(dump ifindex `$downstreamIfIndex`, host ifindex `$resolvedDownstreamIfIndex`) -> " +
+                "upstream `${upstreamIface.ifBlank { "unknown" }}` " +
+                "(dump ifindex `$upstreamIfIndex`, host ifindex `$resolvedUpstreamIfIndex`)",
+        )
         appendLine()
-        appendLine("## 1. BPF Map Snapshot Summary")
-        appendLine("- **IPv4 Upstream Entries**: `$totalUpstreamEntries`")
-        appendLine("- **IPv4 Downstream Entries**: `$totalDownstreamEntries`")
+        appendLine("## 1. Last Published Valid Snapshot Summary")
+        appendLine("- **IPv4 Upstream Entries (Published)**: `$totalUpstreamEntries`")
+        appendLine("- **IPv4 Downstream Entries (Published)**: `$totalDownstreamEntries`")
         appendLine("- **Reverse-Confirmed Mappings**: `$reverseMatchedCount`")
         appendLine("- **Active Validated Flow Mappings**: `$activeMappedFlows`")
         appendLine("- **Ambiguous / Conflicting Tuples**: `$ambiguousTupleCount`")
         appendLine("- **Unverified Owner Entries**: `$unverifiedOwnerEntries`")
-        appendLine("- **Rejected Parse Lines**: `$rejectedLineCount`")
-        appendLine("- **Coverage Incomplete (Cap Reached)**: `$coverageIncomplete`")
+        appendLine("- **Interface / ifindex Mismatches**: `$ifIndexMismatchCount`")
+        appendLine("- **Rejected Parse Lines (Published Snapshot)**: `$rejectedLineCount`")
+        appendLine("- **Coverage Incomplete**: `$coverageIncomplete`")
         appendLine()
         appendLine("### Flows per Client")
         if (perClientCounts.isEmpty()) {
-            appendLine("_No mapped client flows in current snapshot._")
+            appendLine("_No mapped client flows in current published snapshot._")
         } else {
             appendLine("| Client | Original IPv4 | TCP Upstream | UDP Upstream | Total |")
             appendLine("| --- | --- | ---: | ---: | ---: |")
@@ -1573,7 +2047,36 @@ data class BpfAttributionStatusReport(
             }
         }
         appendLine()
-        appendLine("## 2. Packet Engine Attribution & Enforcement Deltas")
+        appendLine("## 2. Last Collection Attempt Diagnostics")
+        appendLine("- **Last Attempt Status**: `${lastAttemptStatus.name}` (duration ${lastAttemptDurationMs}ms, age ${lastAttemptAgeMs}ms)")
+        appendLine("- **Snapshot Published by Last Attempt**: `$lastAttemptSnapshotPublished`")
+        appendLine("- **Recognized Format**: `$lastAttemptRecognizedFormat`")
+        if (lastAttemptDecisionReason.isNotBlank()) {
+            appendLine("- **Publication Decision**: `$lastAttemptDecisionReason`")
+        }
+        if (lastAttemptError.isNotBlank()) {
+            appendLine("- **Last Attempt Error**: `$lastAttemptError`")
+        }
+        appendLine("- **Parsed Entries in Last Attempt**: upstream `$lastAttemptUpstreamEntries`, downstream `$lastAttemptDownstreamEntries`")
+        appendLine("- **Rejected Flow Lines in Last Attempt**: `$lastAttemptRejectedLineCount` (omitted from sample: `$omittedRejectedLineCount`)")
+        if (lastAttemptRejectedByReason.isNotEmpty()) {
+            val summary = lastAttemptRejectedByReason.entries.joinToString(", ") { "`${it.key}`=${it.value}" }
+            appendLine("- **Rejections by Reason**: $summary")
+        }
+        if (lastAttemptRejectedLines.isNotEmpty()) {
+            appendLine()
+            appendLine("### Rejected Lines Sample (max ${NatFlowAttributor.MAX_EXPORTED_REJECTED_LINES})")
+            appendLine("| Line # | Section | Reason | Preview (${if (includeSensitiveEndpoints) "Raw" else "Masked"}) |")
+            appendLine("| ---: | --- | --- | --- |")
+            lastAttemptRejectedLines
+                .take(NatFlowAttributor.MAX_EXPORTED_REJECTED_LINES)
+                .forEach { rej ->
+                    val safePreview = rej.previewForExport(includeSensitiveEndpoints).replace("|", "\\|")
+                    appendLine("| ${rej.lineNumber} | `${rej.section}` | `${rej.reason.name}` | `$safePreview` |")
+                }
+        }
+        appendLine()
+        appendLine("## 3. Packet Engine Attribution & Enforcement Deltas")
         appendLine("- **Directly Attributed Packets (Pre-NAT / Verified IPv6)**: `$directAttributedPackets`")
         appendLine("- **BPF-Attributed Packets (Post-NAT Mapped)**: `$bpfAttributedPackets`")
         appendLine("- **Unknown Forwarded Packets / Bytes**: `$unknownForwardedPackets` pkts (`$unknownForwardedBytes` B)")
@@ -1585,7 +2088,7 @@ data class BpfAttributionStatusReport(
         appendLine("- **Rejected Old-Generation Snapshots**: `$rejectedOldGenerationCount`")
         appendLine("- **TCP SYN Tuple-Reuse Guards Triggered**: `$tupleReuseGuardTriggeredCount`")
         appendLine()
-        appendLine("## 3. Architectural Scope & First-Packet Limitation")
+        appendLine("## 4. Architectural Scope & First-Packet Limitation")
         appendLine("- **Experimental status**: BPF offload entries appear only after a flow has progressed. A readable established-flow map is not a synchronous pre-NAT classifier.")
         appendLine("- **Unknown traffic**: Initial packets of brand-new flows arriving before the next `dumpsys tethering bpf` snapshot remain unattributed (`unknownForwardedPackets`) and are not globally dropped so other connected clients are not disrupted.")
     }
@@ -1604,6 +2107,33 @@ data class BpfAttributionStatusReport(
                             originalIpv4 = item.optString("originalIpv4"),
                             tcpFlows = item.optInt("tcpFlows", 0),
                             udpFlows = item.optInt("udpFlows", 0),
+                        ),
+                    )
+                }
+            }
+            val reasonMap = LinkedHashMap<String, Int>()
+            val reasonsObj = json.optJSONObject("lastAttemptRejectedByReason")
+            if (reasonsObj != null) {
+                val keys = reasonsObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    reasonMap[k] = reasonsObj.optInt(k, 0)
+                }
+            }
+            val rejectedList = mutableListOf<BpfRejectedLine>()
+            val rejArr = json.optJSONArray("lastAttemptRejectedLines")
+            if (rejArr != null) {
+                for (i in 0 until rejArr.length()) {
+                    val item = rejArr.optJSONObject(i) ?: continue
+                    val reason = runCatching {
+                        BpfRejectionReason.valueOf(item.optString("reason", BpfRejectionReason.INVALID_SYNTAX.name))
+                    }.getOrDefault(BpfRejectionReason.INVALID_SYNTAX)
+                    rejectedList.add(
+                        BpfRejectedLine(
+                            lineNumber = item.optInt("lineNumber", 0),
+                            section = item.optString("section", ""),
+                            reason = reason,
+                            linePreview = item.optString("linePreview", ""),
                         ),
                     )
                 }
@@ -1627,15 +2157,32 @@ data class BpfAttributionStatusReport(
                 downstreamIfIndex = json.optInt("downstreamIfIndex", 0),
                 upstreamIface = json.optString("upstreamIface", ""),
                 upstreamIfIndex = json.optInt("upstreamIfIndex", 0),
+                resolvedDownstreamIfIndex = json.optInt("resolvedDownstreamIfIndex", 0),
+                resolvedUpstreamIfIndex = json.optInt("resolvedUpstreamIfIndex", 0),
                 totalUpstreamEntries = json.optInt("totalUpstreamEntries", 0),
                 totalDownstreamEntries = json.optInt("totalDownstreamEntries", 0),
                 reverseMatchedCount = json.optInt("reverseMatchedCount", 0),
                 activeMappedFlows = json.optInt("activeMappedFlows", 0),
                 ambiguousTupleCount = json.optInt("ambiguousTupleCount", 0),
                 unverifiedOwnerEntries = json.optInt("unverifiedOwnerEntries", 0),
+                ifIndexMismatchCount = json.optInt("ifIndexMismatchCount", 0),
                 rejectedLineCount = json.optInt("rejectedLineCount", 0),
                 coverageIncomplete = json.optBoolean("coverageIncomplete", false),
                 perClientCounts = perClientList,
+                lastAttemptStatus = runCatching {
+                    BpfCollectionStatus.valueOf(json.optString("lastAttemptStatus", BpfCollectionStatus.IDLE.name))
+                }.getOrDefault(BpfCollectionStatus.IDLE),
+                lastAttemptError = json.optString("lastAttemptError", ""),
+                lastAttemptAgeMs = json.optLong("lastAttemptAgeMs", 0L),
+                lastAttemptDurationMs = json.optLong("lastAttemptDurationMs", 0L),
+                lastAttemptRecognizedFormat = json.optBoolean("lastAttemptRecognizedFormat", false),
+                lastAttemptSnapshotPublished = json.optBoolean("lastAttemptSnapshotPublished", false),
+                lastAttemptDecisionReason = json.optString("lastAttemptDecisionReason", ""),
+                lastAttemptUpstreamEntries = json.optInt("lastAttemptUpstreamEntries", 0),
+                lastAttemptDownstreamEntries = json.optInt("lastAttemptDownstreamEntries", 0),
+                lastAttemptRejectedLineCount = json.optInt("lastAttemptRejectedLineCount", 0),
+                lastAttemptRejectedByReason = reasonMap,
+                lastAttemptRejectedLines = rejectedList,
                 directAttributedPackets = json.optLong("directAttributedPackets", 0L),
                 bpfAttributedPackets = json.optLong("bpfAttributedPackets", 0L),
                 unknownForwardedPackets = json.optLong("unknownForwardedPackets", 0L),

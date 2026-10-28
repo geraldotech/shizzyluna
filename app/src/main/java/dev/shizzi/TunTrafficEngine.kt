@@ -419,22 +419,29 @@ object TunTrafficEngine {
 
     fun getBpfAttributionReport(): BpfAttributionStatusReport {
         val snap = bpfAttributor.currentSnapshot()
+        val lastAttempt = bpfAttributor.lastAttemptDiagnostic()
         val nowMono = System.nanoTime() / 1_000_000L
         val ageMs = if (snap.collectedAtMonotonicMs > 0L) {
             (nowMono - snap.collectedAtMonotonicMs).coerceAtLeast(0L)
         } else {
             0L
         }
+        val attemptAgeMs = if (lastAttempt.attemptAtMonotonicMs > 0L) {
+            (nowMono - lastAttempt.attemptAtMonotonicMs).coerceAtLeast(0L)
+        } else {
+            0L
+        }
         val hasRestrictivePolicy = policiesByMac.values.any { it.isBlocked || it.bandwidthLimitKbps > 0 }
-        val isStale = snap.collectedAtMonotonicMs > 0L && ageMs > bpfAttributor.maxFreshnessMs
+        val hasPublishedSnapshot = snap.collectedAtMonotonicMs > 0L &&
+            (snap.collectionStatus == BpfCollectionStatus.OK || snap.collectionStatus == BpfCollectionStatus.EMPTY_VALID)
+        val isStale = hasPublishedSnapshot && ageMs > bpfAttributor.maxFreshnessMs
 
         val state = when {
             !isExperimentalBpfEnabled -> ExperimentalBpfState.DISABLED
-            snap.collectionStatus == BpfCollectionStatus.IDLE -> ExperimentalBpfState.COLLECTING
-            snap.collectionStatus != BpfCollectionStatus.OK &&
-                snap.collectionStatus != BpfCollectionStatus.EMPTY_VALID -> ExperimentalBpfState.STALE_OR_UNAVAILABLE
+            !hasPublishedSnapshot && lastAttempt.attemptStatus == BpfCollectionStatus.IDLE -> ExperimentalBpfState.COLLECTING
+            !hasPublishedSnapshot -> ExperimentalBpfState.STALE_OR_UNAVAILABLE
             isStale -> ExperimentalBpfState.STALE_OR_UNAVAILABLE
-            hasRestrictivePolicy -> ExperimentalBpfState.PARTIAL_ENFORCEMENT
+            hasRestrictivePolicy || snap.coverageIncomplete -> ExperimentalBpfState.PARTIAL_ENFORCEMENT
             else -> ExperimentalBpfState.MAPPINGS_AVAILABLE
         }
 
@@ -462,15 +469,30 @@ object TunTrafficEngine {
             downstreamIfIndex = snap.downstreamIfIndex,
             upstreamIface = snap.upstreamIface.ifBlank { activeUpstreamName },
             upstreamIfIndex = snap.upstreamIfIndex,
+            resolvedDownstreamIfIndex = snap.resolvedDownstreamIfIndex,
+            resolvedUpstreamIfIndex = snap.resolvedUpstreamIfIndex,
             totalUpstreamEntries = snap.totalUpstreamEntries,
             totalDownstreamEntries = snap.totalDownstreamEntries,
             reverseMatchedCount = snap.reverseMatchedCount,
             activeMappedFlows = snap.flowsByTuple.size,
             ambiguousTupleCount = snap.ambiguousTuples.size,
             unverifiedOwnerEntries = snap.unverifiedOwnerEntries,
+            ifIndexMismatchCount = snap.ifIndexMismatchCount,
             rejectedLineCount = snap.rejectedLineCount,
             coverageIncomplete = snap.coverageIncomplete,
             perClientCounts = snap.perClientCounts,
+            lastAttemptStatus = lastAttempt.attemptStatus,
+            lastAttemptError = lastAttempt.attemptError,
+            lastAttemptAgeMs = attemptAgeMs,
+            lastAttemptDurationMs = lastAttempt.attemptDurationMs,
+            lastAttemptRecognizedFormat = lastAttempt.recognizedFormat,
+            lastAttemptSnapshotPublished = lastAttempt.snapshotPublished,
+            lastAttemptDecisionReason = lastAttempt.decisionReason,
+            lastAttemptUpstreamEntries = lastAttempt.upstreamEntries,
+            lastAttemptDownstreamEntries = lastAttempt.downstreamEntries,
+            lastAttemptRejectedLineCount = lastAttempt.rejectedLineCount,
+            lastAttemptRejectedByReason = lastAttempt.rejectedByReason,
+            lastAttemptRejectedLines = lastAttempt.rejectedLines,
             directAttributedPackets = directAttributedPackets.get(),
             bpfAttributedPackets = bpfAttributedPackets.get(),
             unknownForwardedPackets = unmatchedPackets.get(),

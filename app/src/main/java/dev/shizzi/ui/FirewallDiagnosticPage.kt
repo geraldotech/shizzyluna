@@ -105,7 +105,7 @@ fun FirewallDiagnosticPage(
     }
     var durationSec by remember { mutableIntStateOf(5) }
     var showRawProbes by remember { mutableStateOf(false) }
-    var includeDetailedEndpointsInExport by remember { mutableStateOf(true) }
+    var includeDetailedEndpointsInExport by remember { mutableStateOf(false) }
 
     val report = diagState.report
     val bpfReport = diagState.bpfReport ?: sessionBpfReport
@@ -179,21 +179,29 @@ fun FirewallDiagnosticPage(
 
                         Spacer(Modifier.height(8.dp))
                         Text(
-                            text = "State: ${bpfReport.state.name} • Collection: ${bpfReport.collectionStatus.name} " +
+                            text = "State: ${bpfReport.state.name} • Published: ${bpfReport.collectionStatus.name} " +
                                 "(age=${bpfReport.snapshotAgeMs}ms, dur=${bpfReport.lastCollectionDurationMs}ms, parser=v${bpfReport.parserVersion})",
                             fontFamily = FontFamily.Monospace,
                             fontSize = 11.sp,
                             color = ShizziTheme.colors.primary,
                         )
                         Text(
+                            text = "Last Attempt: ${bpfReport.lastAttemptStatus.name} " +
+                                "(published=${bpfReport.lastAttemptSnapshotPublished}, up4=${bpfReport.lastAttemptUpstreamEntries}, down4=${bpfReport.lastAttemptDownstreamEntries}, rejected=${bpfReport.lastAttemptRejectedLineCount})",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            color = if (bpfReport.lastAttemptRejectedLineCount > 0) Color(0xFFFFA000) else ShizziTheme.colors.onSurfaceMuted,
+                        )
+                        Text(
                             text = "Gen: session=${bpfReport.sessionGeneration} binding=${bpfReport.bindingGeneration} • " +
-                                "Ifaces: ${bpfReport.downstreamIface.ifBlank { "?" }}(${bpfReport.downstreamIfIndex}) -> ${bpfReport.upstreamIface.ifBlank { "?" }}(${bpfReport.upstreamIfIndex})",
+                                "Ifaces: ${bpfReport.downstreamIface.ifBlank { "?" }}(dump=${bpfReport.downstreamIfIndex}/host=${bpfReport.resolvedDownstreamIfIndex}) -> " +
+                                "${bpfReport.upstreamIface.ifBlank { "?" }}(dump=${bpfReport.upstreamIfIndex}/host=${bpfReport.resolvedUpstreamIfIndex})",
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp,
                             color = ShizziTheme.colors.onSurfaceMuted,
                         )
                         Text(
-                            text = "Flows: mapped=${bpfReport.activeMappedFlows} (up4=${bpfReport.totalUpstreamEntries}, down4=${bpfReport.totalDownstreamEntries}, revOk=${bpfReport.reverseMatchedCount}, ambig=${bpfReport.ambiguousTupleCount}, rejectedLines=${bpfReport.rejectedLineCount})",
+                            text = "Published Flows: mapped=${bpfReport.activeMappedFlows} (up4=${bpfReport.totalUpstreamEntries}, down4=${bpfReport.totalDownstreamEntries}, revOk=${bpfReport.reverseMatchedCount}, ambig=${bpfReport.ambiguousTupleCount}, ifIdxErr=${bpfReport.ifIndexMismatchCount})",
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp,
                             color = ShizziTheme.colors.onSurfaceMuted,
@@ -212,6 +220,28 @@ fun FirewallDiagnosticPage(
                             fontSize = 10.sp,
                             color = ShizziTheme.colors.onSurfaceMuted,
                         )
+
+                        if (bpfReport.lastAttemptRejectedLines.isNotEmpty()) {
+                            Spacer(Modifier.height(6.dp))
+                            HorizontalDivider(color = ShizziTheme.colors.border)
+                            Spacer(Modifier.height(6.dp))
+                            val reasonsSummary = bpfReport.lastAttemptRejectedByReason.entries
+                                .joinToString(", ") { "${it.key}=${it.value}" }
+                            Text(
+                                text = "Rejected Flow Lines (${bpfReport.lastAttemptRejectedLineCount} total • $reasonsSummary):",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 11.sp,
+                                color = Color(0xFFFFA000),
+                            )
+                            bpfReport.lastAttemptRejectedLines.take(5).forEach { rej ->
+                                Text(
+                                    text = "L${rej.lineNumber} [${rej.section}] ${rej.reason.name}: ${rej.previewForExport(includeDetailedEndpointsInExport)}",
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 10.sp,
+                                    color = ShizziTheme.colors.onSurfaceMuted,
+                                )
+                            }
+                        }
 
                         if (bpfReport.perClientCounts.isNotEmpty()) {
                             Spacer(Modifier.height(6.dp))

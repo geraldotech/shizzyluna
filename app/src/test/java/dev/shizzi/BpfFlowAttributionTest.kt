@@ -316,17 +316,35 @@ class BpfFlowAttributionTest {
               sctp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 1000ms
               tcp [82:2d:00:30:5f:2d] 215(215) 999.999.1.1:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 1000ms
               tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:99999 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 1000ms
+              tcp [82:2d:00:30:5f:2d] 0(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 1000ms
+              tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 0 1000ms
+              tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 -5ms
         """.trimIndent()
-        val parsedMalformed = BpfDumpParser.parse(malformedRaw)
+        // When wasTruncatedByReader == false, incomplete flow syntax is INCOMPLETE_FLOW_LINE (never TRUNCATED_LINE)
+        val parsedMalformed = BpfDumpParser.parse(malformedRaw, wasTruncatedByReader = false)
         assertEquals(0, parsedMalformed.ipv4UpstreamEntries.size)
-        assertEquals(4, parsedMalformed.rejectedLines.size)
+        assertEquals(7, parsedMalformed.rejectedLines.size)
         val reasons = parsedMalformed.rejectedLines.map { it.reason }.toSet()
-        assertTrue(reasons.contains(BpfRejectionReason.TRUNCATED_LINE))
+        assertFalse(reasons.contains(BpfRejectionReason.TRUNCATED_LINE))
+        assertTrue(reasons.contains(BpfRejectionReason.INCOMPLETE_FLOW_LINE))
         assertTrue(reasons.contains(BpfRejectionReason.UNSUPPORTED_PROTOCOL))
         assertTrue(reasons.contains(BpfRejectionReason.INVALID_IP))
         assertTrue(reasons.contains(BpfRejectionReason.INVALID_PORT))
+        assertTrue(reasons.contains(BpfRejectionReason.INVALID_IFINDEX))
+        assertTrue(reasons.contains(BpfRejectionReason.INVALID_PMTU))
+        assertTrue(reasons.contains(BpfRejectionReason.INVALID_AGE))
 
-        // Verify valid snapshot is NOT overwritten by subsequent collector failures (TIMEOUT, TRUNCATED, PERMISSION_DENIED)
+        // Authoritative reader truncation (wasTruncatedByReader == true) produces TRUNCATED_LINE
+        val readerTruncatedRaw = """
+            IPv4 Upstream:
+              tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006
+        """.trimIndent()
+        val parsedReaderTruncated = BpfDumpParser.parse(readerTruncatedRaw, wasTruncatedByReader = true)
+        assertTrue(parsedReaderTruncated.wasTruncatedByReader)
+        assertEquals(1, parsedReaderTruncated.rejectedLines.size)
+        assertEquals(BpfRejectionReason.TRUNCATED_LINE, parsedReaderTruncated.rejectedLines.first().reason)
+
+        // Verify valid snapshot is NOT overwritten by subsequent collector failures (TIMEOUT, TRUNCATED, PARSE_FAILURE)
         val clock = AtomicLong(1_000L)
         val attributor = NatFlowAttributor(monotonicClockMs = { clock.get() }, maxFreshnessMs = 4_500L)
         assertTrue(
@@ -340,6 +358,27 @@ class BpfFlowAttributionTest {
             ),
         )
         assertEquals(3, attributor.currentSnapshot().flowsByTuple.size)
+        assertTrue(attributor.lastAttemptDiagnostic().snapshotPublished)
+
+        // Simulate a parse failure with 7 rejected lines at t = 1_500L while previous snapshot is fresh
+        clock.set(1_500L)
+        val failedParseIngest = attributor.ingestParsedDump(
+            parsed = parsedMalformed,
+            collectionSessionGeneration = attributor.currentSessionGeneration,
+            collectionStatus = BpfCollectionStatus.OK,
+            collectionDurationMs = 14L,
+            ipToMac = ipBindings,
+            activeConnectedMacs = activeMacs,
+        )
+        assertFalse(failedParseIngest)
+        // Published snapshot remains OK with 3 active flows and 0 rejected lines, while lastAttempt records the 7 rejected lines
+        assertEquals(BpfCollectionStatus.OK, attributor.currentSnapshot().collectionStatus)
+        assertEquals(3, attributor.currentSnapshot().flowsByTuple.size)
+        assertEquals(0, attributor.currentSnapshot().rejectedLineCount)
+        assertFalse(attributor.lastAttemptDiagnostic().snapshotPublished)
+        assertEquals(BpfCollectionStatus.PARSE_FAILURE, attributor.lastAttemptDiagnostic().attemptStatus)
+        assertEquals(7, attributor.lastAttemptDiagnostic().rejectedLineCount)
+        assertEquals(7, attributor.lastAttemptDiagnostic().rejectedLines.size)
 
         // Simulate a timeout failure at t = 2_000L while previous snapshot is still fresh
         clock.set(2_000L)
@@ -738,6 +777,166 @@ class BpfFlowAttributionTest {
         assertEquals(0, TunTrafficEngine.getQueuedPacketCountForClient(macA))
         val snapA = TunTrafficEngine.getCounterSnapshot(macA)
         assertEquals(rateLimitedCount.toLong(), snapA.policyVersionBlockedDrops)
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `11 non-flow metadata is ignored without false-positive rejections and swapped ifindex is rejected`() {
+        val dumpWithMetadataAndSwappedIfIndex = """
+            Tethering BPF Offload:
+              IPv4 Upstream:
+                # Active upstream offload rules
+                Total entries: 2
+                tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 230026ms
+                tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.17:44056 -> 214(testtun46) 192.0.2.2:44056 -> 142.250.219.14:443 [00:00:00:00:00:00] 1500 227s
+                ---
+              IPv4 Downstream:
+                Count: 2
+                tcp [00:00:00:00:00:00] 214(testtun46) 108.158.147.26:443 -> 215(215) 192.0.2.2:51006 -> 192.168.167.151:51006 [e2:15:cd:54:e4:9b] 1500 230033ms
+                tcp [00:00:00:00:00:00] 215(215) 142.250.219.14:443 -> 214(testtun46) 192.0.2.2:44056 -> 192.168.167.17:44056 [f2:ff:8b:3d:b2:a6] 1500 227494ms
+        """.trimIndent()
+
+        val parsed = BpfDumpParser.parse(dumpWithMetadataAndSwappedIfIndex)
+        assertTrue(parsed.recognizedFormat)
+        assertFalse("Non-flow metadata must not be counted as rejected lines", parsed.hasRejections)
+        assertEquals(2, parsed.ipv4UpstreamEntries.size)
+        assertEquals(2, parsed.ipv4DownstreamEntries.size)
+        // Verify "227s" age unit parsed as 227_000ms
+        assertEquals(227_000L, parsed.ipv4UpstreamEntries[1].rawAgeMs)
+
+        val attributor = NatFlowAttributor(
+            monotonicClockMs = { 1_000L },
+            maxFreshnessMs = 4_500L,
+            interfaceIndexResolver = { iface ->
+                when (iface) {
+                    "ap0" -> 215
+                    "testtun46" -> 214
+                    else -> 0
+                }
+            },
+        )
+        attributor.syncInterfaces("ap0", "testtun46")
+
+        assertTrue(
+            attributor.ingestParsedDump(
+                parsed = parsed,
+                collectionSessionGeneration = attributor.currentSessionGeneration,
+                collectionStatus = BpfCollectionStatus.OK,
+                collectionDurationMs = 9L,
+                ipToMac = ipBindings,
+                activeConnectedMacs = activeMacs,
+            ),
+        )
+
+        val snap = attributor.currentSnapshot()
+        assertEquals(215, snap.resolvedDownstreamIfIndex)
+        assertEquals(214, snap.resolvedUpstreamIfIndex)
+        // First flow has valid reverse ifindex parity (214 -> 215); second flow has swapped downstream ifindex (215 -> 214)
+        assertEquals(1, snap.flowsByTuple.size)
+        assertEquals(1, snap.ifIndexMismatchCount)
+
+        val validRes = attributor.resolveTranslatedPacket(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+        )
+        assertTrue(validRes is AttributionOutcome.Matched)
+
+        val swappedIfIndexRes = attributor.resolveTranslatedPacket(
+            4, 6, "192.0.2.2", 44056, "142.250.219.14", 443, true, false, ipBindings, activeMacs,
+        )
+        assertTrue("Swapped downstream ifindex must be rejected as Ambiguous", swappedIfIndexRes is AttributionOutcome.Ambiguous)
+    }
+
+    @Test
+    fun `12 invalid IPv4 line among valid lines preserves BpfRejectedLine diagnostics masks sensitive previews by default and supports quarantine`() {
+        val mixedDump = """
+            IPv4 Upstream:
+              tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 230026ms
+              tcp [82:2d:00:30:5f:2d] 215(215) 999.168.167.17:44056 -> 214(testtun46) 192.0.2.2:44056 -> 142.250.219.14:443 [e2:15:cd:54:e4:9b] 1500 227494ms
+            IPv4 Downstream:
+              tcp [00:00:00:00:00:00] 214(testtun46) 108.158.147.26:443 -> 215(215) 192.0.2.2:51006 -> 192.168.167.151:51006 [e2:15:cd:54:e4:9b] 1500 230033ms
+        """.trimIndent()
+
+        val parsed = BpfDumpParser.parse(mixedDump)
+        assertEquals(1, parsed.ipv4UpstreamEntries.size)
+        assertEquals(1, parsed.ipv4DownstreamEntries.size)
+        assertEquals(1, parsed.rejectedLines.size)
+        val rej = parsed.rejectedLines.first()
+        assertEquals(3, rej.lineNumber)
+        assertEquals("IPv4 Upstream", rej.section)
+        assertEquals(BpfRejectionReason.INVALID_IP, rej.reason)
+
+        // Default conservative policy (allowSafePartialPublication = false) rejects snapshot publication
+        // while preserving rejectedLines and counts in lastAttemptDiagnostic and BpfAttributionStatusReport
+        TunTrafficEngine.configureExperimentalBpf(enabled = true, pollIntervalMs = 1_000L)
+        val publishedConservative = TunTrafficEngine.bpfAttributor.ingestParsedDump(
+            parsed = parsed,
+            collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+            collectionStatus = BpfCollectionStatus.OK,
+            collectionDurationMs = 11L,
+            ipToMac = ipBindings,
+            activeConnectedMacs = activeMacs,
+        )
+        assertFalse(publishedConservative)
+
+        val report = TunTrafficEngine.getBpfAttributionReport()
+        assertFalse(report.lastAttemptSnapshotPublished)
+        assertEquals(BpfCollectionStatus.PARSE_FAILURE, report.lastAttemptStatus)
+        assertEquals(1, report.lastAttemptUpstreamEntries)
+        assertEquals(1, report.lastAttemptDownstreamEntries)
+        assertEquals(1, report.lastAttemptRejectedLineCount)
+        assertEquals(mapOf("INVALID_IP" to 1), report.lastAttemptRejectedByReason)
+        assertEquals(1, report.lastAttemptRejectedLines.size)
+
+        // Verify default Markdown & JSON reports mask IPs, ports, and MACs by default (includeSensitiveEndpoints = false)
+        val defaultMd = report.toMarkdownReport(
+            apkVersion = "0.4.0-rs-lua.8",
+            sourceCommit = "test",
+            serviceBuildId = 13,
+        )
+        assertTrue(defaultMd.contains("INVALID_IP"))
+        assertTrue(defaultMd.contains("x.x.x.x:xxxx"))
+        assertTrue(defaultMd.contains("xx:xx:xx:xx:xx:xx"))
+        assertFalse("Default report must not expose raw public IP", defaultMd.contains("142.250.219.14"))
+        assertFalse("Default report must not expose raw MAC", defaultMd.contains("e2:15:cd:54:e4:9b", ignoreCase = true))
+
+        val rawMd = report.toMarkdownReport(
+            apkVersion = "0.4.0-rs-lua.8",
+            sourceCommit = "test",
+            serviceBuildId = 13,
+            includeSensitiveEndpoints = true,
+        )
+        assertTrue(rawMd.contains("142.250.219.14:443"))
+
+        // Safe partial publication mode (allowSafePartialPublication = true):
+        // Quarantines any flow touching an endpoint in a rejected line and marks coverageIncomplete = true
+        val partialAttributor = NatFlowAttributor(
+            monotonicClockMs = { 2_000L },
+            maxFreshnessMs = 4_500L,
+            allowSafePartialPublication = true,
+        )
+        val mixedForQuarantine = """
+            IPv4 Upstream:
+              tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 230026ms
+              tcp [82:2d:00:30:5f:2d] 215(215) 999.168.167.17:44056 -> 214(testtun46) 192.0.2.2:44056 -> 142.250.219.14:443 [00:00:00:00:00:00] 1500 227494ms
+            IPv4 Downstream:
+              tcp [00:00:00:00:00:00] 214(testtun46) 108.158.147.26:443 -> 215(215) 192.0.2.2:51006 -> 192.168.167.151:51006 [e2:15:cd:54:e4:9b] 1500 230033ms
+        """.trimIndent()
+        assertTrue(
+            partialAttributor.ingestParsedDump(
+                parsed = BpfDumpParser.parse(mixedForQuarantine),
+                collectionSessionGeneration = partialAttributor.currentSessionGeneration,
+                collectionStatus = BpfCollectionStatus.OK,
+                collectionDurationMs = 7L,
+                ipToMac = ipBindings,
+                activeConnectedMacs = activeMacs,
+            ),
+        )
+        val partialSnap = partialAttributor.currentSnapshot()
+        assertTrue(partialSnap.coverageIncomplete)
+        assertEquals(1, partialSnap.rejectedLineCount)
+        assertEquals(1, partialSnap.flowsByTuple.size)
+
+        TunTrafficEngine.configureExperimentalBpf(enabled = false, pollIntervalMs = 1_000L)
         TunTrafficEngine.clearAll()
     }
 }
