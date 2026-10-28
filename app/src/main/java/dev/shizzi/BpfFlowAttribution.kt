@@ -264,6 +264,16 @@ object BpfDumpParser {
         RegexOption.IGNORE_CASE,
     )
 
+    // Strict anchored pattern for AOSP BpfCoordinator interface forwarding mapping rows
+    // without protocol or endpoints, e.g.:
+    // "269 (testtun64) -> 269 (testtun64)"
+    // "270 (270) -> 270 (270)"
+    // "26 (rmnet_data0) -> 26 (rmnet_data0)"
+    // "31 (rmnet_data5) -> 31 (rmnet_data5)"
+    private val IFINDEX_MAPPING_ROW_REGEX = Regex(
+        """^\d+\s*\([^()]+\)\s*->\s*\d+\s*\([^()]+\)$""",
+    )
+
     private val NON_NEGATIVE_AGE_REGEX = Regex("""^(\d+)(ms|s)?$""", RegexOption.IGNORE_CASE)
     private val NEGATIVE_MS_AGE_REGEX = Regex("""^(-\d+)ms$""", RegexOption.IGNORE_CASE)
 
@@ -485,7 +495,7 @@ object BpfDumpParser {
      */
     internal fun isIgnorableSectionLine(trimmed: String): Boolean {
         if (trimmed.isEmpty()) return true
-        if (IFINDEX_TABLE_HEADER_REGEX.matches(trimmed)) {
+        if (IFINDEX_TABLE_HEADER_REGEX.matches(trimmed) || IFINDEX_MAPPING_ROW_REGEX.matches(trimmed)) {
             return true
         }
         val lower = trimmed.lowercase()
@@ -793,6 +803,7 @@ data class NatFlowMapping(
     val remotePort: Int,
     val verifiedMac: String,
     val reverseMapConfirmed: Boolean,
+    val boundInIpToMacAtIngest: Boolean = false,
     val collectedAtMonotonicMs: Long,
     val rawDumpAgeMs: Long?,
     val flowAge: BpfFlowAge = if (rawDumpAgeMs == null) {
@@ -1449,6 +1460,19 @@ class NatFlowAttributor(
                 continue
             }
 
+            // If ownerFromIpBinding is absent, ensure reverseMac is not already bound to a DIFFERENT IPv4 in normalizedIpToMac
+            val hasConflictingIpv4BindingForReverseMac = ownerFromIpBinding == null &&
+                reverseMac != null &&
+                normalizedIpToMac.entries.any { (ipKey, macVal) ->
+                    !ipKey.contains(':') && macVal == reverseMac && ipKey != up.origClientIp
+                }
+            if (hasConflictingIpv4BindingForReverseMac) {
+                validFlows.remove(tupleKey)
+                ambiguousTuples[tupleKey] =
+                    "Reverse MAC $reverseMac is bound to a different IPv4 than ${up.origClientIp}"
+                continue
+            }
+
             // Determine verified MAC owner:
             // - Never use up.hotspotInDstMac!
             // - Require either a verified ipToMac binding, or a reverse downstream outDstMac that belongs
@@ -1505,6 +1529,7 @@ class NatFlowAttributor(
                 remotePort = up.remotePort,
                 verifiedMac = verifiedMac,
                 reverseMapConfirmed = hasReverseConfirm,
+                boundInIpToMacAtIngest = ownerFromIpBinding != null,
                 collectedAtMonotonicMs = nowMono,
                 rawDumpAgeMs = up.rawAgeMs,
                 flowAge = up.flowAge,
@@ -1693,12 +1718,27 @@ class NatFlowAttributor(
                 "Original IP ${mapping.origClientIp} reassigned from ${mapping.verifiedMac} to $currentOwnerForOrigIp",
             )
         }
-        if (ipToMac.isNotEmpty() && currentOwnerForOrigIp == null) {
-            // Client's IP was removed or changed since snapshot was collected
+        if (mapping.boundInIpToMacAtIngest && currentOwnerForOrigIp == null) {
+            // Client's IP was in ipToMac when snapshot was collected, but was removed or changed since then
             lookupAmbiguousOrStaleCount.incrementAndGet()
             return AttributionOutcome.StaleOrInvalidated(
                 "Original IP ${mapping.origClientIp} is no longer bound to ${mapping.verifiedMac}",
             )
+        }
+        if (!mapping.boundInIpToMacAtIngest && currentOwnerForOrigIp == null) {
+            // If ownership was verified by reverse downstream MAC (e.g. ipToMac only had IPv6),
+            // invalidate if ipToMac now binds a DIFFERENT IPv4 address to mapping.verifiedMac.
+            val hasDifferentIpv4ForMac = ipToMac.entries.any { (ipKey, macVal) ->
+                !ipKey.contains(':') &&
+                    macVal.equals(mapping.verifiedMac, ignoreCase = true) &&
+                    ipKey.trim() != mapping.origClientIp
+            }
+            if (hasDifferentIpv4ForMac) {
+                lookupAmbiguousOrStaleCount.incrementAndGet()
+                return AttributionOutcome.StaleOrInvalidated(
+                    "Client ${mapping.verifiedMac} now has a different IPv4 binding than ${mapping.origClientIp}",
+                )
+            }
         }
 
         // Conservative tuple-reuse guard for TCP:
@@ -2252,6 +2292,7 @@ data class BpfAttributionStatusReport(
     val lastAttemptRejectedLines: List<BpfRejectedLine> = emptyList(),
     val directAttributedPackets: Long = 0L,
     val bpfAttributedPackets: Long = 0L,
+    val conntrackAttributedPackets: Long = 0L,
     val unknownForwardedPackets: Long = 0L,
     val unknownForwardedBytes: Long = 0L,
     val ambiguousOrStaleLookups: Long = 0L,
@@ -2341,6 +2382,7 @@ data class BpfAttributionStatusReport(
 
         put("directAttributedPackets", directAttributedPackets)
         put("bpfAttributedPackets", bpfAttributedPackets)
+        put("conntrackAttributedPackets", conntrackAttributedPackets)
         put("unknownForwardedPackets", unknownForwardedPackets)
         put("unknownForwardedBytes", unknownForwardedBytes)
         put("ambiguousOrStaleLookups", ambiguousOrStaleLookups)
@@ -2455,6 +2497,7 @@ data class BpfAttributionStatusReport(
         appendLine("## 3. Packet Engine Attribution & Enforcement Deltas")
         appendLine("- **Directly Attributed Packets (Pre-NAT / Verified IPv6)**: `$directAttributedPackets`")
         appendLine("- **BPF-Attributed Packets (Post-NAT Mapped)**: `$bpfAttributedPackets`")
+        appendLine("- **Conntrack-Attributed Packets (Procfs Fallback)**: `$conntrackAttributedPackets`")
         appendLine("- **Unknown Forwarded Packets / Bytes**: `$unknownForwardedPackets` pkts (`$unknownForwardedBytes` B)")
         appendLine("- **Ambiguous or Stale Lookups**: `$ambiguousOrStaleLookups`")
         appendLine("- **Local Control Traffic (IPv6 RS/RA/MLD)**: `$localControlPackets`")
@@ -2590,6 +2633,7 @@ data class BpfAttributionStatusReport(
                 lastAttemptRejectedLines = rejectedList,
                 directAttributedPackets = json.optLong("directAttributedPackets", 0L),
                 bpfAttributedPackets = json.optLong("bpfAttributedPackets", 0L),
+                conntrackAttributedPackets = json.optLong("conntrackAttributedPackets", 0L),
                 unknownForwardedPackets = json.optLong("unknownForwardedPackets", 0L),
                 unknownForwardedBytes = json.optLong("unknownForwardedBytes", 0L),
                 ambiguousOrStaleLookups = json.optLong("ambiguousOrStaleLookups", 0L),

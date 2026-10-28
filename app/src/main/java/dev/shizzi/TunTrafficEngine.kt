@@ -80,6 +80,7 @@ object TunTrafficEngine {
         val matchedPackets: AtomicLong = AtomicLong(0L),
         val directAttributedPackets: AtomicLong = AtomicLong(0L),
         val bpfAttributedPackets: AtomicLong = AtomicLong(0L),
+        val conntrackAttributedPackets: AtomicLong = AtomicLong(0L),
         val forwardedPackets: AtomicLong = AtomicLong(0L),
         val droppedPackets: AtomicLong = AtomicLong(0L),
         val blockedDropPackets: AtomicLong = AtomicLong(0L),
@@ -117,6 +118,7 @@ object TunTrafficEngine {
         val unattributedPostNatObserved: Boolean = false,
         val directAttributedPackets: Long = 0L,
         val bpfAttributedPackets: Long = 0L,
+        val conntrackAttributedPackets: Long = 0L,
         val policyVersionShapedPackets: Long = shapedPackets,
     )
 
@@ -340,6 +342,7 @@ object TunTrafficEngine {
     val unknownForwardedBytes = AtomicLong(0L)
     val directAttributedPackets = AtomicLong(0L)
     val bpfAttributedPackets = AtomicLong(0L)
+    val conntrackAttributedPackets = AtomicLong(0L)
     val ambiguousOrStaleLookups = AtomicLong(0L)
     val localControlPackets = AtomicLong(0L)
     val unsupportedOrFragmentPackets = AtomicLong(0L)
@@ -348,7 +351,7 @@ object TunTrafficEngine {
     val bpfReader = BpfMapReader(attributor = bpfAttributor)
 
     @Volatile
-    var isExperimentalBpfEnabled: Boolean = false
+    var isExperimentalBpfEnabled: Boolean = true
         private set
 
     @Volatile
@@ -509,6 +512,7 @@ object TunTrafficEngine {
             lastAttemptRejectedLines = lastAttempt.rejectedLines,
             directAttributedPackets = directAttributedPackets.get(),
             bpfAttributedPackets = bpfAttributedPackets.get(),
+            conntrackAttributedPackets = conntrackAttributedPackets.get(),
             unknownForwardedPackets = unmatchedPackets.get(),
             unknownForwardedBytes = unknownForwardedBytes.get(),
             ambiguousOrStaleLookups = ambiguousOrStaleLookups.get(),
@@ -662,6 +666,7 @@ object TunTrafficEngine {
         unknownForwardedBytes.set(0L)
         directAttributedPackets.set(0L)
         bpfAttributedPackets.set(0L)
+        conntrackAttributedPackets.set(0L)
         ambiguousOrStaleLookups.set(0L)
         localControlPackets.set(0L)
         unsupportedOrFragmentPackets.set(0L)
@@ -1000,6 +1005,7 @@ object TunTrafficEngine {
                 unattributedPostNatObserved = false,
                 directAttributedPackets = 0L,
                 bpfAttributedPackets = 0L,
+                conntrackAttributedPackets = 0L,
                 policyVersionShapedPackets = 0L,
             )
         } else {
@@ -1025,6 +1031,7 @@ object TunTrafficEngine {
                 unattributedPostNatObserved = unattributedSincePolicy,
                 directAttributedPackets = c.directAttributedPackets.get(),
                 bpfAttributedPackets = c.bpfAttributedPackets.get(),
+                conntrackAttributedPackets = c.conntrackAttributedPackets.get(),
                 policyVersionShapedPackets = c.policyVersionShapedPackets.get(),
             )
         }
@@ -1456,7 +1463,13 @@ object TunTrafficEngine {
             if (isPostNat) {
                 postNatUnmatchedPackets.incrementAndGet()
             }
-            maybeLogTrafficSample(meta, isUpload, matchedMac = null, decision = PacketDecision.ALLOW)
+            maybeLogTrafficSample(
+                meta = meta,
+                isUpload = isUpload,
+                matchedMac = null,
+                decision = PacketDecision.ALLOW,
+                attributionSource = attributionSource,
+            )
             return EvaluationDetail(PacketDecision.ALLOW)
         }
 
@@ -1468,7 +1481,13 @@ object TunTrafficEngine {
                 bpfAttributedPackets.incrementAndGet()
                 counters.bpfAttributedPackets.incrementAndGet()
             }
-            AttributionSource.DIRECT_IP, AttributionSource.CONNTRACK_PROCFS -> {
+            AttributionSource.DIRECT_IP -> {
+                directAttributedPackets.incrementAndGet()
+                counters.directAttributedPackets.incrementAndGet()
+            }
+            AttributionSource.CONNTRACK_PROCFS -> {
+                conntrackAttributedPackets.incrementAndGet()
+                counters.conntrackAttributedPackets.incrementAndGet()
                 directAttributedPackets.incrementAndGet()
                 counters.directAttributedPackets.incrementAndGet()
             }
@@ -1495,7 +1514,13 @@ object TunTrafficEngine {
             counters.blockedDropPackets.incrementAndGet()
             counters.policyVersionBlockedDrops.incrementAndGet()
             counters.droppedBytes.addAndGet(meta.length.toLong())
-            maybeLogTrafficSample(meta, isUpload, matchedMac = matchedMac, decision = PacketDecision.DROP)
+            maybeLogTrafficSample(
+                meta = meta,
+                isUpload = isUpload,
+                matchedMac = matchedMac,
+                decision = PacketDecision.DROP,
+                attributionSource = attributionSource,
+            )
             maybeLogCountersOnMilestone(counters)
             return EvaluationDetail(PacketDecision.DROP, policyVersion = currentPolicyVersion)
         }
@@ -1519,7 +1544,13 @@ object TunTrafficEngine {
                 counters.droppedBytes.addAndGet(meta.length.toLong())
                 counters.shapedPackets.incrementAndGet()
                 counters.policyVersionShapedPackets.incrementAndGet()
-                maybeLogTrafficSample(meta, isUpload, matchedMac = matchedMac, decision = PacketDecision.DROP_AQM)
+                maybeLogTrafficSample(
+                    meta = meta,
+                    isUpload = isUpload,
+                    matchedMac = matchedMac,
+                    decision = PacketDecision.DROP_AQM,
+                    attributionSource = attributionSource,
+                )
                 maybeLogCountersOnMilestone(counters)
                 return EvaluationDetail(PacketDecision.DROP_AQM, policyVersion = currentPolicyVersion)
             }
@@ -1528,7 +1559,13 @@ object TunTrafficEngine {
                 counters.shapedPackets.incrementAndGet()
                 counters.policyVersionShapedPackets.incrementAndGet()
                 counters.shapedBytes.addAndGet(meta.length.toLong())
-                maybeLogTrafficSample(meta, isUpload, matchedMac = matchedMac, decision = PacketDecision.RATE_LIMIT)
+                maybeLogTrafficSample(
+                    meta = meta,
+                    isUpload = isUpload,
+                    matchedMac = matchedMac,
+                    decision = PacketDecision.RATE_LIMIT,
+                    attributionSource = attributionSource,
+                )
                 maybeLogCountersOnMilestone(counters)
                 // Do NOT sleep on the shared forwarding thread; return paceDelayMs for per-client queue
                 return EvaluationDetail(
@@ -1556,10 +1593,11 @@ object TunTrafficEngine {
         isUpload: Boolean,
         matchedMac: String?,
         decision: PacketDecision,
+        attributionSource: AttributionSource = AttributionSource.UNMATCHED_UNKNOWN,
     ) {
         if (decision == PacketDecision.ALLOW && matchedMac != null) return
         val dir = if (isUpload) "UPLOAD" else "DOWNLOAD"
-        val key = "$dir:${matchedMac ?: "NONE"}:${decision.name}"
+        val key = "$dir:${attributionSource.name}:${decision.name}"
         val now = System.currentTimeMillis()
         val last = sampleLogTimestamps[key] ?: 0L
         if (now - last < SAMPLE_LOG_INTERVAL_MS) return
@@ -1570,9 +1608,11 @@ object TunTrafficEngine {
             PacketDecision.RATE_LIMIT, PacketDecision.DROP_AQM -> "RATE_LIMIT"
             PacketDecision.ALLOW -> "ALLOW"
         }
+        // Sensitive endpoints (IPs/ports/MACs) are omitted from default runtime logs
         SessionLog.info(
-            "Traffic: direction=$dir src=${meta.srcIp} dst=${meta.dstIp} " +
-                "matchedMac=${matchedMac ?: "none"} decision=$decisionLabel",
+            "Traffic: direction=$dir family=IPv${meta.version} proto=${meta.protocol} " +
+                "source=${attributionSource.name} datapath=${datapathMode.name} " +
+                "matched=${matchedMac != null} decision=$decisionLabel",
         )
     }
 

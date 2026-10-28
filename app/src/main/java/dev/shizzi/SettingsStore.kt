@@ -35,7 +35,7 @@ data class Settings(
 
     val dnsSettings: DnsSettings = DnsSettings(),
     val clientRules: List<ClientRule> = emptyList(),
-    val experimentalBpfEnabled: Boolean = false,
+    val experimentalBpfEnabled: Boolean = true,
     val bpfPollIntervalMs: Int = 1000,
 )
 
@@ -183,6 +183,6 @@ internal fun toSettings(preferences: Preferences) = Settings(
         customSecondary = preferences[CUSTOM_DNS_SECONDARY].orEmpty(),
     ),
     clientRules = ClientRule.parseList(preferences[CLIENT_RULES]),
-    experimentalBpfEnabled = preferences[EXPERIMENTAL_BPF_ENABLED] ?: false,
+    experimentalBpfEnabled = preferences[EXPERIMENTAL_BPF_ENABLED] ?: true,
     bpfPollIntervalMs = (preferences[BPF_POLL_INTERVAL_MS] ?: 1000).coerceIn(500, 5000),
 )

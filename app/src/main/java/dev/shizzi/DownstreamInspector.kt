@@ -266,6 +266,9 @@ class DownstreamInspector(
                 shapedBytes = counters.shapedBytes,
                 policyInstalled = counters.policyInstalled,
                 unattributedPostNatObserved = counters.unattributedPostNatObserved,
+                directAttributedPackets = counters.directAttributedPackets,
+                bpfAttributedPackets = counters.bpfAttributedPackets,
+                policyVersion = counters.policyVersion,
             )
         }
 

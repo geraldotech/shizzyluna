@@ -152,6 +152,10 @@ class TetherSession(private val context: Context) {
         verifyUpstream(name)
         SessionLog.info("upstream verified: $name is sole upstream")
 
+        val initialSnapshot = downstream.inspectSnapshot(forceRefresh = true)
+        val initialDownstream = initialSnapshot.apInterfaces.firstOrNull().orEmpty()
+        TunTrafficEngine.bpfAttributor.syncInterfaces(initialDownstream, name)
+
         state = SessionState.ACTIVE
         activeSince = System.currentTimeMillis()
         detail = "tethered clients routing through $name"
@@ -323,6 +327,10 @@ class TetherSession(private val context: Context) {
 
         val clientsArray = org.json.JSONArray()
         if (isActive) {
+            val downIface = snapshot.apInterfaces.firstOrNull().orEmpty()
+            if (downIface.isNotBlank() || !interfaceName.isNullOrBlank()) {
+                TunTrafficEngine.bpfAttributor.syncInterfaces(downIface, interfaceName.orEmpty())
+            }
             val clients = snapshot.clients
             // Continuously enforce firewall and bandwidth rules on connected clients
             HostFirewall.enforce(activeRules, clients, logSummary = false)

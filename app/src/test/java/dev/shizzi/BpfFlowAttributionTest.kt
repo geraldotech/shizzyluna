@@ -939,4 +939,304 @@ class BpfFlowAttributionTest {
         TunTrafficEngine.configureExperimentalBpf(enabled = false, pollIntervalMs = 1_000L)
         TunTrafficEngine.clearAll()
     }
+
+    @Test
+    fun `13 v2 and v3 age tokens handle unavailable dash age negative deltas and truly invalid age tokens`() {
+        val dumpWithUnavailableAndNegativeAges = """
+            Tethering:
+              BPF offload:
+                IPv4 Upstream:
+                  tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 -
+                  udp [82:2d:00:30:5f:2d] 215(215) 192.168.167.17:39398 -> 214(testtun46) 192.0.2.2:39398 -> 34.0.244.44:443 [00:00:00:00:00:00] 1500 -15ms
+                IPv4 Downstream:
+                  tcp [00:00:00:00:00:00] 214(testtun46) 108.158.147.26:443 -> 215(215) 192.0.2.2:51006 -> 192.168.167.151:51006 [e2:15:cd:54:e4:9b] 1500 -
+                  udp [00:00:00:00:00:00] 214(testtun46) 34.0.244.44:443 -> 215(215) 192.0.2.2:39398 -> 192.168.167.17:39398 [f2:ff:8b:3d:b2:a6] 1500 -3ms
+        """.trimIndent()
+
+        val parsed = BpfDumpParser.parse(dumpWithUnavailableAndNegativeAges)
+        assertTrue(parsed.recognizedFormat)
+        assertFalse("Valid '-' and '-15ms' age tokens must not be rejected", parsed.hasRejections)
+        assertEquals(0, parsed.rejectedLines.size)
+        assertEquals(2, parsed.ipv4UpstreamEntries.size)
+        assertEquals(2, parsed.ipv4DownstreamEntries.size)
+
+        assertTrue(parsed.ipv4UpstreamEntries[0].flowAge is BpfFlowAge.Unavailable)
+        assertNull(parsed.ipv4UpstreamEntries[0].rawAgeMs)
+
+        assertEquals(BpfFlowAge.NegativeDelta(-15L), parsed.ipv4UpstreamEntries[1].flowAge)
+        assertEquals(-15L, parsed.ipv4UpstreamEntries[1].rawAgeMs)
+
+        val attributor = NatFlowAttributor(monotonicClockMs = { 5_000L }, maxFreshnessMs = 4_500L)
+        assertTrue(
+            attributor.ingestParsedDump(
+                parsed = parsed,
+                collectionSessionGeneration = attributor.currentSessionGeneration,
+                collectionStatus = BpfCollectionStatus.OK,
+                collectionDurationMs = 9L,
+                ipToMac = ipBindings,
+                activeConnectedMacs = activeMacs,
+            ),
+        )
+        val snap = attributor.currentSnapshot()
+        assertEquals(0, snap.knownAgeEntries)
+        assertEquals(2, snap.unavailableAgeEntries)
+        assertEquals(2, snap.negativeDeltaAgeEntries)
+        assertEquals(2, snap.flowsByTuple.size)
+        assertTrue(attributor.lastAttemptDiagnostic().snapshotPublished)
+
+        // Truly invalid age tokens (abc, --, 12xyz, -abc) are still rejected as INVALID_AGE
+        val invalidAgeTokens = listOf("abc", "--", "12xyz", "-abc")
+        for (badAge in invalidAgeTokens) {
+            val badDump = """
+                IPv4 Upstream:
+                  tcp [82:2d:00:30:5f:2d] 215(215) 192.168.167.151:51006 -> 214(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 $badAge
+            """.trimIndent()
+            val badParsed = BpfDumpParser.parse(badDump)
+            assertTrue("Expected $badAge to be rejected", badParsed.hasRejections)
+            assertEquals(BpfRejectionReason.INVALID_AGE, badParsed.rejectedLines.first().reason)
+        }
+    }
+
+    @Test
+    fun `14 Fase 1 real Galaxy dumpsys tethering bpf interface mapping rows are ignored without INCOMPLETE_FLOW_LINE rejections`() {
+        val realGalaxyDumpWithInterfaceMappings = """
+            Tethering:
+              BPF offload:
+                IPv4 Upstream:
+                  269 (testtun64) -> 269 (testtun64)
+                  270 (270) -> 270 (270)
+                  26 (rmnet_data0) -> 26 (rmnet_data0)
+                  31 (rmnet_data5) -> 31 (rmnet_data5)
+                  tcp [5e:96:66:b7:9d:2e] 270(swlan0) 192.168.50.145:51006 -> 269(testtun64) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 230026ms
+                  udp [5e:96:66:b7:9d:2e] 270(swlan0) 192.168.50.145:39398 -> 269(testtun64) 192.0.2.2:39398 -> 34.0.244.44:443 [00:00:00:00:00:00] 1500 -
+                IPv4 Downstream:
+                  269 (testtun64) -> 269 (testtun64)
+                  270 (270) -> 270 (270)
+                  26 (rmnet_data0) -> 26 (rmnet_data0)
+                  31 (rmnet_data5) -> 31 (rmnet_data5)
+                  tcp [00:00:00:00:00:00] 269(testtun64) 108.158.147.26:443 -> 270(swlan0) 192.0.2.2:51006 -> 192.168.50.145:51006 [e2:15:cd:54:e4:9b] 1500 230033ms
+                  udp [00:00:00:00:00:00] 269(testtun64) 34.0.244.44:443 -> 270(swlan0) 192.0.2.2:39398 -> 192.168.50.145:39398 [e2:15:cd:54:e4:9b] 1500 -
+        """.trimIndent()
+
+        val parsed = BpfDumpParser.parse(realGalaxyDumpWithInterfaceMappings)
+        assertTrue(parsed.recognizedFormat)
+        assertFalse("Interface mapping lines must not be rejected as INCOMPLETE_FLOW_LINE", parsed.hasRejections)
+        assertEquals(0, parsed.rejectedLines.size)
+        assertEquals(2, parsed.ipv4UpstreamEntries.size)
+        assertEquals(2, parsed.ipv4DownstreamEntries.size)
+
+        val singleClientMac = "E2:15:CD:54:E4:9B"
+        val singleClientBindings = mapOf("192.168.50.145" to singleClientMac)
+        val attributor = NatFlowAttributor(monotonicClockMs = { 2_000L }, maxFreshnessMs = 4_500L)
+        attributor.syncInterfaces("swlan0", "testtun64")
+
+        val published = attributor.ingestParsedDump(
+            parsed = parsed,
+            collectionSessionGeneration = attributor.currentSessionGeneration,
+            collectionStatus = BpfCollectionStatus.OK,
+            collectionDurationMs = 12L,
+            ipToMac = singleClientBindings,
+            activeConnectedMacs = setOf(singleClientMac),
+        )
+        assertTrue("Snapshot must be published when interface mapping lines are present", published)
+        assertTrue(attributor.lastAttemptDiagnostic().snapshotPublished)
+        assertEquals(0, attributor.lastAttemptDiagnostic().rejectedLineCount)
+        assertEquals(2, attributor.currentSnapshot().flowsByTuple.size)
+        assertEquals(270, attributor.currentSnapshot().downstreamIfIndex)
+        assertEquals(269, attributor.currentSnapshot().upstreamIfIndex)
+        assertEquals(Integer.valueOf(270), attributor.currentSnapshot().inferredDownstreamIfIndex)
+        assertEquals(Integer.valueOf(269), attributor.currentSnapshot().inferredUpstreamIfIndex)
+
+        // Malformed lines starting with tcp/udp or partial '269 (testtun64) ->' MUST still be rejected
+        val malformedPartialDump = """
+            IPv4 Upstream:
+              269 (testtun64) ->
+              tcp 269 (testtun64) -> 269 (testtun64)
+              269 (testtun64) -> 269 (testtun64) 192.0.2.2:51006
+        """.trimIndent()
+        val parsedMalformed = BpfDumpParser.parse(malformedPartialDump)
+        assertEquals(3, parsedMalformed.rejectedLines.size)
+        assertEquals(BpfRejectionReason.INCOMPLETE_FLOW_LINE, parsedMalformed.rejectedLines[0].reason)
+        assertEquals(BpfRejectionReason.INCOMPLETE_FLOW_LINE, parsedMalformed.rejectedLines[1].reason)
+        assertEquals(BpfRejectionReason.INCOMPLETE_FLOW_LINE, parsedMalformed.rejectedLines[2].reason)
+    }
+
+    @Test
+    fun `15 Fase 3 single-client regression covers DIRECT_IP BPF_NAT UNMATCHED_UNKNOWN 1 Mbps shaping and IPv6-only neighbor table`() {
+        val clientMac = "E2:15:CD:54:E4:9B"
+        val clientIpv4 = "192.168.50.145"
+        val clientIpv6 = "2804:38a:a08a:c641:ecc7:78ff:fe6f:a0fb"
+
+        // Case A: Client discovered with IPv6 only in ipToMac (common when IPv4 ARP entry aged out under BPF offload),
+        // while BPF downstream flow confirms clientMac via [e2:15:cd:54:e4:9b].
+        val hostIpv6OnlyInNeigh = DiscoveredHost(
+            mac = clientMac,
+            ip = clientIpv6,
+            allIps = listOf(clientIpv6),
+            interfaceName = "swlan0",
+        )
+        TunTrafficEngine.clearAll()
+        TunTrafficEngine.configureExperimentalBpf(
+            enabled = true,
+            pollIntervalMs = 1_000L,
+            downstreamIface = "swlan0",
+            upstreamIface = "testtun64",
+        )
+        TunTrafficEngine.updatePolicies(emptyMap(), listOf(hostIpv6OnlyInNeigh))
+
+        val galaxySingleClientDump = """
+            IPv4 Upstream:
+              269 (testtun64) -> 269 (testtun64)
+              270 (270) -> 270 (270)
+              tcp [5e:96:66:b7:9d:2e] 270(270) $clientIpv4:51006 -> 269(testtun64) 192.0.2.2:51006 -> 108.158.147.26:443 [00:00:00:00:00:00] 1500 1200ms
+            IPv4 Downstream:
+              269 (testtun64) -> 269 (testtun64)
+              270 (270) -> 270 (270)
+              tcp [00:00:00:00:00:00] 269(testtun64) 108.158.147.26:443 -> 270(270) 192.0.2.2:51006 -> $clientIpv4:51006 [e2:15:cd:54:e4:9b] 1500 1205ms
+        """.trimIndent()
+
+        val (verifiedBindings, verifiedMacs) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+        assertTrue(
+            TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                parsed = BpfDumpParser.parse(galaxySingleClientDump),
+                collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                collectionStatus = BpfCollectionStatus.OK,
+                collectionDurationMs = 8L,
+                ipToMac = verifiedBindings,
+                activeConnectedMacs = verifiedMacs,
+            ),
+        )
+
+        // 1. Direct IPv6 packet -> DIRECT_IP
+        val directV6Meta = TunTrafficEngine.PacketMeta(
+            version = 6, protocol = 6, srcIp = clientIpv6, dstIp = "2607:f8b0:4005:80a::200e",
+            srcPort = 54321, dstPort = 443, length = 1200, isSmallControlPacket = false,
+        )
+        val directAttr = TunTrafficEngine.resolveClientMacWithSource(directV6Meta, isUpload = true)
+        assertEquals(clientMac, directAttr.mac)
+        assertEquals(AttributionSource.DIRECT_IP, directAttr.source)
+        assertEquals(
+            PacketDecision.ALLOW,
+            TunTrafficEngine.evaluateAndShape(directV6Meta, directAttr.mac, isUpload = true, attributionSource = directAttr.source),
+        )
+
+        // 2. Post-NAT IPv4 packet on 192.0.2.2:51006 -> BPF_NAT (even when ipToMac only had IPv6 for this client!)
+        val bpfUploadMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 6, srcIp = "192.0.2.2", dstIp = "108.158.147.26",
+            srcPort = 51006, dstPort = 443, length = 1400, isSmallControlPacket = false,
+        )
+        val bpfDownloadMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 6, srcIp = "108.158.147.26", dstIp = "192.0.2.2",
+            srcPort = 443, dstPort = 51006, length = 1400, isSmallControlPacket = false,
+        )
+        val bpfUpAttr = TunTrafficEngine.resolveClientMacWithSource(bpfUploadMeta, isUpload = true)
+        assertEquals(clientMac, bpfUpAttr.mac)
+        assertEquals(AttributionSource.BPF_NAT, bpfUpAttr.source)
+        assertEquals(
+            PacketDecision.ALLOW,
+            TunTrafficEngine.evaluateAndShape(bpfUploadMeta, bpfUpAttr.mac, isUpload = true, attributionSource = bpfUpAttr.source),
+        )
+
+        // 3. Unknown post-NAT flow (port 61234) -> UNMATCHED_UNKNOWN -> ALLOW (never invents MAC even with 1 client)
+        val unknownPostNatMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 6, srcIp = "192.0.2.2", dstIp = "1.1.1.1",
+            srcPort = 61234, dstPort = 443, length = 600, isSmallControlPacket = false,
+        )
+        val unknownAttr = TunTrafficEngine.resolveClientMacWithSource(unknownPostNatMeta, isUpload = true)
+        assertNull("Single-client mode must NOT invent a MAC for an unmapped flow", unknownAttr.mac)
+        assertEquals(AttributionSource.UNMATCHED_UNKNOWN, unknownAttr.source)
+        assertEquals(
+            PacketDecision.ALLOW,
+            TunTrafficEngine.evaluateAndShape(unknownPostNatMeta, unknownAttr.mac, isUpload = true, attributionSource = unknownAttr.source),
+        )
+        assertEquals(1L, TunTrafficEngine.unmatchedPackets.get())
+
+        // 4. Block single client -> both DIRECT_IP and BPF_NAT drop immediately, while unknown flow still passes safely
+        TunTrafficEngine.updatePolicies(
+            mapOf(clientMac to TunTrafficEngine.EnforcedClientPolicy(mac = clientMac, isBlocked = true, bandwidthLimitKbps = 0)),
+            listOf(hostIpv6OnlyInNeigh),
+        )
+        assertEquals(
+            PacketDecision.DROP,
+            TunTrafficEngine.evaluateAndShape(directV6Meta, clientMac, isUpload = true, attributionSource = AttributionSource.DIRECT_IP),
+        )
+        assertEquals(
+            PacketDecision.DROP,
+            TunTrafficEngine.evaluateAndShape(bpfUploadMeta, clientMac, isUpload = true, attributionSource = AttributionSource.BPF_NAT),
+        )
+        assertEquals(
+            PacketDecision.DROP,
+            TunTrafficEngine.evaluateAndShape(bpfDownloadMeta, clientMac, isUpload = false, attributionSource = AttributionSource.BPF_NAT),
+        )
+        assertEquals(
+            PacketDecision.ALLOW,
+            TunTrafficEngine.evaluateAndShape(unknownPostNatMeta, null, isUpload = true, attributionSource = AttributionSource.UNMATCHED_UNKNOWN),
+        )
+
+        val blockedSnap = TunTrafficEngine.getCounterSnapshot(clientMac)
+        assertEquals(3L, blockedSnap.blockedDropPackets)
+        assertEquals(2L, blockedSnap.directAttributedPackets)
+        assertEquals(3L, blockedSnap.bpfAttributedPackets)
+
+        // 5. Unblock and apply 1 Mbps (1000 Kbps) shaping -> packets pass burst and then schedule RATE_LIMIT pacing
+        TunTrafficEngine.updatePolicies(
+            mapOf(clientMac to TunTrafficEngine.EnforcedClientPolicy(mac = clientMac, isBlocked = false, bandwidthLimitKbps = 1000)),
+            listOf(hostIpv6OnlyInNeigh),
+        )
+        var shapedCount = 0
+        for (i in 0 until 20) {
+            val detail = TunTrafficEngine.evaluateAndShapeDetailed(
+                bpfDownloadMeta,
+                clientMac,
+                isUpload = false,
+                attributionSource = AttributionSource.BPF_NAT,
+            )
+            if (detail.decision == PacketDecision.RATE_LIMIT || detail.decision == PacketDecision.DROP_AQM) {
+                shapedCount++
+            }
+        }
+        assertTrue("Expected 1 Mbps shaper to shape burst of 20 x 1400B packets", shapedCount > 0)
+        val shapedSnap = TunTrafficEngine.getCounterSnapshot(clientMac)
+        assertTrue(shapedSnap.shapedBytes > 0L)
+
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `16 Fase 2 HostFirewall protects shared TUN NAT IPs and skips mutating write probes in rootless mode`() {
+        // Shared NAT addresses 192.0.2.2 and 2001:db8::2 must NEVER be accepted as valid per-client target IPs
+        val probeMatrix = HostFirewall.probeKernelCapabilities(force = true, allowWriteProbesInRootless = false)
+        assertFalse("Rootless probe must not execute mutating write probes by default", probeMatrix.writeProbesExecuted)
+        assertFalse(probeMatrix.canWriteBothFamiliesNetfilter)
+        assertFalse(probeMatrix.canWriteBothFamiliesIpRule)
+        assertEquals(
+            FirewallBackend.USERSPACE,
+            HostFirewall.currentBackend(userspaceAttached = true, kernelAvailable = false),
+        )
+        assertTrue(probeMatrix.capabilityNote.contains("rootless mode"))
+
+        val clientMac = "E2:15:CD:54:E4:9B"
+        val hostWithBogusSharedNatIp = DiscoveredHost(
+            mac = clientMac,
+            ip = TunTrafficEngine.TUN_LOCAL_V4,
+            allIps = listOf(TunTrafficEngine.TUN_LOCAL_V4, TunTrafficEngine.TUN_LOCAL_V6, "192.168.50.145"),
+            interfaceName = "swlan0",
+        )
+        HostFirewall.enforce(
+            rules = listOf(
+                ClientRule(
+                    mac = clientMac,
+                    isBlocked = true,
+                    bandwidthLimitKbps = 1000,
+                ),
+            ),
+            connectedHosts = listOf(hostWithBogusSharedNatIp),
+            logSummary = false,
+        )
+        val (boundIps, _) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+        assertFalse("Shared TUN IPv4 192.0.2.2 must never be bound to a single client MAC", boundIps.containsKey(TunTrafficEngine.TUN_LOCAL_V4))
+        assertFalse("Shared TUN IPv6 2001:db8::2 must never be bound to a single client MAC", boundIps.containsKey(TunTrafficEngine.TUN_LOCAL_V6))
+        assertEquals(clientMac, boundIps["192.168.50.145"])
+        HostFirewall.clearAll()
+    }
 }

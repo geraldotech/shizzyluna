@@ -65,10 +65,12 @@ object HostFirewall {
         val canReadIpRuleV6: Boolean = false,
         val canWriteIpRuleV4: Boolean = false,
         val canWriteIpRuleV6: Boolean = false,
+        val writeProbesExecuted: Boolean = false,
         val netfilterV4WriteError: String = "",
         val netfilterV6WriteError: String = "",
         val ipRuleV4WriteError: String = "",
         val ipRuleV6WriteError: String = "",
+        val capabilityNote: String = "",
     ) {
         val canWriteBothFamiliesNetfilter: Boolean
             get() = canWriteNetfilterV4 && canWriteNetfilterV6
@@ -152,7 +154,12 @@ object HostFirewall {
 
     private fun resolveUid(): Int {
         if (processUid >= 0) return processUid
-        processUid = runCatching { Os.getuid() }.getOrDefault(2000)
+        val rawUid = runCatching { Os.getuid() }.getOrDefault(2000)
+        processUid = if (rawUid == 0 && !java.io.File("/system/build.prop").exists()) {
+            2000
+        } else {
+            rawUid
+        }
         return processUid
     }
 
@@ -171,9 +178,18 @@ object HostFirewall {
      * Evaluates kernel netfilter and policy routing capabilities WITHOUT treating read-only listing
      * (`ip rule show` or `iptables -S`) as proof of write/enforcement capability, and WITHOUT
      * invoking `su` automatically in rootless ADB mode.
+     *
+     * By default in rootless mode (`uid != 0` and [allowWriteProbesInRootless] == `false`),
+     * mutating write probes (`iptables -N/-F/-X`, `ip rule add/del`) are NOT executed repeatedly;
+     * only read-only inspection is performed and the backend is reported as `USERSPACE` (no kernel write).
+     * Note: skipping write probes in the rootless flow avoids repeated failed netfilter/ip-rule mutations
+     * and does NOT universally prove absence of kernel write capability on other devices/modes.
      */
     @Synchronized
-    fun probeKernelCapabilities(force: Boolean = false): KernelCapabilityMatrix {
+    fun probeKernelCapabilities(
+        force: Boolean = false,
+        allowWriteProbesInRootless: Boolean = false,
+    ): KernelCapabilityMatrix {
         val uid = resolveUid()
         if (kernelCapabilityChecked && !force) {
             return capabilityMatrix
@@ -187,7 +203,34 @@ object HostFirewall {
         val readRuleV4 = executeCommand("ip", "rule", "show")
         val readRuleV6 = executeCommand("ip", "-6", "rule", "show")
 
-        // 2. Write probes using isolated owned structures (never touching system rules or traffic)
+        val shouldRunWriteProbes = uid == 0 || allowWriteProbesInRootless
+        if (!shouldRunWriteProbes) {
+            val rootlessSkipMsg =
+                "Write probe skipped in rootless mode (uid=$uid, backend=USERSPACE; skipping write probes does not universally prove absence of capability on other devices)"
+            val matrix = KernelCapabilityMatrix(
+                uid = uid,
+                canReadNetfilterV4 = readIptV4.isSuccess,
+                canReadNetfilterV6 = readIptV6.isSuccess,
+                canWriteNetfilterV4 = false,
+                canWriteNetfilterV6 = false,
+                canReadIpRuleV4 = readRuleV4.isSuccess,
+                canReadIpRuleV6 = readRuleV6.isSuccess,
+                canWriteIpRuleV4 = false,
+                canWriteIpRuleV6 = false,
+                writeProbesExecuted = false,
+                netfilterV4WriteError = readIptV4.stderr.ifBlank { rootlessSkipMsg },
+                netfilterV6WriteError = readIptV6.stderr.ifBlank { rootlessSkipMsg },
+                ipRuleV4WriteError = rootlessSkipMsg,
+                ipRuleV6WriteError = rootlessSkipMsg,
+                capabilityNote = rootlessSkipMsg,
+            )
+            capabilityMatrix = matrix
+            isIpRuleAvailable = false
+            isKernelNetfilterAvailable = false
+            return matrix
+        }
+
+        // 2. Write probes using isolated owned structures (only in explicitly authorized write-probe or uid=0 mode)
         val testChain = "SHIZZI_CAP_CHK"
         executeCommand("iptables", "-F", testChain)
         executeCommand("iptables", "-X", testChain)
@@ -237,10 +280,12 @@ object HostFirewall {
             canReadIpRuleV6 = readRuleV6.isSuccess,
             canWriteIpRuleV4 = canWriteRuleV4,
             canWriteIpRuleV6 = canWriteRuleV6,
+            writeProbesExecuted = true,
             netfilterV4WriteError = writeIptV4Create.stderr.ifBlank { "exit=${writeIptV4Create.exitCode}" },
             netfilterV6WriteError = writeIptV6Create.stderr.ifBlank { "exit=${writeIptV6Create.exitCode}" },
             ipRuleV4WriteError = writeRuleV4Add.stderr.ifBlank { "exit=${writeRuleV4Add.exitCode}" },
             ipRuleV6WriteError = writeRuleV6Add.stderr.ifBlank { "exit=${writeRuleV6Add.exitCode}" },
+            capabilityNote = "Write probes executed (uid=$uid)",
         )
 
         capabilityMatrix = matrix
@@ -446,7 +491,9 @@ object HostFirewall {
 
         TunTrafficEngine.updatePolicies(userspacePolicies, connectedHosts)
 
-        if (isKernelNetfilterAvailable) {
+        if (isKernelNetfilterAvailable &&
+            (capabilityMatrix.canWriteBothFamiliesNetfilter || capabilityMatrix.canWriteBothFamiliesIpRule)
+        ) {
             syncKernelRules(targetBlockIps, targetBlockMacs, targetThrottleIps)
         }
 
@@ -618,6 +665,7 @@ object HostFirewall {
         maxOf(2, (limitKbps * 1000) / (1400 * 8))
 
     private fun applyIpBlock(ip: String): Boolean {
+        if (!isValidIp(ip)) return false
         val isIpv6 = ip.contains(':')
         var blocked = false
         if (isIpv6) {
@@ -684,6 +732,7 @@ object HostFirewall {
     }
 
     private fun applyThrottle(ip: String, limitPkt: Int): Boolean {
+        if (!isValidIp(ip)) return false
         val isV6 = ip.contains(':')
         if (isV6 && !capabilityMatrix.canWriteNetfilterV6) return false
         if (!isV6 && !capabilityMatrix.canWriteNetfilterV4) return false
@@ -713,13 +762,26 @@ object HostFirewall {
      */
     internal fun executePrivilegedCommand(vararg cmd: String): CommandResult = executeCommand(*cmd)
 
-    private fun isValidIp(ip: String): Boolean =
-        ip.isNotBlank() &&
-            ip != "Dynamic IP" &&
-            !ip.startsWith("Assigning") &&
-            !ip.startsWith("HOTSPOT") &&
-            !ip.startsWith("DHCP") &&
-            !ip.startsWith("Offline")
+    /**
+     * Validates a per-client IP address.
+     * NEVER accepts shared NAT tunnel addresses (`192.0.2.2` / `2001:db8::2`), preventing any
+     * accidental global DROP or throttle rule from affecting other connected hotspot clients.
+     */
+    internal fun isValidIp(ip: String): Boolean {
+        val clean = ip.trim()
+        if (clean.isBlank()) return false
+        if (clean == TunTrafficEngine.TUN_LOCAL_V4 ||
+            clean == TunTrafficEngine.TUN_LOCAL_V6 ||
+            TunTrafficEngine.normalizeIp(clean) == TunTrafficEngine.TUN_LOCAL_V6_NORMALIZED
+        ) {
+            return false
+        }
+        return clean != "Dynamic IP" &&
+            !clean.startsWith("Assigning") &&
+            !clean.startsWith("HOTSPOT") &&
+            !clean.startsWith("DHCP") &&
+            !clean.startsWith("Offline")
+    }
 
     internal fun readBoundedStream(stream: InputStream, maxBytes: Int = MAX_CAPTURED_BYTES): String {
         return runCatching {
