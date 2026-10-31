@@ -62,6 +62,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -69,18 +70,155 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.shizzi.ClientRule
 import dev.shizzi.ConnectedClient
 import dev.shizzi.DatapathMode
 import dev.shizzi.EnforcementState
-import dev.shizzi.ExperimentalBpfState
 import dev.shizzi.SessionUiState
 import dev.shizzi.Traffic
 import dev.shizzi.UiStatus
 import dev.shizzi.ui.theme.ScreenPadding
 import dev.shizzi.ui.theme.ShizziTheme
+import java.math.BigDecimal
+import java.util.Locale
+
+private val STRICT_DECIMAL_REGEX = Regex("""^\d+(\.\d+)?$""")
+private val THOUSAND_BD = BigDecimal.valueOf(1000L)
+private val MAX_KBPS_BD = BigDecimal.valueOf(Int.MAX_VALUE.toLong())
+
+data class BandwidthParseResult(
+    val kbps: Int?,
+    val errorMessage: String? = null,
+) {
+    val isValid: Boolean get() = kbps != null && errorMessage == null
+}
+
+/**
+ * Formats a persisted [kbps] value (`ClientRule.bandwidthLimitKbps`) as an exact decimal Mbps string
+ * without binary floating-point rounding (`512` -> `"0.512"`, `1000` -> `"1"`, `1500` -> `"1.5"`, `0` -> `"0"`).
+ */
+fun formatKbpsAsMbps(kbps: Int): String {
+    if (kbps <= 0) return "0"
+    return BigDecimal.valueOf(kbps.toLong())
+        .divide(THOUSAND_BD)
+        .stripTrailingZeros()
+        .toPlainString()
+}
+
+/**
+ * Strictly validates and converts a user-entered Mbps string to integer Kbps (`kbps = Mbps * 1000`).
+ * Rejects blank input, negative numbers, non-numeric text, fractional precision finer than 1 Kbps (`0.001 Mbps`),
+ * and values exceeding [Int.MAX_VALUE] Kbps.
+ */
+fun validateMbpsInput(rawInput: String): BandwidthParseResult {
+    val trimmed = rawInput.trim()
+    if (trimmed.isEmpty()) {
+        return BandwidthParseResult(
+            kbps = null,
+            errorMessage = "Enter a bandwidth limit in Mbps (0 = Unlimited).",
+        )
+    }
+    val normalized = trimmed.replace(',', '.')
+    if (normalized.startsWith("-")) {
+        return BandwidthParseResult(
+            kbps = null,
+            errorMessage = "Bandwidth limit cannot be negative.",
+        )
+    }
+    if (!STRICT_DECIMAL_REGEX.matches(normalized)) {
+        return BandwidthParseResult(
+            kbps = null,
+            errorMessage = "Enter a valid non-negative number in Mbps (e.g. 0, 0.5, 1.5, 10).",
+        )
+    }
+    val mbps = runCatching { BigDecimal(normalized) }.getOrElse {
+        return BandwidthParseResult(
+            kbps = null,
+            errorMessage = "Invalid number format.",
+        )
+    }
+    val kbpsDecimal = mbps.multiply(THOUSAND_BD)
+    val stripped = kbpsDecimal.stripTrailingZeros()
+    if (stripped.scale() > 0) {
+        return BandwidthParseResult(
+            kbps = null,
+            errorMessage = "Maximum precision is 0.001 Mbps (1 Kbps).",
+        )
+    }
+    if (stripped > MAX_KBPS_BD) {
+        return BandwidthParseResult(
+            kbps = null,
+            errorMessage = "Bandwidth limit is too large (max 2147483.647 Mbps).",
+        )
+    }
+    return runCatching {
+        BandwidthParseResult(kbps = stripped.intValueExact(), errorMessage = null)
+    }.getOrElse {
+        BandwidthParseResult(
+            kbps = null,
+            errorMessage = "Bandwidth limit is out of supported range.",
+        )
+    }
+}
+
+/**
+ * Convenience parser returning the exact Kbps `Int` or `null` if [rawInput] is invalid.
+ */
+fun parseMbpsToKbps(rawInput: String): Int? = validateMbpsInput(rawInput).kbps
+
+/**
+ * Formats an integer hour (`0..23`) as 24-hour `HH:00` with leading zero.
+ */
+fun formatScheduleHour(hour: Int): String =
+    String.format(Locale.US, "%02d:00", hour.coerceIn(0, 23))
+
+/**
+ * Validates schedule hours. When [scheduleEnabled] is true, `startHour == endHour` is rejected
+ * because an identical start and end hour grants 0 hours of access.
+ */
+fun isValidScheduleHours(
+    scheduleEnabled: Boolean,
+    startHour: Int,
+    endHour: Int,
+): Boolean {
+    if (startHour !in 0..23 || endHour !in 0..23) return false
+    if (!scheduleEnabled) return true
+    return startHour != endHour
+}
+
+fun formatScheduleExplanation(startHour: Int, endHour: Int): String =
+    "Internet allowed from ${formatScheduleHour(startHour)} to ${formatScheduleHour(endHour)}. Outside this window, access is blocked."
+
+internal fun formatClientBandwidthBadgeLabel(
+    client: ConnectedClient,
+    isCurrentlyConnected: Boolean,
+): String {
+    val cap = if (client.bandwidthLimitKbps <= 0) {
+        "Unlimited"
+    } else {
+        "${formatKbpsAsMbps(client.bandwidthLimitKbps)} Mbps"
+    }
+    if (!isCurrentlyConnected) return "Cap: $cap (saved)"
+    return when (client.enforcementState) {
+        EnforcementState.THROTTLING_OBSERVED ->
+            "Cap: $cap (shaped • ${Traffic.format(client.shapedBytes)})"
+        EnforcementState.PARTIAL_BPF_ENFORCEMENT ->
+            "Cap: $cap (partial BPF • ${Traffic.format(client.shapedBytes)} shaped)"
+        EnforcementState.PACKETS_MATCHED ->
+            "Cap: $cap (matched • ${client.matchedPackets} pkts)"
+        EnforcementState.POLICY_INSTALLED,
+        EnforcementState.DATAPATH_ACTIVE,
+        -> "Cap: $cap (requested • policy active)"
+        EnforcementState.DEGRADED_MULTI_CLIENT ->
+            "Cap: $cap — degraded (post-NAT unattributed)"
+        EnforcementState.ENFORCEMENT_UNAVAILABLE ->
+            "Cap: $cap — not enforced"
+        else -> "Cap: $cap (configured)"
+    }
+}
 
 data class ClientActions(
     val onToggleBlock: (mac: String, shouldBlock: Boolean) -> Unit,
@@ -217,101 +355,6 @@ fun ClientsPage(
                         Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("Add MAC")
-                    }
-                }
-            }
-
-            val bpfReport = sessionState.bpfAttribution
-            Card(
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = ShizziTheme.colors.surfaceVariant.copy(alpha = 0.55f),
-                ),
-                border = BorderStroke(1.dp, ShizziTheme.colors.border),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 10.dp)
-                    .testTag("experimental_bpf_card"),
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Experimental BPF NAT Attribution",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp,
-                                color = ShizziTheme.colors.onSurface,
-                            )
-                            Text(
-                                text = "State: ${bpfReport.state.name} • Poll: ${bpfPollIntervalMs}ms",
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 10.sp,
-                                color = ShizziTheme.colors.primary,
-                            )
-                        }
-                        Switch(
-                            checked = experimentalBpfEnabled,
-                            onCheckedChange = actions.onSetExperimentalBpfEnabled,
-                            modifier = Modifier.testTag("experimental_bpf_switch"),
-                        )
-                    }
-                    if (experimentalBpfEnabled) {
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = "Collection: ${bpfReport.collectionStatus.name} (age ${bpfReport.snapshotAgeMs}ms, gen ${bpfReport.sessionGeneration}/${bpfReport.bindingGeneration}) • " +
-                                "Mapped flows: ${bpfReport.activeMappedFlows} (up=${bpfReport.totalUpstreamEntries}, rev=${bpfReport.reverseMatchedCount})",
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.sp,
-                            color = ShizziTheme.colors.onSurfaceMuted,
-                        )
-                        Text(
-                            text = "Pkts: bpf=${bpfReport.bpfAttributedPackets} direct=${bpfReport.directAttributedPackets} " +
-                                "unknownFwd=${bpfReport.unknownForwardedPackets} (${Traffic.format(bpfReport.unknownForwardedBytes)}) " +
-                                "ambiguous/stale=${bpfReport.ambiguousOrStaleLookups}",
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.sp,
-                            color = ShizziTheme.colors.onSurfaceMuted,
-                        )
-                        if (bpfReport.state == ExperimentalBpfState.PARTIAL_ENFORCEMENT) {
-                            Text(
-                                text = "Note: Established flows mapped via BPF are filtered, but initial packets before BPF offload remain unattributed.",
-                                fontSize = 10.sp,
-                                color = Color(0xFFFFA000),
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = actions.onOpenFirewallDiagnostic,
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("open_firewall_diagnostic_button"),
-                        ) {
-                            Text(
-                                text = "BPF & Firewall Diagnostics",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                        }
-                        if (experimentalBpfEnabled) {
-                            OutlinedButton(
-                                onClick = actions.onCollectBpfSnapshotNow,
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.testTag("collect_bpf_now_clients_button"),
-                            ) {
-                                Text(
-                                    text = "Collect BPF",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                )
-                            }
-                        }
                     }
                 }
             }
@@ -682,7 +725,7 @@ private fun ClientCard(
                         ShizziTheme.colors.primary
                     }
                     BadgeChip(
-                        label = client.formattedBandwidthBadgeLabel(isCurrentlyConnected),
+                        label = formatClientBandwidthBadgeLabel(client, isCurrentlyConnected),
                         color = capColor,
                         icon = Icons.Filled.Speed,
                     )
@@ -709,7 +752,7 @@ private fun ClientCard(
                 // Schedule badge
                 if (client.scheduleEnabled) {
                     BadgeChip(
-                        label = "Sched: ${client.scheduleStartHour}:00 - ${client.scheduleEndHour}:00",
+                        label = "Sched: ${formatScheduleHour(client.scheduleStartHour)} - ${formatScheduleHour(client.scheduleEndHour)}",
                         color = Color(0xFF29B6F6),
                         icon = Icons.Filled.Schedule,
                     )
@@ -788,18 +831,29 @@ private fun BadgeChip(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ConfigureClientDialog(
+internal fun ConfigureClientDialog(
     client: ConnectedClient,
     onDismiss: () -> Unit,
     onSave: (ClientRule) -> Unit,
 ) {
-    var alias by remember { mutableStateOf(client.alias) }
-    var isBlocked by remember { mutableStateOf(client.isBlocked) }
-    var bandwidthKbps by remember { mutableIntStateOf(client.bandwidthLimitKbps) }
-    var durationMinutes by remember { mutableIntStateOf(client.connectionTimeLimitMinutes) }
-    var scheduleEnabled by remember { mutableStateOf(client.scheduleEnabled) }
-    var scheduleStartHour by remember { mutableIntStateOf(client.scheduleStartHour) }
-    var scheduleEndHour by remember { mutableIntStateOf(client.scheduleEndHour) }
+    var alias by remember(client.cleanMac) { mutableStateOf(client.alias) }
+    var isBlocked by remember(client.cleanMac) { mutableStateOf(client.isBlocked) }
+    var bandwidthMbpsText by remember(client.cleanMac, client.bandwidthLimitKbps) {
+        mutableStateOf(formatKbpsAsMbps(client.bandwidthLimitKbps))
+    }
+    var durationMinutes by remember(client.cleanMac) { mutableIntStateOf(client.connectionTimeLimitMinutes) }
+    var scheduleEnabled by remember(client.cleanMac) { mutableStateOf(client.scheduleEnabled) }
+    var scheduleStartHour by remember(client.cleanMac) { mutableIntStateOf(client.scheduleStartHour.coerceIn(0, 23)) }
+    var scheduleEndHour by remember(client.cleanMac) { mutableIntStateOf(client.scheduleEndHour.coerceIn(0, 23)) }
+    var activeHourPicker by remember { mutableStateOf<HourPickerTarget?>(null) }
+
+    val bandwidthValidation = remember(bandwidthMbpsText) {
+        validateMbpsInput(bandwidthMbpsText)
+    }
+    val scheduleHoursValid = remember(scheduleEnabled, scheduleStartHour, scheduleEndHour) {
+        isValidScheduleHours(scheduleEnabled, scheduleStartHour, scheduleEndHour)
+    }
+    val canSave = bandwidthValidation.isValid && scheduleHoursValid
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -824,7 +878,9 @@ private fun ConfigureClientDialog(
                     label = { Text("Friendly Alias") },
                     placeholder = { Text("e.g. Geraldo's Laptop") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("configure_alias_input"),
                 )
 
                 Spacer(Modifier.height(16.dp))
@@ -854,40 +910,39 @@ private fun ConfigureClientDialog(
                             checkedThumbColor = Color.White,
                             checkedTrackColor = Color(0xFFFF5252),
                         ),
+                        modifier = Modifier.testTag("configure_block_switch"),
                     )
                 }
 
                 Spacer(Modifier.height(16.dp))
 
-                // Bandwidth Rate Limit Presets
-                Text(
-                    text = "Bandwidth Limit (Per Direction: Download & Upload)",
-                    fontWeight = FontWeight.SemiBold,
-                    style = ShizziTheme.typography.body,
+                // Numeric Bandwidth Rate Limit in Mbps
+                OutlinedTextField(
+                    value = bandwidthMbpsText,
+                    onValueChange = { bandwidthMbpsText = it },
+                    label = { Text("Bandwidth Limit (Mbps)") },
+                    suffix = { Text("Mbps") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    isError = !bandwidthValidation.isValid,
+                    supportingText = {
+                        if (bandwidthValidation.errorMessage != null) {
+                            Text(
+                                text = bandwidthValidation.errorMessage,
+                                color = Color(0xFFFF5252),
+                                modifier = Modifier.testTag("bandwidth_limit_error_text"),
+                            )
+                        } else {
+                            Text(
+                                text = "0 = Unlimited. Applied separately to download and upload.",
+                                modifier = Modifier.testTag("bandwidth_limit_helper_text"),
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("bandwidth_limit_mbps_input"),
                 )
-                Spacer(Modifier.height(6.dp))
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    val presets = listOf(
-                        0 to "Unlimited",
-                        512 to "512 Kbps",
-                        1000 to "1 Mbps",
-                        2000 to "2 Mbps",
-                        5000 to "5 Mbps",
-                        10000 to "10 Mbps",
-                        25000 to "25 Mbps",
-                    )
-                    presets.forEach { (limit, label) ->
-                        val selected = bandwidthKbps == limit
-                        LimitChip(
-                            label = label,
-                            isSelected = selected,
-                            onClick = { bandwidthKbps = limit },
-                        )
-                    }
-                }
 
                 Spacer(Modifier.height(16.dp))
 
@@ -948,30 +1003,68 @@ private fun ConfigureClientDialog(
                     Switch(
                         checked = scheduleEnabled,
                         onCheckedChange = { scheduleEnabled = it },
+                        modifier = Modifier.testTag("configure_schedule_switch"),
                     )
                 }
 
                 AnimatedVisibility(visible = scheduleEnabled) {
-                    Row(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(top = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        OutlinedTextField(
-                            value = scheduleStartHour.toString(),
-                            onValueChange = { scheduleStartHour = it.toIntOrNull()?.coerceIn(0, 23) ?: 0 },
-                            label = { Text("Start Hour (0-23)") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            ScheduleHourSelectorButton(
+                                label = "Start time",
+                                hour = scheduleStartHour,
+                                isError = !scheduleHoursValid,
+                                onClick = { activeHourPicker = HourPickerTarget.START },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("schedule_start_time_button"),
+                            )
+                            ScheduleHourSelectorButton(
+                                label = "End time",
+                                hour = scheduleEndHour,
+                                isError = !scheduleHoursValid,
+                                onClick = { activeHourPicker = HourPickerTarget.END },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("schedule_end_time_button"),
+                            )
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Text(
+                            text = "${formatScheduleHour(scheduleStartHour)} → ${formatScheduleHour(scheduleEndHour)}",
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp,
+                            color = if (scheduleHoursValid) ShizziTheme.colors.primary else Color(0xFFFF5252),
+                            modifier = Modifier.testTag("schedule_window_summary_text"),
                         )
-                        OutlinedTextField(
-                            value = scheduleEndHour.toString(),
-                            onValueChange = { scheduleEndHour = it.toIntOrNull()?.coerceIn(0, 23) ?: 23 },
-                            label = { Text("End Hour (0-23)") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                        )
+
+                        Spacer(Modifier.height(2.dp))
+
+                        if (!scheduleHoursValid) {
+                            Text(
+                                text = "Start time and end time cannot be the same (${formatScheduleHour(scheduleStartHour)}). Select different whole hours.",
+                                fontSize = 11.sp,
+                                color = Color(0xFFFF5252),
+                                modifier = Modifier.testTag("schedule_error_text"),
+                            )
+                        } else {
+                            Text(
+                                text = formatScheduleExplanation(scheduleStartHour, scheduleEndHour),
+                                fontSize = 11.sp,
+                                color = ShizziTheme.colors.onSurfaceMuted,
+                                modifier = Modifier.testTag("schedule_helper_text"),
+                            )
+                        }
                     }
                 }
             }
@@ -979,12 +1072,16 @@ private fun ConfigureClientDialog(
         confirmButton = {
             Button(
                 onClick = {
+                    val resolvedKbps = bandwidthValidation.kbps ?: return@Button
+                    if (!isValidScheduleHours(scheduleEnabled, scheduleStartHour, scheduleEndHour)) {
+                        return@Button
+                    }
                     onSave(
                         ClientRule(
                             mac = client.cleanMac,
                             alias = alias.trim(),
                             isBlocked = isBlocked,
-                            bandwidthLimitKbps = bandwidthKbps,
+                            bandwidthLimitKbps = resolvedKbps,
                             connectionTimeLimitMinutes = durationMinutes,
                             scheduleEnabled = scheduleEnabled,
                             scheduleStartHour = scheduleStartHour,
@@ -992,13 +1089,172 @@ private fun ConfigureClientDialog(
                         ),
                     )
                 },
+                enabled = canSave,
                 colors = ButtonDefaults.buttonColors(containerColor = ShizziTheme.colors.primary),
+                modifier = Modifier.testTag("save_client_rules_button"),
             ) {
                 Text("Save Rules")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("cancel_client_rules_button"),
+            ) {
+                Text("Cancel")
+            }
+        },
+    )
+
+    activeHourPicker?.let { target ->
+        val currentSelected = if (target == HourPickerTarget.START) scheduleStartHour else scheduleEndHour
+        val dialogTitle = if (target == HourPickerTarget.START) "Select Start Time (24h)" else "Select End Time (24h)"
+        HourPickerDialog(
+            title = dialogTitle,
+            selectedHour = currentSelected,
+            onSelectHour = { chosenHour ->
+                if (target == HourPickerTarget.START) {
+                    scheduleStartHour = chosenHour
+                } else {
+                    scheduleEndHour = chosenHour
+                }
+                activeHourPicker = null
+            },
+            onDismiss = { activeHourPicker = null },
+        )
+    }
+}
+
+private enum class HourPickerTarget {
+    START,
+    END,
+}
+
+@Composable
+private fun ScheduleHourSelectorButton(
+    label: String,
+    hour: Int,
+    isError: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val borderColor = when {
+        isError -> Color(0xFFFF5252)
+        else -> ShizziTheme.colors.onSurfaceMuted.copy(alpha = 0.35f)
+    }
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = ShizziTheme.colors.surfaceVariant.copy(alpha = 0.65f),
+        border = BorderStroke(1.dp, borderColor),
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column {
+                Text(
+                    text = label,
+                    fontSize = 11.sp,
+                    color = ShizziTheme.colors.onSurfaceMuted,
+                )
+                Text(
+                    text = formatScheduleHour(hour),
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = ShizziTheme.colors.onSurface,
+                )
+            }
+            Icon(
+                imageVector = Icons.Filled.Schedule,
+                contentDescription = label,
+                tint = if (isError) Color(0xFFFF5252) else ShizziTheme.colors.primary,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun HourPickerDialog(
+    title: String,
+    selectedHour: Int,
+    onSelectHour: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                Text(
+                    text = "Whole hours only (00:00 – 23:00)",
+                    fontSize = 12.sp,
+                    color = ShizziTheme.colors.onSurfaceMuted,
+                )
+                Spacer(Modifier.height(10.dp))
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    for (hour in 0..23) {
+                        val isSelected = hour == selectedHour
+                        val formatted = formatScheduleHour(hour)
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (isSelected) {
+                                ShizziTheme.colors.primary.copy(alpha = 0.2f)
+                            } else {
+                                ShizziTheme.colors.surfaceVariant
+                            },
+                            border = BorderStroke(
+                                width = 1.dp,
+                                color = if (isSelected) {
+                                    ShizziTheme.colors.primary
+                                } else {
+                                    ShizziTheme.colors.onSurfaceMuted.copy(alpha = 0.25f)
+                                },
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { onSelectHour(hour) }
+                                .testTag("hour_option_$hour"),
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            ) {
+                                Text(
+                                    text = formatted,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 13.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (isSelected) ShizziTheme.colors.primary else ShizziTheme.colors.onSurface,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("hour_picker_cancel_button"),
+            ) {
                 Text("Cancel")
             }
         },

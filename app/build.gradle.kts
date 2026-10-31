@@ -16,10 +16,10 @@ android {
     applicationId = "dev.shizzi"
     minSdk = 24
     targetSdk = 36
-    versionCode = 15
-    versionName = "0.4.0-rs-lua.10"
-    buildConfigField("int", "SERVICE_BUILD_ID", "15")
-    buildConfigField("String", "SOURCE_COMMIT", "\"29ef77940316acb6b7890fc507f28f22bbbc985e+lua.10\"")
+    versionCode = 16
+    versionName = "0.4.0-rs-lua.10.1"
+    buildConfigField("int", "SERVICE_BUILD_ID", "16")
+    buildConfigField("String", "SOURCE_COMMIT", "\"ab2e16dcef1590fe09358fc462cf3a3561439602+lua.10.1\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     ndk {
