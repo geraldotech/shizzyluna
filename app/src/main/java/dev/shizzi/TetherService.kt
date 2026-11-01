@@ -119,6 +119,11 @@ class TetherService : ITetherService.Stub {
         runCatching { session.collectBpfSnapshotNow() }
             .getOrElse { failure -> errorReport("collectBpfSnapshotNow", failure) }
 
+    override fun resetClientQuota(mac: String?) {
+        runCatching { session.resetClientQuota(mac.orEmpty()) }
+            .onFailure { failure -> Log.e(TAG, "resetClientQuota failed: ${failure.message}") }
+    }
+
     private fun publish(report: String): String {
         runCatching { java.io.File(REPORT_PATH).writeText(report) }
             .onFailure { failure -> Log.w(TAG, "publish: ${failure.message}") }

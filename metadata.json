@@ -1,6 +1,6 @@
 {
-  "name": "Shizzi",
-  "description": "Rootless hotspot & tethering carrier restriction bypass utility powered by Shizuku",
+  "name": "shizzy lua",
+  "description": "Rootless hotspot & tethering carrier restriction bypass utility with eBPF NAT flow attribution, per-client token-bucket QoS, and persistent data quota limits (v0.10.2)",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

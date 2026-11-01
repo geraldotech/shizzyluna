@@ -96,10 +96,11 @@ fun SettingsToggle(
 fun SettingsAction(
     label: SettingsText,
     isExternal: Boolean = false,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
             .padding(vertical = RowPadding),

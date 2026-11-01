@@ -42,6 +42,8 @@ class SessionService : Service() {
 
     private val sessionLock = Mutex()
 
+    private var lastQuotaSyncEpochMs = 0L
+
     override fun onCreate() {
         super.onCreate()
         controller.onSessionLost = ::handleSessionLost
@@ -136,11 +138,27 @@ class SessionService : Service() {
         }
     }
 
+    fun applyResetClientQuota(mac: String) {
+        scope.launch {
+            sessionLock.withLock {
+                runCatching { controller.resetClientQuota(mac) }
+            }
+        }
+    }
+
     private fun followStatus() = statusPoller.follow(
         isConnected = { internalState.value.status == UiStatus.CONNECTED },
         onStatus = { outcome ->
             internalState.update { current -> current.applyOutcome(outcome) }
             publishState()
+            val hosts = internalState.value.connectedClients
+            val now = System.currentTimeMillis()
+            if (hosts.isNotEmpty() && now - lastQuotaSyncEpochMs >= 4_000L) {
+                lastQuotaSyncEpochMs = now
+                scope.launch {
+                    runCatching { settingsStore().syncClientQuotaSnapshots(hosts, force = false) }
+                }
+            }
         },
     )
 
@@ -155,6 +173,7 @@ class SessionService : Service() {
 
         statusPoller.stop()
 
+        val lastConnectedHosts = internalState.value.connectedClients
         internalState.update {
             it.asStopped()
         }
@@ -164,6 +183,10 @@ class SessionService : Service() {
         scope.launch {
 
             abandoned?.cancelAndJoin()
+
+            if (lastConnectedHosts.isNotEmpty()) {
+                runCatching { settingsStore().syncClientQuotaSnapshots(lastConnectedHosts, force = true) }
+            }
 
             sessionLock.withLock {
                 runCatching { controller.stop() }
@@ -270,6 +293,10 @@ class SessionService : Service() {
 
         fun updateExperimentalBpfConfig(enabled: Boolean, pollIntervalMs: Int) {
             liveService?.applyExperimentalBpfConfig(enabled, pollIntervalMs)
+        }
+
+        fun resetClientQuota(mac: String) {
+            liveService?.applyResetClientQuota(mac)
         }
 
         private fun Intent.reporting(command: AutomationCommand?): Intent = when (command) {

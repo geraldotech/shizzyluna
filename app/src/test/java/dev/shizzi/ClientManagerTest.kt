@@ -851,6 +851,392 @@ class ClientManagerTest {
         assertTrue(report.toMarkdownReport().contains("ShizziLuna — Relatório de Capacidade do Firewall por Cliente"))
     }
 
+    @Test
+    fun `v0_10_2 legacy ClientRule JSON backward compatibility and quota serialization roundtrip`() {
+        val legacyJson = """
+            [
+              {
+                "mac": "e2:15:cd:54:e4:9b",
+                "alias": "Galaxy S25",
+                "isBlocked": false,
+                "bandwidthLimitKbps": 1500,
+                "connectionTimeLimitMinutes": 30,
+                "scheduleEnabled": true,
+                "scheduleStartHour": 8,
+                "scheduleEndHour": 22
+              }
+            ]
+        """.trimIndent()
+
+        val parsedLegacy = ClientRule.parseList(legacyJson)
+        assertEquals(1, parsedLegacy.size)
+        val rule = parsedLegacy[0]
+        assertEquals("E2:15:CD:54:E4:9B", rule.cleanMac)
+        assertEquals(1500, rule.bandwidthLimitKbps)
+        assertEquals(0L, rule.dataLimitBytes)
+        assertEquals(QuotaResetPeriod.MANUAL, rule.quotaResetPeriod)
+        assertEquals(0L, rule.quotaUsedRxBytes)
+        assertEquals(0L, rule.quotaUsedTxBytes)
+        assertFalse(rule.isQuotaExceeded)
+
+        // Full v0.10.2 quota rule roundtrip
+        val quotaRule = ClientRule(
+            mac = "E2:15:CD:54:E4:9B",
+            alias = "Galaxy S25",
+            isBlocked = false,
+            bandwidthLimitKbps = 2000,
+            connectionTimeLimitMinutes = 60,
+            scheduleEnabled = true,
+            scheduleStartHour = 9,
+            scheduleEndHour = 21,
+            dataLimitBytes = 500L * DataQuota.BYTES_PER_MB,
+            quotaResetPeriod = QuotaResetPeriod.DAILY,
+            quotaUsedRxBytes = 120L * DataQuota.BYTES_PER_MB,
+            quotaUsedTxBytes = 80L * DataQuota.BYTES_PER_MB,
+            quotaWindowId = "DAILY:2026-10-31",
+            quotaWindowStartEpochMs = 1761868800000L,
+            quotaLastUpdatedEpochMs = 1761872400000L,
+            quotaResetGeneration = 4L,
+        )
+        val serialized = ClientRule.serializeList(listOf(quotaRule))
+        val roundtrip = ClientRule.parseList(serialized).single()
+        assertEquals(500L * DataQuota.BYTES_PER_MB, roundtrip.dataLimitBytes)
+        assertEquals(QuotaResetPeriod.DAILY, roundtrip.quotaResetPeriod)
+        assertEquals(120L * DataQuota.BYTES_PER_MB, roundtrip.quotaUsedRxBytes)
+        assertEquals(80L * DataQuota.BYTES_PER_MB, roundtrip.quotaUsedTxBytes)
+        assertEquals(200L * DataQuota.BYTES_PER_MB, roundtrip.quotaUsedTotalBytes)
+        assertEquals("DAILY:2026-10-31", roundtrip.quotaWindowId)
+        assertEquals(1761868800000L, roundtrip.quotaWindowStartEpochMs)
+        assertEquals(1761872400000L, roundtrip.quotaLastUpdatedEpochMs)
+        assertEquals(4L, roundtrip.quotaResetGeneration)
+    }
+
+    @Test
+    fun `v0_10_2 DataQuota validates MB input and formats bytes accurately`() {
+        assertEquals(0L, DataQuota.parseDataLimitMbToBytes("0"))
+        assertEquals(500L * 1_048_576L, DataQuota.parseDataLimitMbToBytes("500"))
+        assertEquals(1024L * 1_048_576L, DataQuota.parseDataLimitMbToBytes("1024"))
+        assertEquals(2048L * 1_048_576L, DataQuota.parseDataLimitMbToBytes("2048"))
+
+        assertEquals("0", DataQuota.formatBytesAsMbInput(0L))
+        assertEquals("500", DataQuota.formatBytesAsMbInput(500L * 1_048_576L))
+        assertEquals("2048", DataQuota.formatBytesAsMbInput(2048L * 1_048_576L))
+
+        assertEquals("0 B", DataQuota.formatBytes(0L))
+        assertEquals("512 B", DataQuota.formatBytes(512L))
+        assertEquals("1 KB", DataQuota.formatBytes(1024L))
+        assertEquals("500 MB", DataQuota.formatBytes(500L * 1_048_576L))
+        assertEquals("1 GB", DataQuota.formatBytes(1024L * 1_048_576L))
+        assertEquals("1.5 GB", DataQuota.formatBytes(1536L * 1_048_576L))
+        assertEquals("2 GB", DataQuota.formatBytes(2048L * 1_048_576L))
+
+        // Invalid inputs
+        assertFalse(DataQuota.validateDataLimitMbInput("").isValid)
+        assertFalse(DataQuota.validateDataLimitMbInput("   ").isValid)
+        assertFalse(DataQuota.validateDataLimitMbInput("-1").isValid)
+        assertFalse(DataQuota.validateDataLimitMbInput("1.5").isValid)
+        assertFalse(DataQuota.validateDataLimitMbInput("abc").isValid)
+        assertFalse(DataQuota.validateDataLimitMbInput("9999999999999").isValid)
+    }
+
+    @Test
+    fun `v0_10_2 quota threshold enforcement blocks Client A when exceeded while Client B remains allowed`() {
+        TunTrafficEngine.resetAllQuotaStatesForTest()
+        val macA = "E2:15:CD:54:E4:9B"
+        val macB = "00:A5:54:56:D0:D3"
+        val hostA = DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "swlan0")
+        val hostB = DiscoveredHost(mac = macB, ip = "192.168.167.242", allIps = listOf("192.168.167.242"), interfaceName = "swlan0")
+
+        val rules = listOf(
+            ClientRule(
+                mac = macA,
+                alias = "Client A",
+                isBlocked = false,
+                dataLimitBytes = 3000L,
+                quotaResetPeriod = QuotaResetPeriod.MANUAL,
+            ),
+            ClientRule(
+                mac = macB,
+                alias = "Client B",
+                isBlocked = false,
+                dataLimitBytes = 0L, // Unlimited
+            ),
+        )
+        HostFirewall.enforce(rules, listOf(hostA, hostB))
+
+        // Packet 1 for Client A: 1200 bytes upload -> ALLOW (used = 1200 / 3000)
+        val pktA1 = buildIpv4TcpPacket(intArrayOf(192, 168, 167, 151), intArrayOf(142, 250, 190, 46), 50100, 443, 1200)
+        val metaA1 = TunTrafficEngine.parsePacketMeta(pktA1, pktA1.size)!!
+        assertEquals(macA, TunTrafficEngine.resolveClientMacForPacket(metaA1, isUpload = true))
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(metaA1, macA, isUpload = true))
+
+        // Packet 2 for Client A: 1200 bytes download -> ALLOW (used = 2400 / 3000)
+        val pktA2 = buildIpv4TcpPacket(intArrayOf(142, 250, 190, 46), intArrayOf(192, 168, 167, 151), 443, 50100, 1200)
+        val metaA2 = TunTrafficEngine.parsePacketMeta(pktA2, pktA2.size)!!
+        assertEquals(macA, TunTrafficEngine.resolveClientMacForPacket(metaA2, isUpload = false))
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(metaA2, macA, isUpload = false))
+        assertFalse(TunTrafficEngine.getCounterSnapshot(macA).quotaExceeded)
+
+        // Packet 3 for Client A: 800 bytes upload -> crosses 3000-byte limit (used = 3200 >= 3000)
+        val pktA3 = buildIpv4TcpPacket(intArrayOf(192, 168, 167, 151), intArrayOf(142, 250, 190, 46), 50100, 443, 800)
+        val metaA3 = TunTrafficEngine.parsePacketMeta(pktA3, pktA3.size)!!
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(metaA3, macA, isUpload = true))
+        val snapAfterCross = TunTrafficEngine.getCounterSnapshot(macA)
+        assertTrue(snapAfterCross.quotaExceeded)
+        assertEquals(1200L, snapAfterCross.quotaUsedRxBytes)
+        assertEquals(2000L, snapAfterCross.quotaUsedTxBytes)
+
+        // Packet 4 for Client A: must now be immediately DROPPED due to quota exhaustion, and dropped bytes must not inflate quota
+        val pktA4 = buildIpv4TcpPacket(intArrayOf(192, 168, 167, 151), intArrayOf(142, 250, 190, 46), 50100, 443, 1000)
+        val metaA4 = TunTrafficEngine.parsePacketMeta(pktA4, pktA4.size)!!
+        assertEquals(PacketDecision.DROP, TunTrafficEngine.evaluateAndShape(metaA4, macA, isUpload = true))
+        val snapAfterDrop = TunTrafficEngine.getCounterSnapshot(macA)
+        assertEquals(1L, snapAfterDrop.blockedDropPackets)
+        assertEquals(3200L, snapAfterDrop.quotaUsedRxBytes + snapAfterDrop.quotaUsedTxBytes)
+
+        // Client B must remain completely unaffected and allowed
+        val pktB = buildIpv4TcpPacket(intArrayOf(192, 168, 167, 242), intArrayOf(142, 250, 190, 46), 50200, 443, 1400)
+        val metaB = TunTrafficEngine.parsePacketMeta(pktB, pktB.size)!!
+        assertEquals(macB, TunTrafficEngine.resolveClientMacForPacket(metaB, isUpload = true))
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(metaB, macB, isUpload = true))
+        assertEquals(0L, TunTrafficEngine.getCounterSnapshot(macB).droppedPackets)
+
+        // Verify HostFirewall.enforce reflects Data limit reached without mutating rule.isBlocked
+        val summary = HostFirewall.enforce(rules, listOf(hostA, hostB))
+        assertEquals(1, summary.blockedConnectedCount)
+        assertFalse(rules[0].isBlocked)
+
+        TunTrafficEngine.resetAllQuotaStatesForTest()
+    }
+
+    @Test
+    fun `v0_10_2 manual block and quota block remain independent and manual block has higher priority`() {
+        TunTrafficEngine.resetAllQuotaStatesForTest()
+        val mac = "AA:BB:CC:11:22:33"
+        val host = DiscoveredHost(mac = mac, ip = "192.168.43.77", allIps = listOf("192.168.43.77"), interfaceName = "wlan1")
+
+        // 1. Client exceeds quota while isBlocked = false -> reason is "Data limit reached"
+        val ruleOverQuota = ClientRule(
+            mac = mac,
+            isBlocked = false,
+            dataLimitBytes = 1000L,
+            quotaUsedRxBytes = 1200L,
+            quotaUsedTxBytes = 0L,
+        )
+        HostFirewall.enforce(listOf(ruleOverQuota), listOf(host))
+        val snap1 = TunTrafficEngine.getCounterSnapshot(mac)
+        assertTrue(snap1.quotaExceeded)
+
+        val uiClientOverQuota = ClientDiscovery.discoverClients(
+            savedRules = listOf(ruleOverQuota),
+            discoveredHosts = listOf(host.copy(quotaUsedRxBytes = snap1.quotaUsedRxBytes)),
+            activeClientCount = 1,
+        ).single()
+        assertFalse(uiClientOverQuota.isBlocked)
+        assertEquals(true to "Data limit reached", uiClientOverQuota.isRestricted())
+
+        // 2. Admin manually blocks client while also over quota -> "Blocked by admin" wins
+        val uiClientManualAndQuota = uiClientOverQuota.copy(isBlocked = true)
+        assertEquals(true to "Blocked by admin", uiClientManualAndQuota.isRestricted())
+
+        // 3. Admin resets quota while client is manually blocked -> usage becomes 0, client stays "Blocked by admin"
+        val resetRecord = TunTrafficEngine.resetClientQuota(mac)!!
+        assertEquals(0L, resetRecord.usedTotalBytes)
+        val uiClientManualAfterReset = uiClientManualAndQuota.copy(quotaUsedRxBytes = 0L, quotaUsedTxBytes = 0L)
+        assertFalse(uiClientManualAfterReset.isQuotaExceeded)
+        assertEquals(true to "Blocked by admin", uiClientManualAfterReset.isRestricted())
+
+        // 4. Admin unblocks client after quota was exceeded (without resetting quota) -> still blocked by "Data limit reached"
+        val uiClientUnblockedStillOverQuota = uiClientOverQuota.copy(isBlocked = false, quotaUsedRxBytes = 1200L)
+        assertEquals(true to "Data limit reached", uiClientUnblockedStillOverQuota.isRestricted())
+
+        // 5. Increasing data limit above used bytes (or setting 0 Unlimited) immediately restores access
+        val ruleIncreasedLimit = ruleOverQuota.copy(dataLimitBytes = 5000L, quotaUsedRxBytes = 1200L)
+        HostFirewall.enforce(listOf(ruleIncreasedLimit), listOf(host))
+        val pkt = buildIpv4TcpPacket(intArrayOf(192, 168, 43, 77), intArrayOf(1, 1, 1, 1), 40000, 443, 500)
+        val meta = TunTrafficEngine.parsePacketMeta(pkt, pkt.size)!!
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(meta, mac, isUpload = true))
+
+        TunTrafficEngine.resetAllQuotaStatesForTest()
+    }
+
+    @Test
+    fun `v0_10_2 shaped queued packets count once toward quota and overflow or unattributed packets are not charged`() {
+        TunTrafficEngine.resetAllQuotaStatesForTest()
+        val mac = "AA:BB:CC:44:55:66"
+        val host = DiscoveredHost(mac = mac, ip = "192.168.43.88", allIps = listOf("192.168.43.88"), interfaceName = "wlan1")
+        val rule = ClientRule(
+            mac = mac,
+            bandwidthLimitKbps = 100, // 100 Kbps (12,500 bytes/sec, burst 4500 bytes -> 1100B deficit = 88ms <= 100ms)
+            dataLimitBytes = 50_000L,
+        )
+        HostFirewall.enforce(listOf(rule), listOf(host))
+
+        // First three 1400-byte packets consume 4200 bytes of the 4500-byte initial burst; 4th triggers RATE_LIMIT (88ms)
+        val pkt = buildIpv4TcpPacket(intArrayOf(192, 168, 43, 88), intArrayOf(8, 8, 8, 8), 55000, 443, 1400)
+        val meta = TunTrafficEngine.parsePacketMeta(pkt, pkt.size)!!
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShapeDetailed(meta, mac, isUpload = true).decision)
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShapeDetailed(meta, mac, isUpload = true).decision)
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShapeDetailed(meta, mac, isUpload = true).decision)
+        assertEquals(4200L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+        val resPaced = TunTrafficEngine.evaluateAndShapeDetailed(meta, mac, isUpload = true)
+        assertEquals(PacketDecision.RATE_LIMIT, resPaced.decision)
+        assertTrue(resPaced.paceDelayMs > 0L)
+        // Charged once when accepted into RATE_LIMIT shaping (4200 + 1400 = 5600)
+        assertEquals(5600L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+        // Enqueue and drain due paced packet -> must NOT double-count!
+        val nowNs = System.nanoTime()
+        assertTrue(
+            TunTrafficEngine.enqueuePacedPacket(
+                mac = mac,
+                isUpload = true,
+                buf = pkt,
+                length = pkt.size,
+                paceDelayMs = 1L,
+                policyVersion = resPaced.policyVersion,
+                targetFd = null,
+                nowNs = nowNs,
+            ),
+        )
+        val drainedCount = TunTrafficEngine.drainDuePacedPackets(nowNs + 5_000_000L)
+        assertEquals(1, drainedCount)
+        assertEquals(5600L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+        // Next large 1400-byte packet exceeds 100ms virtual queue delay -> DROP_AQM -> must NOT charge quota!
+        val resAqmDrop = TunTrafficEngine.evaluateAndShapeDetailed(meta, mac, isUpload = true)
+        assertEquals(PacketDecision.DROP_AQM, resAqmDrop.decision)
+        assertEquals(5600L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+        // If a small paced packet is dropped on queue overflow, its pre-charged bytes are refunded
+        val pktOverflow = buildIpv4TcpPacket(intArrayOf(192, 168, 43, 88), intArrayOf(8, 8, 8, 8), 55000, 443, 60)
+        val metaOverflow = TunTrafficEngine.parsePacketMeta(pktOverflow, pktOverflow.size)!!
+        val resOverflow = TunTrafficEngine.evaluateAndShapeDetailed(metaOverflow, mac, isUpload = true)
+        assertEquals(PacketDecision.RATE_LIMIT, resOverflow.decision)
+        assertEquals(5660L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+        TunTrafficEngine.recordQueueOverflowDrop(mac, pktOverflow.size, isUpload = true)
+        assertEquals(5600L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+        // Unattributed post-NAT packet (192.0.2.2) must never be charged to Client A
+        val unattributedPkt = buildIpv4TcpPacket(intArrayOf(192, 0, 2, 2), intArrayOf(8, 8, 4, 4), 61234, 53, 900)
+        val unattributedMeta = TunTrafficEngine.parsePacketMeta(unattributedPkt, unattributedPkt.size)!!
+        assertEquals(null, TunTrafficEngine.resolveClientMacForPacket(unattributedMeta, isUpload = true))
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(unattributedMeta, matchedMac = null, isUpload = true))
+        assertEquals(5600L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+        TunTrafficEngine.resetAllQuotaStatesForTest()
+    }
+
+    @Test
+    fun `v0_10_2 quota usage persists across session stop and simulated process death`() {
+        val tempFile = java.io.File.createTempFile("shizzi_quota_test_", ".json")
+        val prevFile = TunTrafficEngine.quotaCheckpointFile
+        try {
+            TunTrafficEngine.quotaCheckpointFile = tempFile
+            TunTrafficEngine.resetAllQuotaStatesForTest()
+
+            val mac = "E2:15:CD:54:E4:9B"
+            val host = DiscoveredHost(mac = mac, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "swlan0")
+            val rule = ClientRule(
+                mac = mac,
+                dataLimitBytes = 5000L,
+                quotaResetPeriod = QuotaResetPeriod.DAILY,
+            )
+            HostFirewall.enforce(listOf(rule), listOf(host))
+
+            val pkt = buildIpv4TcpPacket(intArrayOf(192, 168, 167, 151), intArrayOf(1, 1, 1, 1), 50000, 443, 2200)
+            val meta = TunTrafficEngine.parsePacketMeta(pkt, pkt.size)!!
+            assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(meta, mac, isUpload = true))
+            assertEquals(2200L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+            // 1. Stop hotspot/VPN session -> HostFirewall.clearAll() flushes checkpoint and keeps quota
+            HostFirewall.clearAll()
+            assertEquals(2200L, TunTrafficEngine.getQuotaRecord(mac)?.usedTotalBytes)
+
+            // 2. Simulate process death & service restart -> reloads from checkpoint file on disk
+            TunTrafficEngine.simulateProcessRestartForQuotaTest()
+            val restored = TunTrafficEngine.getQuotaRecord(mac)
+            assertEquals(2200L, restored?.usedTotalBytes)
+            assertEquals(5000L, restored?.dataLimitBytes)
+            assertEquals(QuotaResetPeriod.DAILY, restored?.resetPeriod)
+        } finally {
+            TunTrafficEngine.resetAllQuotaStatesForTest()
+            TunTrafficEngine.quotaCheckpointFile = prevFile
+            tempFile.delete()
+        }
+    }
+
+    @Test
+    fun `v0_10_2 Daily Weekly Monthly and Manual window rollover and clock rollback protection`() {
+        val zone = java.time.ZoneId.of("America/Sao_Paulo")
+        val day1Time = java.time.ZonedDateTime.of(2026, 10, 30, 23, 50, 0, 0, zone).toInstant().toEpochMilli()
+        val day2Time = java.time.ZonedDateTime.of(2026, 10, 31, 0, 5, 0, 0, zone).toInstant().toEpochMilli()
+
+        // 1. DAILY rollover across local midnight
+        val day1Window = DataQuota.computeCurrentWindow(QuotaResetPeriod.DAILY, day1Time, zone)
+        assertEquals("DAILY:2026-10-30", day1Window.windowId)
+        val dailyRecord = ClientQuotaRecord(
+            mac = "AA:BB:CC:DD:EE:01",
+            dataLimitBytes = 10_000L,
+            resetPeriod = QuotaResetPeriod.DAILY,
+            usedRxBytes = 8_000L,
+            usedTxBytes = 3_000L,
+            windowId = day1Window.windowId,
+            windowStartEpochMs = day1Window.windowStartEpochMs,
+            lastUpdatedEpochMs = day1Time,
+        )
+        assertTrue(dailyRecord.isQuotaExceeded)
+
+        val rolledDaily = DataQuota.evaluateWindowRollover(dailyRecord, day2Time, zone)
+        assertEquals("DAILY:2026-10-31", rolledDaily.windowId)
+        assertEquals(0L, rolledDaily.usedRxBytes)
+        assertEquals(0L, rolledDaily.usedTxBytes)
+        assertFalse(rolledDaily.isQuotaExceeded)
+
+        // 2. Clock rollback protection: moving clock backward from Oct 31 to Oct 30 must NOT reset usage
+        val activeDay2Record = rolledDaily.copy(usedRxBytes = 4_500L, lastUpdatedEpochMs = day2Time)
+        val afterClockRollback = DataQuota.evaluateWindowRollover(activeDay2Record, day1Time, zone)
+        assertEquals("DAILY:2026-10-31", afterClockRollback.windowId)
+        assertEquals(4_500L, afterClockRollback.usedRxBytes)
+
+        // 3. WEEKLY rollover across Sunday -> Monday 00:00 local time
+        val sundayTime = java.time.ZonedDateTime.of(2026, 10, 25, 22, 0, 0, 0, zone).toInstant().toEpochMilli()
+        val mondayTime = java.time.ZonedDateTime.of(2026, 10, 26, 0, 10, 0, 0, zone).toInstant().toEpochMilli()
+        val sunWindow = DataQuota.computeCurrentWindow(QuotaResetPeriod.WEEKLY, sundayTime, zone)
+        assertEquals("WEEKLY:2026-10-19", sunWindow.windowId)
+        val weeklyRecord = dailyRecord.copy(
+            resetPeriod = QuotaResetPeriod.WEEKLY,
+            windowId = sunWindow.windowId,
+            windowStartEpochMs = sunWindow.windowStartEpochMs,
+        )
+        val rolledWeekly = DataQuota.evaluateWindowRollover(weeklyRecord, mondayTime, zone)
+        assertEquals("WEEKLY:2026-10-26", rolledWeekly.windowId)
+        assertEquals(0L, rolledWeekly.usedTotalBytes)
+
+        // 4. MONTHLY rollover across Oct 31 -> Nov 1 00:00 local time
+        val nov1Time = java.time.ZonedDateTime.of(2026, 11, 1, 0, 1, 0, 0, zone).toInstant().toEpochMilli()
+        val octWindow = DataQuota.computeCurrentWindow(QuotaResetPeriod.MONTHLY, day2Time, zone)
+        assertEquals("MONTHLY:2026-10", octWindow.windowId)
+        val monthlyRecord = dailyRecord.copy(
+            resetPeriod = QuotaResetPeriod.MONTHLY,
+            windowId = octWindow.windowId,
+            windowStartEpochMs = octWindow.windowStartEpochMs,
+        )
+        val rolledMonthly = DataQuota.evaluateWindowRollover(monthlyRecord, nov1Time, zone)
+        assertEquals("MONTHLY:2026-11", rolledMonthly.windowId)
+        assertEquals(0L, rolledMonthly.usedTotalBytes)
+
+        // 5. MANUAL never auto-resets across days or months
+        val manualRecord = dailyRecord.copy(
+            resetPeriod = QuotaResetPeriod.MANUAL,
+            windowId = "MANUAL",
+        )
+        val manualAfterMonth = DataQuota.evaluateWindowRollover(manualRecord, nov1Time, zone)
+        assertEquals(11_000L, manualAfterMonth.usedTotalBytes)
+        assertTrue(manualAfterMonth.isQuotaExceeded)
+    }
+
     private fun buildIpv4TcpPacket(
         srcIp: IntArray,
         dstIp: IntArray,

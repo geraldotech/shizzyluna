@@ -37,4 +37,6 @@ interface ITetherService {
     String setExperimentalBpfConfig(boolean enabled, int pollIntervalMs);
 
     String collectBpfSnapshotNow();
+
+    void resetClientQuota(String mac);
 }

@@ -63,6 +63,7 @@ data class AppActions(
     val onSetExperimentalBpfEnabled: (Boolean) -> Unit = {},
     val onSetBpfPollIntervalMs: (Int) -> Unit = {},
     val onCollectBpfSnapshotNow: () -> Unit = {},
+    val onResetClientQuotaUsage: (String) -> Unit = {},
 )
 
 /** Routes the navigator's current screen and hosts the toast overlay. */
@@ -171,6 +172,7 @@ private fun ClientsRoute(context: ScreenContext) {
             onOpenFirewallDiagnostic = { navigation.open(Screen.FIREWALL_DIAGNOSTIC) },
             onSetExperimentalBpfEnabled = actions.onSetExperimentalBpfEnabled,
             onCollectBpfSnapshotNow = actions.onCollectBpfSnapshotNow,
+            onResetClientQuotaUsage = actions.onResetClientQuotaUsage,
         ),
         onBack = navigation.goBack,
     )

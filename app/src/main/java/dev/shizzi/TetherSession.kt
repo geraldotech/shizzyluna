@@ -94,6 +94,31 @@ class TetherSession(private val context: Context) {
         }
     }
 
+    fun resetClientQuota(mac: String) {
+        val cleanMac = mac.uppercase().trim()
+        if (cleanMac.length != 17) return
+        val resetRecord = TunTrafficEngine.resetClientQuota(cleanMac)
+        activeRules = activeRules.map { rule ->
+            if (rule.cleanMac == cleanMac) {
+                val winStart = resetRecord?.windowStartEpochMs ?: System.currentTimeMillis()
+                val winId = resetRecord?.windowId ?: rule.quotaWindowId
+                val gen = resetRecord?.resetGeneration ?: (rule.quotaResetGeneration + 1L)
+                rule.copy(
+                    quotaUsedRxBytes = 0L,
+                    quotaUsedTxBytes = 0L,
+                    quotaWindowId = winId,
+                    quotaWindowStartEpochMs = winStart,
+                    quotaLastUpdatedEpochMs = System.currentTimeMillis(),
+                    quotaResetGeneration = gen,
+                )
+            } else {
+                rule
+            }
+        }
+        val clients = if (isActive) downstream.listDiscoveredClients(forceRefresh = true) else emptyList()
+        HostFirewall.enforce(activeRules, clients, logSummary = false)
+    }
+
     fun start(
         mode: VpnMode = VpnMode.AUTO,
         customDnsList: List<String>? = null,
@@ -356,6 +381,13 @@ class TetherSession(private val context: Context) {
                     put("directAttributedPackets", counters.directAttributedPackets)
                     put("bpfAttributedPackets", counters.bpfAttributedPackets)
                     put("policyVersion", counters.policyVersion)
+                    put("quotaUsedRxBytes", counters.quotaUsedRxBytes)
+                    put("quotaUsedTxBytes", counters.quotaUsedTxBytes)
+                    put("quotaWindowId", counters.quotaWindowId)
+                    put("quotaWindowStartEpochMs", counters.quotaWindowStartEpochMs)
+                    put("quotaLastUpdatedEpochMs", counters.quotaLastUpdatedEpochMs)
+                    put("quotaResetGeneration", counters.quotaResetGeneration)
+                    put("quotaDropPackets", counters.quotaDropPackets)
                     val ipsArr = org.json.JSONArray()
                     c.allIps.forEach { ipsArr.put(it) }
                     put("allIps", ipsArr)

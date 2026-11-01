@@ -115,12 +115,105 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { preferences ->
             val existing = ClientRule.parseList(preferences[CLIENT_RULES]).toMutableList()
             val index = existing.indexOfFirst { it.mac.equals(rule.mac, ignoreCase = true) }
+            val evaluatedIncoming = rule.withEvaluatedQuotaWindow()
             if (index >= 0) {
-                existing[index] = rule
+                val prev = existing[index].withEvaluatedQuotaWindow()
+                val merged = if (evaluatedIncoming.quotaResetGeneration > prev.quotaResetGeneration) {
+                    evaluatedIncoming
+                } else {
+                    val sameWindow = prev.quotaWindowId.isEmpty() ||
+                        evaluatedIncoming.quotaWindowId.isEmpty() ||
+                        prev.quotaWindowId == evaluatedIncoming.quotaWindowId
+                    val rx = if (sameWindow) maxOf(prev.quotaUsedRxBytes, evaluatedIncoming.quotaUsedRxBytes) else evaluatedIncoming.quotaUsedRxBytes
+                    val tx = if (sameWindow) maxOf(prev.quotaUsedTxBytes, evaluatedIncoming.quotaUsedTxBytes) else evaluatedIncoming.quotaUsedTxBytes
+                    evaluatedIncoming.copy(
+                        quotaUsedRxBytes = rx,
+                        quotaUsedTxBytes = tx,
+                        quotaWindowId = evaluatedIncoming.quotaWindowId.ifBlank { prev.quotaWindowId },
+                        quotaWindowStartEpochMs = maxOf(prev.quotaWindowStartEpochMs, evaluatedIncoming.quotaWindowStartEpochMs),
+                        quotaLastUpdatedEpochMs = maxOf(prev.quotaLastUpdatedEpochMs, evaluatedIncoming.quotaLastUpdatedEpochMs),
+                        quotaResetGeneration = maxOf(prev.quotaResetGeneration, evaluatedIncoming.quotaResetGeneration),
+                    )
+                }
+                existing[index] = merged
             } else {
-                existing.add(rule)
+                existing.add(evaluatedIncoming)
             }
             preferences[CLIENT_RULES] = ClientRule.serializeList(existing)
+        }
+    }
+
+    suspend fun resetClientQuotaUsage(mac: String): ClientRule {
+        val cleanMac = mac.uppercase().trim()
+        var resetRule = ClientRule(mac = cleanMac).withResetQuotaUsage()
+        context.dataStore.edit { preferences ->
+            val existing = ClientRule.parseList(preferences[CLIENT_RULES]).toMutableList()
+            val index = existing.indexOfFirst { it.mac.equals(cleanMac, ignoreCase = true) }
+            if (index >= 0) {
+                resetRule = existing[index].withResetQuotaUsage()
+                existing[index] = resetRule
+            } else {
+                existing.add(resetRule)
+            }
+            preferences[CLIENT_RULES] = ClientRule.serializeList(existing)
+        }
+        return resetRule
+    }
+
+    suspend fun syncClientQuotaSnapshots(hosts: List<DiscoveredHost>, force: Boolean = false) {
+        if (hosts.isEmpty()) return
+        val hostsByMac = hosts.associateBy { it.mac.uppercase().trim() }
+        context.dataStore.edit { preferences ->
+            val existing = ClientRule.parseList(preferences[CLIENT_RULES]).toMutableList()
+            if (existing.isEmpty()) return@edit
+            var changed = false
+            for (i in existing.indices) {
+                val rule = existing[i]
+                val host = hostsByMac[rule.cleanMac] ?: continue
+                if (host.quotaResetGeneration < rule.quotaResetGeneration) continue
+
+                val evaluatedRule = rule.withEvaluatedQuotaWindow()
+                val sameWindow = host.quotaWindowId.isEmpty() ||
+                    evaluatedRule.quotaWindowId.isEmpty() ||
+                    host.quotaWindowId == evaluatedRule.quotaWindowId
+                val nextRx = if (sameWindow) {
+                    maxOf(evaluatedRule.quotaUsedRxBytes, host.quotaUsedRxBytes)
+                } else {
+                    host.quotaUsedRxBytes
+                }
+                val nextTx = if (sameWindow) {
+                    maxOf(evaluatedRule.quotaUsedTxBytes, host.quotaUsedTxBytes)
+                } else {
+                    host.quotaUsedTxBytes
+                }
+                val nextWindowId = host.quotaWindowId.ifBlank { evaluatedRule.quotaWindowId }
+                val nextWindowStart = maxOf(evaluatedRule.quotaWindowStartEpochMs, host.quotaWindowStartEpochMs)
+                val nextLastUpdated = maxOf(evaluatedRule.quotaLastUpdatedEpochMs, host.quotaLastUpdatedEpochMs)
+                val nextGeneration = maxOf(evaluatedRule.quotaResetGeneration, host.quotaResetGeneration)
+
+                val byteDelta = (nextRx - rule.quotaUsedRxBytes).coerceAtLeast(0L) +
+                    (nextTx - rule.quotaUsedTxBytes).coerceAtLeast(0L)
+                val windowChanged = nextWindowId != rule.quotaWindowId && nextWindowId.isNotEmpty()
+                val wasExceeded = rule.dataLimitBytes > 0L &&
+                    (rule.quotaUsedRxBytes + rule.quotaUsedTxBytes) >= rule.dataLimitBytes
+                val nowExceeded = rule.dataLimitBytes > 0L && (nextRx + nextTx) >= rule.dataLimitBytes
+                val crossedQuota = !wasExceeded && nowExceeded
+
+                if (windowChanged || crossedQuota || (force && byteDelta > 0L) || byteDelta >= DataQuota.CHECKPOINT_BYTE_DELTA_THRESHOLD) {
+                    existing[i] = evaluatedRule.copy(
+                        quotaUsedRxBytes = nextRx,
+                        quotaUsedTxBytes = nextTx,
+                        quotaWindowId = nextWindowId,
+                        quotaWindowStartEpochMs = nextWindowStart,
+                        quotaLastUpdatedEpochMs = nextLastUpdated,
+                        quotaResetGeneration = nextGeneration,
+                    )
+                    changed = true
+                }
+            }
+            if (changed) {
+                preferences[CLIENT_RULES] = ClientRule.serializeList(existing)
+            }
         }
     }
 

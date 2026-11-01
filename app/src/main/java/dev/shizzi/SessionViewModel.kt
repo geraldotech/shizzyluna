@@ -242,9 +242,49 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             settingsStore.saveClientRule(rule)
             val updatedRules = settingsStore.settings.first().clientRules
+            TunTrafficEngine.syncQuotaRules(updatedRules)
             SessionService.updateRules(updatedRules)
             val name = rule.alias.ifBlank { "Host ${rule.mac.takeLast(5)}" }
-            SessionLog.info("Rule updated for $name (${rule.mac}): blocked=${rule.isBlocked}, limit=${rule.bandwidthLimitKbps}kbps, timeLimit=${rule.connectionTimeLimitMinutes}m")
+            SessionLog.info(
+                "Rule updated for $name (${rule.mac}): blocked=${rule.isBlocked}, " +
+                    "limit=${rule.bandwidthLimitKbps}kbps, quota=${rule.formattedDataLimit()}(${rule.quotaResetPeriod.displayName}), " +
+                    "timeLimit=${rule.connectionTimeLimitMinutes}m",
+            )
+            refreshClients()
+        }
+    }
+
+    fun resetClientQuotaUsage(mac: String) {
+        viewModelScope.launch {
+            val cleanMac = mac.uppercase().trim()
+            TunTrafficEngine.resetClientQuota(cleanMac)
+            val updatedRule = settingsStore.resetClientQuotaUsage(cleanMac)
+            val updatedRules = settingsStore.settings.first().clientRules
+            SessionService.resetClientQuota(cleanMac)
+            SessionService.updateRules(updatedRules)
+            runCatching { diagnostics.resetClientQuota(cleanMac) }
+            localState.update { current ->
+                current.copy(
+                    connectedClients = current.connectedClients.map { host ->
+                        if (host.mac.equals(cleanMac, ignoreCase = true)) {
+                            host.copy(
+                                rxBytes = 0L,
+                                txBytes = 0L,
+                                quotaUsedRxBytes = 0L,
+                                quotaUsedTxBytes = 0L,
+                                quotaWindowId = updatedRule.quotaWindowId,
+                                quotaWindowStartEpochMs = updatedRule.quotaWindowStartEpochMs,
+                                quotaLastUpdatedEpochMs = updatedRule.quotaLastUpdatedEpochMs,
+                                quotaResetGeneration = updatedRule.quotaResetGeneration,
+                                quotaDropPackets = 0L,
+                            )
+                        } else {
+                            host
+                        }
+                    },
+                )
+            }
+            SessionLog.info("Quota usage reset to 0 B for ${updatedRule.displayName} ($cleanMac)")
             refreshClients()
         }
     }

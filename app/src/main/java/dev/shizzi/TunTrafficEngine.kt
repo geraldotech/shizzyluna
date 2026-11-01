@@ -93,6 +93,7 @@ object TunTrafficEngine {
         val policyVersion: AtomicLong = AtomicLong(1L),
         val policyVersionBlockedDrops: AtomicLong = AtomicLong(0L),
         val policyVersionShapedPackets: AtomicLong = AtomicLong(0L),
+        val quotaDropPackets: AtomicLong = AtomicLong(0L),
         @Volatile var policyBaselinePostNatUnmatched: Long = 0L,
         @Volatile var lastSeenAt: Long = 0L,
         @Volatile var lastLoggedPackets: Long = -1L,
@@ -120,6 +121,14 @@ object TunTrafficEngine {
         val bpfAttributedPackets: Long = 0L,
         val conntrackAttributedPackets: Long = 0L,
         val policyVersionShapedPackets: Long = shapedPackets,
+        val quotaDropPackets: Long = 0L,
+        val quotaUsedRxBytes: Long = 0L,
+        val quotaUsedTxBytes: Long = 0L,
+        val quotaWindowId: String = "",
+        val quotaWindowStartEpochMs: Long = 0L,
+        val quotaLastUpdatedEpochMs: Long = 0L,
+        val quotaResetGeneration: Long = 0L,
+        val quotaExceeded: Boolean = false,
     )
 
     data class ConntrackPathObservation(
@@ -138,7 +147,15 @@ object TunTrafficEngine {
         val isBlocked: Boolean,
         val blockReason: String? = null,
         val bandwidthLimitKbps: Int = 0,
-    )
+        val dataLimitBytes: Long = 0L,
+        val quotaResetPeriod: QuotaResetPeriod = QuotaResetPeriod.MANUAL,
+    ) {
+        val isQuotaOnlyBlock: Boolean
+            get() = isBlocked && blockReason == "Data limit reached"
+
+        val isNonQuotaBlocked: Boolean
+            get() = isBlocked && !isQuotaOnlyBlock
+    }
 
     internal data class PacketMeta(
         val version: Int,
@@ -330,6 +347,21 @@ object TunTrafficEngine {
     private val downloadBucketsByMac = ConcurrentHashMap<String, TokenBucket>()
     private val pacingQueuesByMac = ConcurrentHashMap<String, ClientPacingQueue>()
 
+    private val quotaRecordsByMac = ConcurrentHashMap<String, ClientQuotaRecord>()
+    private val quotaLocksByMac = ConcurrentHashMap<String, Any>()
+    private val quotaLoadedFromDisk = AtomicBoolean(false)
+    private val lastQuotaCheckpointFlushMs = AtomicLong(0L)
+    private val unflushedQuotaBytes = AtomicLong(0L)
+
+    @Volatile
+    var quotaCheckpointFile: File = File(DataQuota.DEFAULT_CHECKPOINT_FILE_PATH)
+
+    @Volatile
+    var quotaClockMillisProvider: () -> Long = { System.currentTimeMillis() }
+
+    @Volatile
+    var quotaZoneIdProvider: () -> java.time.ZoneId = { java.time.ZoneId.systemDefault() }
+
     private val flowToMacCache = ConcurrentHashMap<FlowKey, String>()
     private val flowTimestamps = ConcurrentHashMap<FlowKey, Long>()
     private const val FLOW_TTL_MS = 60_000L
@@ -434,7 +466,9 @@ object TunTrafficEngine {
         } else {
             0L
         }
-        val hasRestrictivePolicy = policiesByMac.values.any { it.isBlocked || it.bandwidthLimitKbps > 0 }
+        val hasRestrictivePolicy = policiesByMac.values.any {
+            it.isBlocked || it.bandwidthLimitKbps > 0 || it.dataLimitBytes > 0L
+        }
         val hasPublishedSnapshot = snap.collectedAtMonotonicMs > 0L &&
             (snap.collectionStatus == BpfCollectionStatus.OK || snap.collectionStatus == BpfCollectionStatus.EMPTY_VALID)
         val isStale = hasPublishedSnapshot && ageMs > bpfAttributor.maxFreshnessMs
@@ -633,6 +667,7 @@ object TunTrafficEngine {
         bpfReader.stopWorker()
         stopPacingDispatcher()
         clearPacingQueues()
+        flushQuotaCheckpointNow()
         runCatching { engineEndPfd?.close() }
         runCatching { datapathEndPfd?.close() }
         engineEndPfd = null
@@ -647,6 +682,9 @@ object TunTrafficEngine {
     fun clearAll() {
         bpfReader.stopWorker()
         clearPacingQueues()
+        flushQuotaCheckpointNow()
+        activeUpstreamName = ""
+        activeDownstreamName = ""
         policiesByMac.clear()
         policiesByIp.clear()
         activeConnectedMacs.clear()
@@ -684,6 +722,7 @@ object TunTrafficEngine {
             counters.droppedPackets.set(0L)
             counters.blockedDropPackets.set(0L)
             counters.shapingDropPackets.set(0L)
+            counters.quotaDropPackets.set(0L)
             counters.droppedBytes.set(0L)
             counters.matchedPackets.set(0L)
             counters.shapedPackets.set(0L)
@@ -692,6 +731,325 @@ object TunTrafficEngine {
             counters.policyVersionBlockedDrops.set(0L)
             counters.policyVersionShapedPackets.set(0L)
             counters.policyBaselinePostNatUnmatched = postNatUnmatchedPackets.get()
+        }
+    }
+
+    private fun lockForMac(mac: String): Any =
+        quotaLocksByMac.computeIfAbsent(mac.uppercase().trim()) { Any() }
+
+    @Synchronized
+    fun ensureQuotaLoaded() {
+        if (!quotaLoadedFromDisk.compareAndSet(false, true)) return
+        val loaded = DataQuota.loadFromFile(quotaCheckpointFile)
+        val nowMs = quotaClockMillisProvider()
+        val zoneId = quotaZoneIdProvider()
+        for ((mac, record) in loaded) {
+            synchronized(lockForMac(mac)) {
+                if (!quotaRecordsByMac.containsKey(mac)) {
+                    quotaRecordsByMac[mac] = DataQuota.evaluateWindowRollover(record, nowMs, zoneId)
+                }
+            }
+        }
+    }
+
+    fun flushQuotaCheckpointNow(): Boolean {
+        ensureQuotaLoaded()
+        val records = quotaRecordsByMac.values.toList()
+        unflushedQuotaBytes.set(0L)
+        lastQuotaCheckpointFlushMs.set(quotaClockMillisProvider())
+        if (records.isEmpty() && !quotaCheckpointFile.exists()) return true
+        return DataQuota.saveToFile(quotaCheckpointFile, records)
+    }
+
+    private fun maybeFlushQuotaCheckpoint(nowMs: Long = quotaClockMillisProvider(), force: Boolean = false) {
+        if (force) {
+            flushQuotaCheckpointNow()
+            return
+        }
+        val pendingBytes = unflushedQuotaBytes.get()
+        val lastFlush = lastQuotaCheckpointFlushMs.get()
+        if (pendingBytes >= DataQuota.CHECKPOINT_BYTE_DELTA_THRESHOLD &&
+            nowMs - lastFlush >= DataQuota.CHECKPOINT_MIN_INTERVAL_MS
+        ) {
+            if (lastQuotaCheckpointFlushMs.compareAndSet(lastFlush, nowMs)) {
+                unflushedQuotaBytes.set(0L)
+                DataQuota.saveToFile(quotaCheckpointFile, quotaRecordsByMac.values.toList())
+            }
+        }
+    }
+
+    /**
+     * Synchronizes configured [ClientRule] quota settings and persisted usage with the packet engine's
+     * atomic per-MAC quota records.
+     */
+    fun syncQuotaRules(rules: List<ClientRule>) {
+        ensureQuotaLoaded()
+        val nowMs = quotaClockMillisProvider()
+        val zoneId = quotaZoneIdProvider()
+        var needsFlush = false
+
+        for (rule in rules) {
+            val mac = rule.cleanMac
+            if (mac.length != 17 || mac == "00:00:00:00:00:00") continue
+            synchronized(lockForMac(mac)) {
+                val existing = quotaRecordsByMac[mac]
+                val ruleRecord = rule.toQuotaRecord()
+                val mergedBase = when {
+                    existing == null -> ruleRecord
+                    ruleRecord.resetGeneration > existing.resetGeneration -> {
+                        needsFlush = true
+                        ruleRecord
+                    }
+                    ruleRecord.resetGeneration < existing.resetGeneration -> {
+                        existing.copy(
+                            dataLimitBytes = ruleRecord.sanitizedLimitBytes,
+                            resetPeriod = ruleRecord.resetPeriod,
+                        )
+                    }
+                    else -> {
+                        val sameWindow = existing.windowId.isEmpty() ||
+                            ruleRecord.windowId.isEmpty() ||
+                            existing.windowId == ruleRecord.windowId
+                        val mergedRx = if (sameWindow) {
+                            maxOf(existing.sanitizedRxBytes, ruleRecord.sanitizedRxBytes)
+                        } else {
+                            existing.sanitizedRxBytes
+                        }
+                        val mergedTx = if (sameWindow) {
+                            maxOf(existing.sanitizedTxBytes, ruleRecord.sanitizedTxBytes)
+                        } else {
+                            existing.sanitizedTxBytes
+                        }
+                        existing.copy(
+                            dataLimitBytes = ruleRecord.sanitizedLimitBytes,
+                            resetPeriod = ruleRecord.resetPeriod,
+                            usedRxBytes = mergedRx,
+                            usedTxBytes = mergedTx,
+                            windowId = existing.windowId.ifBlank { ruleRecord.windowId },
+                            windowStartEpochMs = maxOf(existing.windowStartEpochMs, ruleRecord.windowStartEpochMs),
+                            lastUpdatedEpochMs = maxOf(existing.lastUpdatedEpochMs, ruleRecord.lastUpdatedEpochMs),
+                        )
+                    }
+                }
+
+                val evaluated = DataQuota.evaluateWindowRollover(mergedBase, nowMs, zoneId)
+                if (existing != evaluated) {
+                    if (existing != null &&
+                        (existing.windowId != evaluated.windowId ||
+                            existing.dataLimitBytes != evaluated.dataLimitBytes ||
+                            existing.resetPeriod != evaluated.resetPeriod ||
+                            existing.resetGeneration != evaluated.resetGeneration)
+                    ) {
+                        needsFlush = true
+                    }
+                    val wasExceeded = existing?.isQuotaExceeded == true
+                    quotaRecordsByMac[mac] = evaluated
+                    if (wasExceeded && !evaluated.isQuotaExceeded) {
+                        countersByMac[mac]?.let { c ->
+                            c.quotaDropPackets.set(0L)
+                            c.policyVersion.incrementAndGet()
+                            c.policyVersionBlockedDrops.set(0L)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (needsFlush) {
+            flushQuotaCheckpointNow()
+        }
+    }
+
+    /**
+     * Evaluates and returns the current [ClientQuotaRecord] for [mac], lazily applying any
+     * Daily/Weekly/Monthly calendar rollover at [quotaClockMillisProvider].
+     */
+    fun getQuotaRecord(mac: String): ClientQuotaRecord? {
+        ensureQuotaLoaded()
+        val cleanMac = mac.uppercase().trim()
+        if (cleanMac.length != 17) return null
+        val nowMs = quotaClockMillisProvider()
+        val zoneId = quotaZoneIdProvider()
+        synchronized(lockForMac(cleanMac)) {
+            val existing = quotaRecordsByMac[cleanMac] ?: return null
+            val rolled = DataQuota.evaluateWindowRollover(existing, nowMs, zoneId)
+            if (rolled != existing) {
+                val windowAdvanced = rolled.windowId != existing.windowId && rolled.usedTotalBytes == 0L
+                quotaRecordsByMac[cleanMac] = rolled
+                if (windowAdvanced) {
+                    countersByMac[cleanMac]?.let { c ->
+                        c.quotaDropPackets.set(0L)
+                        c.policyVersion.incrementAndGet()
+                        c.policyVersionBlockedDrops.set(0L)
+                    }
+                    policiesByMac[cleanMac]?.let { pol ->
+                        if (pol.isQuotaOnlyBlock) {
+                            val unblocked = pol.copy(isBlocked = false, blockReason = null)
+                            policiesByMac[cleanMac] = unblocked
+                            for (ip in macToIps[cleanMac].orEmpty()) {
+                                policiesByIp[ip] = unblocked
+                            }
+                        }
+                    }
+                    SessionLog.info(
+                        "Quota: mac=$cleanMac calendar period rolled over (${existing.windowId} -> ${rolled.windowId}); usage reset to 0 B",
+                    )
+                    flushQuotaCheckpointNow()
+                }
+            }
+            return rolled
+        }
+    }
+
+    /**
+     * Atomically resets only the quota usage counters (`usedRxBytes = 0`, `usedTxBytes = 0`) for [mac],
+     * preserving `dataLimitBytes`, `resetPeriod`, and all non-quota rules.
+     */
+    fun resetClientQuota(mac: String): ClientQuotaRecord? {
+        ensureQuotaLoaded()
+        val cleanMac = mac.uppercase().trim()
+        if (cleanMac.length != 17) return null
+        val nowMs = quotaClockMillisProvider()
+        val zoneId = quotaZoneIdProvider()
+        val updated: ClientQuotaRecord
+        synchronized(lockForMac(cleanMac)) {
+            val existing = quotaRecordsByMac[cleanMac]
+            val pol = policiesByMac[cleanMac]
+            val period = existing?.resetPeriod ?: pol?.quotaResetPeriod ?: QuotaResetPeriod.MANUAL
+            val limitBytes = existing?.dataLimitBytes ?: pol?.dataLimitBytes ?: 0L
+            val window = DataQuota.computeWindow(period, nowMs, zoneId)
+            updated = ClientQuotaRecord(
+                mac = cleanMac,
+                dataLimitBytes = limitBytes,
+                resetPeriod = period,
+                usedRxBytes = 0L,
+                usedTxBytes = 0L,
+                windowId = window.windowId,
+                windowStartEpochMs = window.windowStartEpochMs.takeIf { it > 0L } ?: nowMs,
+                lastUpdatedEpochMs = maxOf(nowMs, existing?.lastUpdatedEpochMs ?: 0L),
+                resetGeneration = (existing?.resetGeneration ?: 0L) + 1L,
+            )
+            quotaRecordsByMac[cleanMac] = updated
+        }
+
+        countersByMac[cleanMac]?.let { counters ->
+            counters.rxBytes.set(0L)
+            counters.txBytes.set(0L)
+            counters.quotaDropPackets.set(0L)
+            counters.policyVersion.incrementAndGet()
+            counters.policyVersionBlockedDrops.set(0L)
+            if (policiesByMac[cleanMac]?.isNonQuotaBlocked != true) {
+                counters.droppedPackets.set(0L)
+                counters.blockedDropPackets.set(0L)
+                counters.droppedBytes.set(0L)
+            }
+        }
+
+        policiesByMac[cleanMac]?.let { pol ->
+            if (pol.isQuotaOnlyBlock) {
+                val unblocked = pol.copy(isBlocked = false, blockReason = null)
+                policiesByMac[cleanMac] = unblocked
+                for (ip in macToIps[cleanMac].orEmpty()) {
+                    policiesByIp[ip] = unblocked
+                }
+            }
+        }
+
+        flushQuotaCheckpointNow()
+        SessionLog.info("Quota: mac=$cleanMac usage manually reset to 0 B (generation=${updated.resetGeneration})")
+        return updated
+    }
+
+    /**
+     * Simulates process death by clearing in-memory quota records while leaving the on-disk checkpoint intact.
+     */
+    internal fun simulateProcessRestartForQuotaTest() {
+        quotaRecordsByMac.clear()
+        quotaLoadedFromDisk.set(false)
+    }
+
+    internal fun resetAllQuotaStatesForTest(deleteCheckpointFile: Boolean = true) {
+        clearAll()
+        quotaRecordsByMac.clear()
+        quotaLocksByMac.clear()
+        unflushedQuotaBytes.set(0L)
+        lastQuotaCheckpointFlushMs.set(0L)
+        if (deleteCheckpointFile) {
+            runCatching { quotaCheckpointFile.delete() }
+        }
+        quotaLoadedFromDisk.set(true)
+    }
+
+    private fun recordQuotaBytes(
+        mac: String,
+        packetBytes: Int,
+        isUpload: Boolean,
+        policy: EnforcedClientPolicy?,
+    ): ClientQuotaRecord {
+        ensureQuotaLoaded()
+        val cleanMac = mac.uppercase().trim()
+        val nowMs = quotaClockMillisProvider()
+        val zoneId = quotaZoneIdProvider()
+        var crossedLimit = false
+        val updated: ClientQuotaRecord
+
+        synchronized(lockForMac(cleanMac)) {
+            val existing = quotaRecordsByMac[cleanMac]
+            val limitBytes = policy?.dataLimitBytes?.takeIf { it > 0L }
+                ?: existing?.dataLimitBytes
+                ?: 0L
+            val period = if (policy != null && (policy.dataLimitBytes > 0L || existing == null)) {
+                policy.quotaResetPeriod
+            } else {
+                existing?.resetPeriod ?: QuotaResetPeriod.MANUAL
+            }
+            val base = existing?.copy(
+                dataLimitBytes = limitBytes,
+                resetPeriod = period,
+            ) ?: ClientQuotaRecord(
+                mac = cleanMac,
+                dataLimitBytes = limitBytes,
+                resetPeriod = period,
+            )
+            val rolled = DataQuota.evaluateWindowRollover(base, nowMs, zoneId)
+            val wasExceeded = rolled.isQuotaExceeded
+            val delta = packetBytes.coerceAtLeast(0).toLong()
+            val newRx = if (isUpload) rolled.sanitizedRxBytes else DataQuota.safeAddBytes(rolled.sanitizedRxBytes, delta)
+            val newTx = if (isUpload) DataQuota.safeAddBytes(rolled.sanitizedTxBytes, delta) else rolled.sanitizedTxBytes
+
+            updated = rolled.copy(
+                usedRxBytes = newRx,
+                usedTxBytes = newTx,
+                lastUpdatedEpochMs = maxOf(nowMs, rolled.lastUpdatedEpochMs),
+            )
+            quotaRecordsByMac[cleanMac] = updated
+            crossedLimit = !wasExceeded && updated.isQuotaExceeded
+        }
+
+        if (crossedLimit) {
+            SessionLog.info(
+                "Quota: mac=$cleanMac reached data limit (${DataQuota.formatUsageSummary(updated.usedTotalBytes, updated.sanitizedLimitBytes)}) period=${updated.resetPeriod.displayName}",
+            )
+            maybeFlushQuotaCheckpoint(nowMs, force = true)
+        } else {
+            unflushedQuotaBytes.addAndGet(packetBytes.coerceAtLeast(0).toLong())
+            maybeFlushQuotaCheckpoint(nowMs, force = false)
+        }
+        return updated
+    }
+
+    private fun refundQuotaBytes(mac: String, packetBytes: Int, isUpload: Boolean) {
+        val cleanMac = mac.uppercase().trim()
+        val delta = packetBytes.coerceAtLeast(0).toLong()
+        if (delta <= 0L) return
+        synchronized(lockForMac(cleanMac)) {
+            val existing = quotaRecordsByMac[cleanMac] ?: return
+            val newRx = if (isUpload) existing.sanitizedRxBytes else (existing.sanitizedRxBytes - delta).coerceAtLeast(0L)
+            val newTx = if (isUpload) (existing.sanitizedTxBytes - delta).coerceAtLeast(0L) else existing.sanitizedTxBytes
+            quotaRecordsByMac[cleanMac] = existing.copy(
+                usedRxBytes = newRx,
+                usedTxBytes = newTx,
+            )
         }
     }
 
@@ -749,7 +1107,10 @@ object TunTrafficEngine {
 
         // 1. Evict disconnected MACs from active mappings, pacing queues, and flow cache
         for (disconnectedMac in previousConnectedMacs - currentConnectedMacs) {
-            pacingQueuesByMac.remove(disconnectedMac)?.drainAll()
+            val drained = pacingQueuesByMac.remove(disconnectedMac)?.drainAll().orEmpty()
+            for (pkt in drained) {
+                refundQuotaBytes(disconnectedMac, pkt.length, pkt.isUpload)
+            }
         }
         activeConnectedMacs.retainAll(currentConnectedMacs)
         activeConnectedMacs.addAll(currentConnectedMacs)
@@ -836,10 +1197,32 @@ object TunTrafficEngine {
             newMacPolicies[mac] = policy
             val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
 
+            synchronized(lockForMac(mac)) {
+                val existingQuota = quotaRecordsByMac[mac]
+                if (existingQuota != null || policy.dataLimitBytes > 0L) {
+                    val base = existingQuota?.copy(
+                        dataLimitBytes = policy.dataLimitBytes.coerceAtLeast(0L),
+                        resetPeriod = policy.quotaResetPeriod,
+                    ) ?: ClientQuotaRecord(
+                        mac = mac,
+                        dataLimitBytes = policy.dataLimitBytes.coerceAtLeast(0L),
+                        resetPeriod = policy.quotaResetPeriod,
+                    )
+                    quotaRecordsByMac[mac] = DataQuota.evaluateWindowRollover(
+                        record = base,
+                        nowEpochMs = quotaClockMillisProvider(),
+                        zoneId = quotaZoneIdProvider(),
+                    )
+                }
+            }
+
             val oldPolicy = policiesByMac[mac]
             val policyChanged = oldPolicy == null ||
                 oldPolicy.isBlocked != policy.isBlocked ||
-                oldPolicy.bandwidthLimitKbps != policy.bandwidthLimitKbps
+                oldPolicy.blockReason != policy.blockReason ||
+                oldPolicy.bandwidthLimitKbps != policy.bandwidthLimitKbps ||
+                oldPolicy.dataLimitBytes != policy.dataLimitBytes ||
+                oldPolicy.quotaResetPeriod != policy.quotaResetPeriod
             if (policyChanged) {
                 counters.policyVersion.incrementAndGet()
                 counters.policyVersionBlockedDrops.set(0L)
@@ -852,6 +1235,7 @@ object TunTrafficEngine {
                 counters.droppedPackets.set(0L)
                 counters.blockedDropPackets.set(0L)
                 counters.shapingDropPackets.set(0L)
+                counters.quotaDropPackets.set(0L)
                 counters.droppedBytes.set(0L)
                 counters.matchedPackets.set(0L)
                 for ((flowKey, mappedMac) in flowToMacCache.entries.toList()) {
@@ -912,7 +1296,9 @@ object TunTrafficEngine {
         }
 
         // 5. Update degraded multi-client state
-        val hasRestricted = newMacPolicies.values.any { it.isBlocked || it.bandwidthLimitKbps > 0 }
+        val hasRestricted = newMacPolicies.values.any {
+            it.isBlocked || it.bandwidthLimitKbps > 0 || it.dataLimitBytes > 0L
+        }
         val bpfHasFreshMappings = isExperimentalBpfEnabled &&
             bpfAttributor.currentSnapshot().let { snap ->
                 (snap.collectionStatus == BpfCollectionStatus.OK || snap.collectionStatus == BpfCollectionStatus.EMPTY_VALID) &&
@@ -966,9 +1352,10 @@ object TunTrafficEngine {
         counters: ClientTrafficCounters,
     ) {
         val queue = pacingQueuesByMac[mac] ?: return
-        if (newPolicy.isBlocked) {
+        if (newPolicy.isNonQuotaBlocked) {
             val cancelled = queue.drainAll()
             for (pkt in cancelled) {
+                refundQuotaBytes(mac, pkt.length, pkt.isUpload)
                 counters.droppedPackets.incrementAndGet()
                 counters.blockedDropPackets.incrementAndGet()
                 counters.policyVersionBlockedDrops.incrementAndGet()
@@ -984,6 +1371,7 @@ object TunTrafficEngine {
     fun getCounterSnapshot(mac: String): CounterSnapshot {
         val cleanMac = mac.uppercase().trim()
         val c = countersByMac[cleanMac]
+        val quota = getQuotaRecord(cleanMac)
         val policyInstalled = isAttached && policiesByMac.containsKey(cleanMac)
         return if (c == null) {
             CounterSnapshot(
@@ -993,8 +1381,8 @@ object TunTrafficEngine {
                 forwardedPackets = 0L,
                 droppedPackets = 0L,
                 shapedPackets = 0L,
-                rxBytes = 0L,
-                txBytes = 0L,
+                rxBytes = quota?.sanitizedRxBytes ?: 0L,
+                txBytes = quota?.sanitizedTxBytes ?: 0L,
                 droppedBytes = 0L,
                 shapedBytes = 0L,
                 policyInstalled = policyInstalled,
@@ -1007,11 +1395,21 @@ object TunTrafficEngine {
                 bpfAttributedPackets = 0L,
                 conntrackAttributedPackets = 0L,
                 policyVersionShapedPackets = 0L,
+                quotaDropPackets = 0L,
+                quotaUsedRxBytes = quota?.sanitizedRxBytes ?: 0L,
+                quotaUsedTxBytes = quota?.sanitizedTxBytes ?: 0L,
+                quotaWindowId = quota?.windowId.orEmpty(),
+                quotaWindowStartEpochMs = quota?.windowStartEpochMs ?: 0L,
+                quotaLastUpdatedEpochMs = quota?.lastUpdatedEpochMs ?: 0L,
+                quotaResetGeneration = quota?.resetGeneration ?: 0L,
+                quotaExceeded = quota?.isQuotaExceeded == true,
             )
         } else {
             val unattributedSincePolicy =
                 (postNatUnmatchedPackets.get() - c.policyBaselinePostNatUnmatched) > 0L &&
                     !HostFirewall.isKernelNetfilterAvailable
+            val qRx = quota?.sanitizedRxBytes ?: c.rxBytes.get()
+            val qTx = quota?.sanitizedTxBytes ?: c.txBytes.get()
             CounterSnapshot(
                 mac = cleanMac,
                 seenPackets = c.seenPackets.get(),
@@ -1019,8 +1417,8 @@ object TunTrafficEngine {
                 forwardedPackets = c.forwardedPackets.get(),
                 droppedPackets = c.droppedPackets.get(),
                 shapedPackets = c.shapedPackets.get(),
-                rxBytes = c.rxBytes.get(),
-                txBytes = c.txBytes.get(),
+                rxBytes = maxOf(c.rxBytes.get(), qRx),
+                txBytes = maxOf(c.txBytes.get(), qTx),
                 droppedBytes = c.droppedBytes.get(),
                 shapedBytes = c.shapedBytes.get(),
                 policyInstalled = policyInstalled,
@@ -1033,6 +1431,14 @@ object TunTrafficEngine {
                 bpfAttributedPackets = c.bpfAttributedPackets.get(),
                 conntrackAttributedPackets = c.conntrackAttributedPackets.get(),
                 policyVersionShapedPackets = c.policyVersionShapedPackets.get(),
+                quotaDropPackets = c.quotaDropPackets.get(),
+                quotaUsedRxBytes = qRx,
+                quotaUsedTxBytes = qTx,
+                quotaWindowId = quota?.windowId.orEmpty(),
+                quotaWindowStartEpochMs = quota?.windowStartEpochMs ?: 0L,
+                quotaLastUpdatedEpochMs = quota?.lastUpdatedEpochMs ?: 0L,
+                quotaResetGeneration = quota?.resetGeneration ?: 0L,
+                quotaExceeded = quota?.isQuotaExceeded == true,
             )
         }
     }
@@ -1065,8 +1471,11 @@ object TunTrafficEngine {
     }
 
     private fun clearPacingQueues() {
-        for (q in pacingQueuesByMac.values) {
-            q.drainAll()
+        for ((mac, q) in pacingQueuesByMac) {
+            val drained = q.drainAll()
+            for (pkt in drained) {
+                refundQuotaBytes(mac, pkt.length, pkt.isUpload)
+            }
         }
         pacingQueuesByMac.clear()
     }
@@ -1079,7 +1488,8 @@ object TunTrafficEngine {
                 val currentPolicy = policiesByMac[mac]
                 val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
                 // Re-evaluate current policy before releasing a queued packet
-                if (currentPolicy != null && currentPolicy.isBlocked) {
+                if (currentPolicy != null && currentPolicy.isNonQuotaBlocked) {
+                    refundQuotaBytes(mac, pkt.length, pkt.isUpload)
                     counters.droppedPackets.incrementAndGet()
                     counters.blockedDropPackets.incrementAndGet()
                     counters.policyVersionBlockedDrops.incrementAndGet()
@@ -1186,7 +1596,7 @@ object TunTrafficEngine {
                             targetFd = tunFd,
                         )
                         if (!enqueued) {
-                            recordQueueOverflowDrop(attr.mac, n)
+                            recordQueueOverflowDrop(attr.mac, n, isUpload = false)
                         }
                         continue
                     }
@@ -1230,7 +1640,8 @@ object TunTrafficEngine {
         return queue.tryEnqueue(pkt)
     }
 
-    private fun recordQueueOverflowDrop(mac: String, packetLength: Int) {
+    internal fun recordQueueOverflowDrop(mac: String, packetLength: Int, isUpload: Boolean = true) {
+        refundQuotaBytes(mac, packetLength, isUpload)
         val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
         counters.droppedPackets.incrementAndGet()
         counters.shapingDropPackets.incrementAndGet()
@@ -1495,8 +1906,14 @@ object TunTrafficEngine {
         }
 
         val currentPolicyVersion = counters.policyVersion.get()
+        val quotaRecordBefore = getQuotaRecord(matchedMac)
         val policy = policiesByMac[matchedMac]
-        if (policy == null || (!policy.isBlocked && policy.bandwidthLimitKbps <= 0)) {
+        val hasConfiguredQuota = (policy?.dataLimitBytes ?: 0L) > 0L || (quotaRecordBefore?.isQuotaEnabled == true)
+        val hasActivePolicy = policy != null &&
+            (policy.isNonQuotaBlocked || policy.bandwidthLimitKbps > 0 || hasConfiguredQuota)
+
+        if (!hasActivePolicy && !hasConfiguredQuota) {
+            recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
             counters.forwardedPackets.incrementAndGet()
             if (isUpload) {
                 counters.txBytes.addAndGet(meta.length.toLong())
@@ -1508,8 +1925,8 @@ object TunTrafficEngine {
 
         counters.matchedPackets.incrementAndGet()
 
-        // 1. Hard block enforcement (evaluated freshly on every packet; never caches ALLOW)
-        if (policy.isBlocked) {
+        // 1a. Non-quota hard block enforcement (manual admin block, time limit, or schedule; evaluated freshly on every packet)
+        if (policy != null && policy.isNonQuotaBlocked) {
             counters.droppedPackets.incrementAndGet()
             counters.blockedDropPackets.incrementAndGet()
             counters.policyVersionBlockedDrops.incrementAndGet()
@@ -1525,8 +1942,26 @@ object TunTrafficEngine {
             return EvaluationDetail(PacketDecision.DROP, policyVersion = currentPolicyVersion)
         }
 
+        // 1b. Atomic per-client data quota enforcement (usedTotalBytes >= dataLimitBytes)
+        if (quotaRecordBefore != null && quotaRecordBefore.isQuotaExceeded) {
+            counters.droppedPackets.incrementAndGet()
+            counters.blockedDropPackets.incrementAndGet()
+            counters.policyVersionBlockedDrops.incrementAndGet()
+            counters.quotaDropPackets.incrementAndGet()
+            counters.droppedBytes.addAndGet(meta.length.toLong())
+            maybeLogTrafficSample(
+                meta = meta,
+                isUpload = isUpload,
+                matchedMac = matchedMac,
+                decision = PacketDecision.DROP,
+                attributionSource = attributionSource,
+            )
+            maybeLogCountersOnMilestone(counters)
+            return EvaluationDetail(PacketDecision.DROP, policyVersion = currentPolicyVersion)
+        }
+
         // 2. Non-blocking per-client calibrated Token Bucket bandwidth limiting
-        val limitKbps = policy.bandwidthLimitKbps
+        val limitKbps = policy?.bandwidthLimitKbps ?: 0
         if (limitKbps > 0) {
             val bucketMap = if (isUpload) uploadBucketsByMac else downloadBucketsByMac
             val bucket = bucketMap.getOrPut(matchedMac) { TokenBucket(limitKbps) }
@@ -1556,6 +1991,9 @@ object TunTrafficEngine {
             }
 
             if (waitMs > 0L) {
+                // Count each shaped/queued packet ONCE toward quota upon acceptance into the pacing pipeline;
+                // if later dropped by queue overflow or admin block before transmission, bytes are refunded.
+                recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
                 counters.shapedPackets.incrementAndGet()
                 counters.policyVersionShapedPackets.incrementAndGet()
                 counters.shapedBytes.addAndGet(meta.length.toLong())
@@ -1578,6 +2016,8 @@ object TunTrafficEngine {
             }
         }
 
+        // Count immediately forwarded packet ONCE toward quota and rx/tx counters
+        recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
         counters.forwardedPackets.incrementAndGet()
         if (isUpload) {
             counters.txBytes.addAndGet(meta.length.toLong())

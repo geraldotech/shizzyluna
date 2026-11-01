@@ -27,6 +27,13 @@ data class DiscoveredHost(
     val directAttributedPackets: Long = 0L,
     val bpfAttributedPackets: Long = 0L,
     val policyVersion: Long = 1L,
+    val quotaUsedRxBytes: Long = 0L,
+    val quotaUsedTxBytes: Long = 0L,
+    val quotaWindowId: String = "",
+    val quotaWindowStartEpochMs: Long = 0L,
+    val quotaLastUpdatedEpochMs: Long = 0L,
+    val quotaResetGeneration: Long = 0L,
+    val quotaDropPackets: Long = 0L,
 )
 
 data class CallbackObservation(
@@ -269,6 +276,13 @@ class DownstreamInspector(
                 directAttributedPackets = counters.directAttributedPackets,
                 bpfAttributedPackets = counters.bpfAttributedPackets,
                 policyVersion = counters.policyVersion,
+                quotaUsedRxBytes = counters.quotaUsedRxBytes,
+                quotaUsedTxBytes = counters.quotaUsedTxBytes,
+                quotaWindowId = counters.quotaWindowId,
+                quotaWindowStartEpochMs = counters.quotaWindowStartEpochMs,
+                quotaLastUpdatedEpochMs = counters.quotaLastUpdatedEpochMs,
+                quotaResetGeneration = counters.quotaResetGeneration,
+                quotaDropPackets = counters.quotaDropPackets,
             )
         }
 

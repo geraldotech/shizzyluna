@@ -391,9 +391,12 @@ object HostFirewall {
         logSummary: Boolean = false,
     ): EnforcementSummary {
         ensureKernelCapabilityChecked()
+        TunTrafficEngine.syncQuotaRules(rules)
 
-        val nowMillis = System.currentTimeMillis()
-        val currentHour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        val nowMillis = TunTrafficEngine.quotaClockMillisProvider()
+        val currentHour = Calendar.getInstance(java.util.TimeZone.getTimeZone(TunTrafficEngine.quotaZoneIdProvider())).apply {
+            timeInMillis = nowMillis
+        }.get(Calendar.HOUR_OF_DAY)
 
         val activeHostMacs = connectedHosts.map { it.mac.uppercase().trim() }.toSet()
 
@@ -428,8 +431,15 @@ object HostFirewall {
                 }
             }.distinct()
 
+            val quotaRecord = TunTrafficEngine.getQuotaRecord(upperMac)
+
             var shouldBlock = rule.isBlocked
             var blockReason: String? = if (rule.isBlocked) "manual block" else null
+
+            if (!shouldBlock && quotaRecord != null && quotaRecord.isQuotaExceeded) {
+                shouldBlock = true
+                blockReason = "Data limit reached"
+            }
 
             if (!shouldBlock && rule.scheduleEnabled) {
                 val allowed = if (rule.scheduleStartHour <= rule.scheduleEndHour) {
@@ -470,20 +480,32 @@ object HostFirewall {
                 isBlocked = shouldBlock,
                 blockReason = blockReason,
                 bandwidthLimitKbps = if (shouldBlock) 0 else rule.bandwidthLimitKbps,
+                dataLimitBytes = rule.dataLimitBytes.coerceAtLeast(0L),
+                quotaResetPeriod = rule.quotaResetPeriod,
             )
         }
 
         for ((mac, rule) in rulesByMac) {
             if (!userspacePolicies.containsKey(mac)) {
-                if (rule.isBlocked || rule.bandwidthLimitKbps > 0) {
+                val quotaRecord = TunTrafficEngine.getQuotaRecord(mac)
+                val quotaExceeded = quotaRecord?.isQuotaExceeded == true
+                val effectiveBlocked = rule.isBlocked || quotaExceeded
+                val effectiveReason = when {
+                    rule.isBlocked -> "pre-configured block"
+                    quotaExceeded -> "Data limit reached"
+                    else -> null
+                }
+                if (effectiveBlocked || rule.bandwidthLimitKbps > 0 || rule.dataLimitBytes > 0L) {
                     userspacePolicies[mac] = TunTrafficEngine.EnforcedClientPolicy(
                         mac = mac,
-                        isBlocked = rule.isBlocked,
-                        blockReason = if (rule.isBlocked) "pre-configured block" else null,
-                        bandwidthLimitKbps = if (rule.isBlocked) 0 else rule.bandwidthLimitKbps,
+                        isBlocked = effectiveBlocked,
+                        blockReason = effectiveReason,
+                        bandwidthLimitKbps = if (effectiveBlocked) 0 else rule.bandwidthLimitKbps,
+                        dataLimitBytes = rule.dataLimitBytes.coerceAtLeast(0L),
+                        quotaResetPeriod = rule.quotaResetPeriod,
                     )
                 }
-                if (rule.isBlocked) {
+                if (effectiveBlocked) {
                     targetBlockMacs.add(mac)
                 }
             }
@@ -500,7 +522,7 @@ object HostFirewall {
         for (host in connectedHosts) {
             val upperMac = host.mac.uppercase().trim()
             val policy = userspacePolicies[upperMac] ?: continue
-            val hasActiveRestriction = policy.isBlocked || policy.bandwidthLimitKbps > 0
+            val hasActiveRestriction = policy.isBlocked || policy.bandwidthLimitKbps > 0 || policy.dataLimitBytes > 0L
             val counters = TunTrafficEngine.getCounterSnapshot(upperMac)
             val enforcementState = computeClientEnforcementState(
                 isRestricted = policy.isBlocked,
@@ -525,7 +547,7 @@ object HostFirewall {
                 }
             }
 
-            val stateKey = "${policy.isBlocked}:${policy.blockReason}:${policy.bandwidthLimitKbps}:${enforcementState.name}:${counters.policyVersion}"
+            val stateKey = "${policy.isBlocked}:${policy.blockReason}:${policy.bandwidthLimitKbps}:${policy.dataLimitBytes}:${enforcementState.name}:${counters.policyVersion}"
             if (lastLoggedStateByMac[upperMac] != stateKey) {
                 lastLoggedStateByMac[upperMac] = stateKey
                 val ipLabel = host.ip.ifBlank { "pending-ip" }
@@ -549,6 +571,10 @@ object HostFirewall {
                             "state=${enforcementState.name} matchedPackets=${counters.matchedPackets} " +
                             "shapeDrops=${counters.shapingDropPackets} shapedBytes=${counters.shapedBytes}",
                     )
+                    policy.dataLimitBytes > 0L -> SessionLog.info(
+                        "TrafficControl: mac=$upperMac ($ipLabel) policy=QUOTA(${DataQuota.formatBytes(policy.dataLimitBytes)}/${policy.quotaResetPeriod.displayName}) " +
+                            "state=${enforcementState.name} used=${DataQuota.formatBytes(counters.quotaUsedRxBytes + counters.quotaUsedTxBytes)}",
+                    )
                     else -> SessionLog.info(
                         "TrafficControl: mac=$upperMac ($ipLabel) policy=UNRESTRICTED state=${enforcementState.name}",
                     )
@@ -559,7 +585,7 @@ object HostFirewall {
         lastLoggedStateByMac.keys.retainAll(activeHostMacs intersect rulesByMac.keys)
 
         val activeRulesCount = rules.count {
-            it.isBlocked || it.bandwidthLimitKbps > 0 || it.connectionTimeLimitMinutes > 0 || it.scheduleEnabled
+            it.isBlocked || it.bandwidthLimitKbps > 0 || it.connectionTimeLimitMinutes > 0 || it.scheduleEnabled || it.dataLimitBytes > 0L
         }
 
         val backend = currentBackend()

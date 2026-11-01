@@ -118,6 +118,13 @@ fun SessionUiState.applyOutcome(outcome: Result<String>): SessionUiState {
                         directAttributedPackets = obj.optLong("directAttributedPackets", 0L),
                         bpfAttributedPackets = obj.optLong("bpfAttributedPackets", 0L),
                         policyVersion = obj.optLong("policyVersion", 1L),
+                        quotaUsedRxBytes = obj.optLong("quotaUsedRxBytes", 0L),
+                        quotaUsedTxBytes = obj.optLong("quotaUsedTxBytes", 0L),
+                        quotaWindowId = obj.optString("quotaWindowId", ""),
+                        quotaWindowStartEpochMs = obj.optLong("quotaWindowStartEpochMs", 0L),
+                        quotaLastUpdatedEpochMs = obj.optLong("quotaLastUpdatedEpochMs", 0L),
+                        quotaResetGeneration = obj.optLong("quotaResetGeneration", 0L),
+                        quotaDropPackets = obj.optLong("quotaDropPackets", 0L),
                     ),
                 )
             }
@@ -366,6 +373,13 @@ class TetherClient {
         runCatching {
             val bound = service()
             bound.updateRules(rulesJson)
+        }
+    }
+
+    suspend fun resetClientQuota(mac: String) = withContext(Dispatchers.IO) {
+        runCatching {
+            val bound = service()
+            bound.resetClientQuota(mac)
         }
     }
 

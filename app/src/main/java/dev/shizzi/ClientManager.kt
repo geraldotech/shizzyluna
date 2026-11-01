@@ -1,5 +1,6 @@
 package dev.shizzi
 
+import java.time.ZoneId
 import java.util.Calendar
 import org.json.JSONArray
 import org.json.JSONObject
@@ -13,14 +14,80 @@ data class ClientRule(
     val scheduleEnabled: Boolean = false,
     val scheduleStartHour: Int = 8,
     val scheduleEndHour: Int = 22,
+    val dataLimitBytes: Long = 0L, // 0 = unlimited (canonical unit: bytes; 1 MB = 1,048,576 bytes)
+    val quotaResetPeriod: QuotaResetPeriod = QuotaResetPeriod.MANUAL,
+    val quotaUsedRxBytes: Long = 0L,
+    val quotaUsedTxBytes: Long = 0L,
+    val quotaWindowId: String = "",
+    val quotaWindowStartEpochMs: Long = 0L,
+    val quotaLastUpdatedEpochMs: Long = 0L,
+    val quotaResetGeneration: Long = 0L,
 ) {
-    val cleanMac: String get() = mac.uppercase()
+    val cleanMac: String get() = mac.uppercase().trim()
+
+    val quotaUsedTotalBytes: Long
+        get() = DataQuota.safeAddBytes(quotaUsedRxBytes.coerceAtLeast(0L), quotaUsedTxBytes.coerceAtLeast(0L))
+
+    val isQuotaExceeded: Boolean
+        get() = dataLimitBytes > 0L && quotaUsedTotalBytes >= dataLimitBytes
 
     val displayName: String
         get() = alias.ifBlank {
             val suffix = cleanMac.takeLast(5).replace(":", "")
             "Host-$suffix"
         }
+
+    fun toQuotaRecord(): ClientQuotaRecord = ClientQuotaRecord(
+        mac = cleanMac,
+        dataLimitBytes = dataLimitBytes.coerceAtLeast(0L),
+        resetPeriod = quotaResetPeriod,
+        usedRxBytes = quotaUsedRxBytes.coerceAtLeast(0L),
+        usedTxBytes = quotaUsedTxBytes.coerceAtLeast(0L),
+        windowId = quotaWindowId,
+        windowStartEpochMs = quotaWindowStartEpochMs.coerceAtLeast(0L),
+        lastUpdatedEpochMs = quotaLastUpdatedEpochMs.coerceAtLeast(0L),
+        resetGeneration = quotaResetGeneration.coerceAtLeast(0L),
+    )
+
+    fun evaluateQuotaRecord(
+        nowEpochMs: Long = System.currentTimeMillis(),
+        zoneId: ZoneId = ZoneId.systemDefault(),
+    ): ClientQuotaRecord = DataQuota.evaluateWindowRollover(
+        record = toQuotaRecord(),
+        nowEpochMs = nowEpochMs,
+        zoneId = zoneId,
+    )
+
+    fun withEvaluatedQuotaWindow(
+        nowEpochMs: Long = System.currentTimeMillis(),
+        zoneId: ZoneId = ZoneId.systemDefault(),
+    ): ClientRule {
+        val evaluated = evaluateQuotaRecord(nowEpochMs, zoneId)
+        return copy(
+            dataLimitBytes = evaluated.sanitizedLimitBytes,
+            quotaUsedRxBytes = evaluated.sanitizedRxBytes,
+            quotaUsedTxBytes = evaluated.sanitizedTxBytes,
+            quotaWindowId = evaluated.windowId,
+            quotaWindowStartEpochMs = evaluated.windowStartEpochMs,
+            quotaLastUpdatedEpochMs = evaluated.lastUpdatedEpochMs,
+            quotaResetGeneration = evaluated.resetGeneration,
+        )
+    }
+
+    fun withResetQuotaUsage(
+        nowEpochMs: Long = System.currentTimeMillis(),
+        zoneId: ZoneId = ZoneId.systemDefault(),
+    ): ClientRule {
+        val window = DataQuota.computeWindow(quotaResetPeriod, nowEpochMs, zoneId)
+        return copy(
+            quotaUsedRxBytes = 0L,
+            quotaUsedTxBytes = 0L,
+            quotaWindowId = window.windowId,
+            quotaWindowStartEpochMs = window.windowStartEpochMs.takeIf { it > 0L } ?: nowEpochMs,
+            quotaLastUpdatedEpochMs = nowEpochMs,
+            quotaResetGeneration = quotaResetGeneration.coerceAtLeast(0L) + 1L,
+        )
+    }
 
     fun formattedBandwidthLimit(): String = when {
         bandwidthLimitKbps <= 0 -> "Unlimited"
@@ -29,27 +96,48 @@ data class ClientRule(
         else -> "$bandwidthLimitKbps Kbps"
     }
 
+    fun formattedDataLimit(): String =
+        if (dataLimitBytes <= 0L) "Unlimited" else DataQuota.formatBytes(dataLimitBytes)
+
     fun toJson(): JSONObject = JSONObject().apply {
-        put("mac", mac.uppercase())
+        put("mac", cleanMac)
         put("alias", alias)
         put("isBlocked", isBlocked)
-        put("bandwidthLimitKbps", bandwidthLimitKbps)
-        put("connectionTimeLimitMinutes", connectionTimeLimitMinutes)
+        put("bandwidthLimitKbps", bandwidthLimitKbps.coerceAtLeast(0))
+        put("connectionTimeLimitMinutes", connectionTimeLimitMinutes.coerceAtLeast(0))
         put("scheduleEnabled", scheduleEnabled)
-        put("scheduleStartHour", scheduleStartHour)
-        put("scheduleEndHour", scheduleEndHour)
+        put("scheduleStartHour", scheduleStartHour.coerceIn(0, 23))
+        put("scheduleEndHour", scheduleEndHour.coerceIn(0, 23))
+        put("dataLimitBytes", dataLimitBytes.coerceAtLeast(0L))
+        put("quotaResetPeriod", quotaResetPeriod.name)
+        put("quotaUsedRxBytes", quotaUsedRxBytes.coerceAtLeast(0L))
+        put("quotaUsedTxBytes", quotaUsedTxBytes.coerceAtLeast(0L))
+        put("quotaWindowId", quotaWindowId)
+        put("quotaWindowStartEpochMs", quotaWindowStartEpochMs.coerceAtLeast(0L))
+        put("quotaLastUpdatedEpochMs", quotaLastUpdatedEpochMs.coerceAtLeast(0L))
+        put("quotaResetGeneration", quotaResetGeneration.coerceAtLeast(0L))
     }
 
     companion object {
         fun fromJson(json: JSONObject): ClientRule = ClientRule(
-            mac = json.optString("mac").uppercase(),
+            mac = json.optString("mac").uppercase().trim(),
             alias = json.optString("alias"),
             isBlocked = json.optBoolean("isBlocked", false),
-            bandwidthLimitKbps = json.optInt("bandwidthLimitKbps", 0),
-            connectionTimeLimitMinutes = json.optInt("connectionTimeLimitMinutes", 0),
+            bandwidthLimitKbps = json.optInt("bandwidthLimitKbps", 0).coerceAtLeast(0),
+            connectionTimeLimitMinutes = json.optInt("connectionTimeLimitMinutes", 0).coerceAtLeast(0),
             scheduleEnabled = json.optBoolean("scheduleEnabled", false),
-            scheduleStartHour = json.optInt("scheduleStartHour", 8),
-            scheduleEndHour = json.optInt("scheduleEndHour", 22),
+            scheduleStartHour = json.optInt("scheduleStartHour", 8).coerceIn(0, 23),
+            scheduleEndHour = json.optInt("scheduleEndHour", 22).coerceIn(0, 23),
+            dataLimitBytes = json.optLong("dataLimitBytes", 0L).coerceAtLeast(0L),
+            quotaResetPeriod = QuotaResetPeriod.fromName(
+                if (json.has("quotaResetPeriod")) json.optString("quotaResetPeriod") else null,
+            ),
+            quotaUsedRxBytes = json.optLong("quotaUsedRxBytes", 0L).coerceAtLeast(0L),
+            quotaUsedTxBytes = json.optLong("quotaUsedTxBytes", 0L).coerceAtLeast(0L),
+            quotaWindowId = json.optString("quotaWindowId", ""),
+            quotaWindowStartEpochMs = json.optLong("quotaWindowStartEpochMs", 0L).coerceAtLeast(0L),
+            quotaLastUpdatedEpochMs = json.optLong("quotaLastUpdatedEpochMs", 0L).coerceAtLeast(0L),
+            quotaResetGeneration = json.optLong("quotaResetGeneration", 0L).coerceAtLeast(0L),
         )
 
         fun serializeList(rules: List<ClientRule>): String {
@@ -86,6 +174,15 @@ data class ConnectedClient(
     val scheduleEnabled: Boolean = false,
     val scheduleStartHour: Int = 8,
     val scheduleEndHour: Int = 22,
+    val dataLimitBytes: Long = 0L, // 0 = unlimited
+    val quotaResetPeriod: QuotaResetPeriod = QuotaResetPeriod.MANUAL,
+    val quotaUsedRxBytes: Long = 0L,
+    val quotaUsedTxBytes: Long = 0L,
+    val quotaWindowId: String = "",
+    val quotaWindowStartEpochMs: Long = 0L,
+    val quotaLastUpdatedEpochMs: Long = 0L,
+    val quotaResetGeneration: Long = 0L,
+    val quotaDropPackets: Long = 0L,
     val rxBytes: Long = 0,
     val txBytes: Long = 0,
     val seenPackets: Long = 0,
@@ -105,7 +202,7 @@ data class ConnectedClient(
     val firewallBackend: FirewallBackend = FirewallBackend.NONE,
     val kernelNetfilterAvailable: Boolean = false,
 ) {
-    val cleanMac: String get() = mac.uppercase()
+    val cleanMac: String get() = mac.uppercase().trim()
 
     val displayName: String
         get() = alias.ifBlank {
@@ -113,18 +210,53 @@ data class ConnectedClient(
             "Host-$suffix"
         }
 
-    fun isRestricted(): Pair<Boolean, String?> {
+    fun effectiveQuotaRecord(
+        nowEpochMs: Long = System.currentTimeMillis(),
+        zoneId: ZoneId = ZoneId.systemDefault(),
+    ): ClientQuotaRecord = DataQuota.evaluateWindowRollover(
+        record = ClientQuotaRecord(
+            mac = cleanMac,
+            dataLimitBytes = dataLimitBytes.coerceAtLeast(0L),
+            resetPeriod = quotaResetPeriod,
+            usedRxBytes = quotaUsedRxBytes.coerceAtLeast(0L),
+            usedTxBytes = quotaUsedTxBytes.coerceAtLeast(0L),
+            windowId = quotaWindowId,
+            windowStartEpochMs = quotaWindowStartEpochMs.coerceAtLeast(0L),
+            lastUpdatedEpochMs = quotaLastUpdatedEpochMs.coerceAtLeast(0L),
+            resetGeneration = quotaResetGeneration.coerceAtLeast(0L),
+        ),
+        nowEpochMs = nowEpochMs,
+        zoneId = zoneId,
+    )
+
+    val quotaUsedTotalBytes: Long
+        get() = effectiveQuotaRecord().usedTotalBytes
+
+    val isQuotaExceeded: Boolean
+        get() = effectiveQuotaRecord().isQuotaExceeded
+
+    fun isRestricted(
+        nowEpochMs: Long = System.currentTimeMillis(),
+        zoneId: ZoneId = ZoneId.systemDefault(),
+    ): Pair<Boolean, String?> {
         if (isBlocked) {
-            return true to "Blocked by administrator"
+            return true to "Blocked by admin"
+        }
+        val quota = effectiveQuotaRecord(nowEpochMs, zoneId)
+        if (quota.isQuotaExceeded) {
+            return true to "Data limit reached"
         }
         if (connectionTimeLimitMinutes > 0) {
-            val elapsedMinutes = (System.currentTimeMillis() - firstSeenAt) / 60_000
+            val elapsedMinutes = (nowEpochMs - firstSeenAt) / 60_000
             if (elapsedMinutes >= connectionTimeLimitMinutes) {
                 return true to "Time limit reached ($connectionTimeLimitMinutes min)"
             }
         }
         if (scheduleEnabled) {
-            val currentHour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+            val cal = Calendar.getInstance( java.util.TimeZone.getTimeZone(zoneId)).apply {
+                timeInMillis = nowEpochMs
+            }
+            val currentHour = cal.get(Calendar.HOUR_OF_DAY)
             val allowed = if (scheduleStartHour <= scheduleEndHour) {
                 currentHour in scheduleStartHour until scheduleEndHour
             } else {
@@ -168,6 +300,12 @@ data class ConnectedClient(
                 unattributedPostNatObserved = unattributedPostNatObserved,
                 directAttributedPackets = directAttributedPackets,
                 bpfAttributedPackets = bpfAttributedPackets,
+                quotaDropPackets = quotaDropPackets,
+                quotaUsedRxBytes = quotaUsedRxBytes,
+                quotaUsedTxBytes = quotaUsedTxBytes,
+                quotaWindowId = quotaWindowId,
+                quotaWindowStartEpochMs = quotaWindowStartEpochMs,
+                quotaLastUpdatedEpochMs = quotaLastUpdatedEpochMs,
             )
             return HostFirewall.computeClientEnforcementState(
                 isRestricted = restricted,
@@ -182,20 +320,21 @@ data class ConnectedClient(
     fun formattedBlockStatusLabel(): String {
         val (restricted, reason) = isRestricted()
         if (!restricted) return "Connected (${formattedUptime()})"
+        val reasonPrefix = reason ?: "Blocked"
         return when (enforcementState) {
             EnforcementState.PACKETS_DROPPED ->
-                "Blocked (verified • $effectivePolicyVersionDrops pkts dropped in policy v$policyVersion)"
+                "$reasonPrefix (verified • $effectivePolicyVersionDrops pkts dropped in policy v$policyVersion)"
             EnforcementState.PARTIAL_BPF_ENFORCEMENT ->
-                "Block requested • Partial enforcement ($effectivePolicyVersionDrops BPF-mapped pkts dropped; initial/unknown flows possible)"
+                "$reasonPrefix • Partial enforcement ($effectivePolicyVersionDrops BPF-mapped pkts dropped; initial/unknown flows possible)"
             EnforcementState.PACKETS_MATCHED,
             EnforcementState.POLICY_INSTALLED,
-            -> "Block requested (${reason ?: "Blocked"} • awaiting mapped traffic)"
+            -> "$reasonPrefix (policy active • awaiting mapped traffic)"
             EnforcementState.DEGRADED_MULTI_CLIENT ->
-                "Block requested — degraded (post-NAT traffic unattributed; enable Experimental BPF or run Diagnostic)"
+                "$reasonPrefix — degraded (post-NAT traffic unattributed; enable Experimental BPF or run Diagnostic)"
             EnforcementState.ENFORCEMENT_UNAVAILABLE ->
-                "Block requested — not enforced (direct-TUN fallback)"
+                "$reasonPrefix — not enforced (direct-TUN fallback)"
             else ->
-                "Block requested — syncing policy"
+                "$reasonPrefix — syncing policy"
         }
     }
 
@@ -218,6 +357,33 @@ data class ConnectedClient(
                 "Cap: $cap — not enforced"
             else -> "Cap: $cap (configured)"
         }
+    }
+
+    fun formattedQuotaBadgeLabel(isCurrentlyConnected: Boolean): String {
+        val quota = effectiveQuotaRecord()
+        if (!quota.isQuotaEnabled) return "Data: Unlimited"
+        val usageRatio = DataQuota.formatUsageSummary(quota.usedTotalBytes, quota.sanitizedLimitBytes)
+        val pct = "${quota.usagePercent}%"
+        val remaining = "${DataQuota.formatBytes(quota.remainingBytes)} left"
+        val statusSuffix = when {
+            !isCurrentlyConnected -> if (quota.isQuotaExceeded) "Data limit reached • saved" else "$remaining • saved"
+            quota.isQuotaExceeded -> when (enforcementState) {
+                EnforcementState.PACKETS_DROPPED,
+                EnforcementState.PARTIAL_BPF_ENFORCEMENT,
+                -> "Data limit reached • enforced"
+                EnforcementState.DEGRADED_MULTI_CLIENT,
+                EnforcementState.ENFORCEMENT_UNAVAILABLE,
+                -> "Data limit reached — Usage may be incomplete"
+                else -> "Data limit reached • policy active"
+            }
+            enforcementState == EnforcementState.DEGRADED_MULTI_CLIENT ||
+                enforcementState == EnforcementState.ENFORCEMENT_UNAVAILABLE ||
+                datapathMode != DatapathMode.USERSPACE_PROXY ->
+                "$remaining • configured (Usage may be incomplete)"
+            policyInstalled -> "$remaining • enforced (${quota.resetPeriod.displayName})"
+            else -> "$remaining • configured (${quota.resetPeriod.displayName})"
+        }
+        return "Quota: $usageRatio ($pct • $statusSuffix)"
     }
 
     fun formattedBandwidthLimit(): String = when {
@@ -273,8 +439,26 @@ object ClientDiscovery {
             if (mac.length != 17 || mac == "00:00:00:00:00:00" || mac == "FF:FF:FF:FF:FF:FF") continue
             if (!seenMacs.add(mac)) continue
 
-            val rule = rulesByMac[mac]
+            val rawRule = rulesByMac[mac]
+            val rule = rawRule?.withEvaluatedQuotaWindow(now)
             val firstSeen = seenTimes.getOrPut(mac) { now }
+
+            val ruleWindowId = rule?.quotaWindowId.orEmpty()
+            val hostWindowId = host.quotaWindowId
+            val sameWindow = hostWindowId.isEmpty() || ruleWindowId.isEmpty() || hostWindowId == ruleWindowId
+            val mergedQuotaRx = if (sameWindow) {
+                maxOf(rule?.quotaUsedRxBytes ?: 0L, host.quotaUsedRxBytes)
+            } else {
+                host.quotaUsedRxBytes
+            }
+            val mergedQuotaTx = if (sameWindow) {
+                maxOf(rule?.quotaUsedTxBytes ?: 0L, host.quotaUsedTxBytes)
+            } else {
+                host.quotaUsedTxBytes
+            }
+            val effectiveWindowId = hostWindowId.ifBlank { ruleWindowId }
+            val effectiveWindowStart = maxOf(rule?.quotaWindowStartEpochMs ?: 0L, host.quotaWindowStartEpochMs)
+            val effectiveLastUpdated = maxOf(rule?.quotaLastUpdatedEpochMs ?: 0L, host.quotaLastUpdatedEpochMs)
 
             foundClients.add(
                 ConnectedClient(
@@ -291,8 +475,17 @@ object ClientDiscovery {
                     scheduleEnabled = rule?.scheduleEnabled ?: false,
                     scheduleStartHour = rule?.scheduleStartHour ?: 8,
                     scheduleEndHour = rule?.scheduleEndHour ?: 22,
-                    rxBytes = host.rxBytes,
-                    txBytes = host.txBytes,
+                    dataLimitBytes = rule?.dataLimitBytes ?: 0L,
+                    quotaResetPeriod = rule?.quotaResetPeriod ?: QuotaResetPeriod.MANUAL,
+                    quotaUsedRxBytes = mergedQuotaRx,
+                    quotaUsedTxBytes = mergedQuotaTx,
+                    quotaWindowId = effectiveWindowId,
+                    quotaWindowStartEpochMs = effectiveWindowStart,
+                    quotaLastUpdatedEpochMs = effectiveLastUpdated,
+                    quotaResetGeneration = rule?.quotaResetGeneration ?: 0L,
+                    quotaDropPackets = host.quotaDropPackets,
+                    rxBytes = maxOf(host.rxBytes, mergedQuotaRx),
+                    txBytes = maxOf(host.txBytes, mergedQuotaTx),
                     seenPackets = host.seenPackets,
                     matchedPackets = host.matchedPackets,
                     droppedPackets = host.droppedPackets,

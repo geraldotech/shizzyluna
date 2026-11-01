@@ -16,7 +16,9 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextReplacement
 import dev.shizzi.ClientRule
 import dev.shizzi.ConnectedClient
+import dev.shizzi.DataQuota
 import dev.shizzi.DnsSettings
+import dev.shizzi.QuotaResetPeriod
 import dev.shizzi.SessionUiState
 import dev.shizzi.ShizukuState
 import dev.shizzi.VpnMode
@@ -408,5 +410,190 @@ class ClientsPageComposeTest {
         composeTestRule.onNodeWithText("Diagnóstico do firewall & BPF NAT")
             .performScrollTo()
             .assertIsDisplayed()
+    }
+
+    @Test
+    fun `11 v0_10_2 SettingsPage consolidates About into single row opening AboutDialog with version and GeraldoDev`() {
+        val baseContext = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val appInstance = dev.shizzi.App()
+        android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+            .apply {
+                isAccessible = true
+                invoke(appInstance, baseContext)
+            }
+        dev.shizzi.App::class.java.getDeclaredField("instance").apply {
+            isAccessible = true
+            set(null, appInstance)
+        }
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                SettingsPage(
+                    state = SettingsState(
+                        shizuku = ShizukuState.Ready(uid = 2000, isRoot = false),
+                        permissions = emptyList(),
+                        theme = ThemeChoice.DARK,
+                        design = DesignLanguage.MATERIAL_EXPRESSIVE,
+                        accent = AccentChoice.Default,
+                        customAccents = emptyList(),
+                        isLogging = true,
+                        vpnMode = VpnMode.AUTO,
+                        isRunningDiagnostics = false,
+                        automation = AutomationState(isEnabled = false, token = ""),
+                        dnsSettings = DnsSettings(),
+                        experimentalBpfEnabled = true,
+                    ),
+                    actions = SettingsActions(
+                        onSetTheme = {},
+                        onSetDesign = {},
+                        onSetAccent = {},
+                        onAddCustomAccent = {},
+                        onSetLogging = {},
+                        onSetVpnMode = {},
+                        onSetDnsPreset = {},
+                        onSetCustomDns = { _, _ -> },
+                        onOpenClients = {},
+                        onOpenLog = {},
+                        onOpenFirewallDiagnostic = {},
+                        onSetExperimentalBpfEnabled = {},
+                        onRunProbes = {},
+                        onGrantPermission = {},
+                        onShizukuAction = {},
+                        onRestartOnboarding = {},
+                        automation = AutomationActions(
+                            onSetEnabled = {},
+                            onRegenerateToken = {},
+                        ),
+                    ),
+                    toasts = rememberToastState(),
+                    onBack = {},
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Legacy 3-row About entries ("Report a bug") are removed
+        composeTestRule.onAllNodesWithText("Report a bug").assertCountEquals(0)
+
+        // Single About action row is displayed
+        composeTestRule.onNodeWithTag("about_settings_action")
+            .performScrollTo()
+            .assertIsDisplayed()
+            .performClick()
+        composeTestRule.waitForIdle()
+
+        // About modal displays shizzy lua, Version 0.10.2, Author: GeraldoDev, GitHub button, and Close button
+        composeTestRule.onNodeWithTag("about_modal_title")
+            .assertIsDisplayed()
+            .assertTextContains("shizzy lua")
+        composeTestRule.onNodeWithTag("about_modal_version")
+            .assertIsDisplayed()
+            .assertTextContains("Version 0.10.2")
+        composeTestRule.onNodeWithTag("about_modal_author")
+            .assertIsDisplayed()
+            .assertTextContains("Author: GeraldoDev")
+        composeTestRule.onNodeWithTag("about_modal_github_button")
+            .assertIsDisplayed()
+
+        // Close button dismisses modal
+        composeTestRule.onNodeWithTag("about_modal_close_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onAllNodesWithTag("about_modal_title").assertCountEquals(0)
+    }
+
+    @Test
+    fun `12 v0_10_2 ConfigureClientDialog validates Data Usage Limit MB selects period resets usage and saves quota fields`() {
+        var savedRule: ClientRule? = null
+        var resetCallbackCount = 0
+        val initialClient = ConnectedClient(
+            mac = "E2:15:CD:54:E4:9B",
+            ip = "192.168.50.145",
+            alias = "Galaxy Client",
+            isBlocked = false,
+            bandwidthLimitKbps = 2000,
+            connectionTimeLimitMinutes = 30,
+            scheduleEnabled = true,
+            scheduleStartHour = 8,
+            scheduleEndHour = 22,
+            dataLimitBytes = 500L * DataQuota.BYTES_PER_MB,
+            quotaResetPeriod = QuotaResetPeriod.MANUAL,
+            quotaUsedRxBytes = 120L * DataQuota.BYTES_PER_MB,
+            quotaUsedTxBytes = 80L * DataQuota.BYTES_PER_MB,
+            quotaResetGeneration = 1L,
+        )
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                ConfigureClientDialog(
+                    client = initialClient,
+                    onDismiss = {},
+                    onSave = { savedRule = it },
+                    onResetQuotaUsage = { resetCallbackCount++ },
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Verify initial 500 MB and 200 MB / 500 MB (40%) usage summary
+        composeTestRule.onNodeWithTag("data_limit_mb_input", useUnmergedTree = true)
+            .assertTextContains("500")
+        composeTestRule.onNodeWithTag("quota_usage_summary_text")
+            .performScrollTo()
+            .assertTextContains("200 MB / 500 MB (40%)", substring = true)
+
+        // Invalid data limit input disables Save Rules
+        composeTestRule.onNodeWithTag("data_limit_mb_input")
+            .performScrollTo()
+            .performTextReplacement("-50")
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("data_limit_error_text", useUnmergedTree = true).assertIsDisplayed()
+        composeTestRule.onNodeWithTag("save_client_rules_button").assertIsNotEnabled()
+
+        // Valid 2048 MB (2 GB) input re-enables Save Rules and shows 2 GB in helper text
+        composeTestRule.onNodeWithTag("data_limit_mb_input")
+            .performTextReplacement("2048")
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("data_limit_helper_text", useUnmergedTree = true)
+            .assertTextContains("Selected: 2 GB", substring = true)
+        composeTestRule.onNodeWithTag("save_client_rules_button").assertIsEnabled()
+
+        // Select Daily reset period
+        composeTestRule.onNodeWithTag("quota_period_daily")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+
+        // Click Reset Usage -> opens confirmation dialog -> confirm resets usage to 0 B without altering speed/schedule/quota limit
+        composeTestRule.onNodeWithTag("reset_quota_usage_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("confirm_reset_quota_button")
+            .assertIsDisplayed()
+            .performClick()
+        composeTestRule.waitForIdle()
+
+        assertEquals(1, resetCallbackCount)
+        composeTestRule.onNodeWithTag("quota_usage_summary_text")
+            .performScrollTo()
+            .assertTextContains("0 B / 2 GB (0%)", substring = true)
+
+        // Save Rules -> verify all fields preserved + new 2048 MB limit, DAILY period, 0 B usage, incremented resetGeneration
+        composeTestRule.onNodeWithTag("save_client_rules_button").performClick()
+        composeTestRule.waitForIdle()
+
+        assertNotNull(savedRule)
+        assertEquals("E2:15:CD:54:E4:9B", savedRule!!.cleanMac)
+        assertEquals(2000, savedRule!!.bandwidthLimitKbps)
+        assertEquals(30, savedRule!!.connectionTimeLimitMinutes)
+        assertTrue(savedRule!!.scheduleEnabled)
+        assertEquals(8, savedRule!!.scheduleStartHour)
+        assertEquals(22, savedRule!!.scheduleEndHour)
+        assertEquals(2048L * DataQuota.BYTES_PER_MB, savedRule!!.dataLimitBytes)
+        assertEquals(QuotaResetPeriod.DAILY, savedRule!!.quotaResetPeriod)
+        assertEquals(0L, savedRule!!.quotaUsedRxBytes)
+        assertEquals(0L, savedRule!!.quotaUsedTxBytes)
+        assertEquals(2L, savedRule!!.quotaResetGeneration)
     }
 }

@@ -13,13 +13,13 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "dev.shizzi"
+    applicationId = "dev.shizzyluna.proxy"
     minSdk = 24
     targetSdk = 36
-    versionCode = 16
-    versionName = "0.4.0-rs-lua.10.1"
-    buildConfigField("int", "SERVICE_BUILD_ID", "16")
-    buildConfigField("String", "SOURCE_COMMIT", "\"ab2e16dcef1590fe09358fc462cf3a3561439602+lua.10.1\"")
+    versionCode = 17
+    versionName = "0.10.2"
+    buildConfigField("int", "SERVICE_BUILD_ID", "17")
+    buildConfigField("String", "SOURCE_COMMIT", "\"ab2e16dcef1590fe09358fc462cf3a3561439602+v0.10.2\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     ndk {

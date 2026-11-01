@@ -125,6 +125,7 @@ class MainActivity : ComponentActivity() {
                             onSetExperimentalBpfEnabled = viewModel::setExperimentalBpfEnabled,
                             onSetBpfPollIntervalMs = viewModel::setBpfPollIntervalMs,
                             onCollectBpfSnapshotNow = viewModel::collectBpfSnapshotNow,
+                            onResetClientQuotaUsage = viewModel::resetClientQuotaUsage,
                         ),
                     )
                 }

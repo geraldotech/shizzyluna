@@ -74,7 +74,7 @@ private fun ColumnScope.SetupContent(token: String, toasts: ToastState) {
 }
 
 private fun connectionFields(token: String) = listOf(
-    SetupField("Package", "dev.shizzi"),
+    SetupField("Package", dev.shizzi.BuildConfig.APPLICATION_ID),
     SetupField("Class", "dev.shizzi.AutomationReceiver"),
     SetupField("Target", "Broadcast receiver"),
     SetupField("Extra name", Automation.EXTRA_TOKEN),

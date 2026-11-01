@@ -28,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.DataUsage
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Edit
@@ -59,6 +60,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -75,8 +77,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.shizzi.ClientRule
 import dev.shizzi.ConnectedClient
+import dev.shizzi.DataQuota
 import dev.shizzi.DatapathMode
 import dev.shizzi.EnforcementState
+import dev.shizzi.QuotaResetPeriod
 import dev.shizzi.SessionUiState
 import dev.shizzi.Traffic
 import dev.shizzi.UiStatus
@@ -228,6 +232,7 @@ data class ClientActions(
     val onOpenFirewallDiagnostic: () -> Unit = {},
     val onSetExperimentalBpfEnabled: (Boolean) -> Unit = {},
     val onCollectBpfSnapshotNow: () -> Unit = {},
+    val onResetClientQuotaUsage: (mac: String) -> Unit = {},
 )
 
 @Composable
@@ -302,6 +307,7 @@ fun ClientsPage(
             ) {
                 val blockedCount = clients.count { it.isRestricted().first }
                 val limitedCount = clients.count { it.bandwidthLimitKbps > 0 }
+                val quotaLimitedCount = clients.count { it.dataLimitBytes > 0L }
 
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
@@ -311,13 +317,14 @@ fun ClientsPage(
                         color = ShizziTheme.colors.onSurface,
                         modifier = Modifier.testTag("connected_devices_count_text"),
                     )
+                    val quotaSuffix = if (quotaLimitedCount > 0) " • $quotaLimitedCount data capped" else ""
                     val offlineSuffix = if (offlineRules.isNotEmpty()) {
                         " • ${offlineRules.size} saved offline"
                     } else {
                         ""
                     }
                     Text(
-                        text = "$blockedCount blocked • $limitedCount bandwidth limited$offlineSuffix",
+                        text = "$blockedCount blocked • $limitedCount bandwidth limited$quotaSuffix$offlineSuffix",
                         style = ShizziTheme.typography.caption,
                         color = ShizziTheme.colors.onSurfaceMuted,
                     )
@@ -534,17 +541,28 @@ fun ClientsPage(
                     }
 
                     items(filteredOfflineRules, key = { "offline_${it.cleanMac}" }) { rule ->
+                        val evalRule = rule.withEvaluatedQuotaWindow()
                         val offlineClientView = ConnectedClient(
-                            mac = rule.cleanMac,
+                            mac = evalRule.cleanMac,
                             ip = "Offline",
-                            alias = rule.alias,
+                            alias = evalRule.alias,
                             interfaceName = "saved rule",
-                            isBlocked = rule.isBlocked,
-                            bandwidthLimitKbps = rule.bandwidthLimitKbps,
-                            connectionTimeLimitMinutes = rule.connectionTimeLimitMinutes,
-                            scheduleEnabled = rule.scheduleEnabled,
-                            scheduleStartHour = rule.scheduleStartHour,
-                            scheduleEndHour = rule.scheduleEndHour,
+                            rxBytes = evalRule.quotaUsedRxBytes,
+                            txBytes = evalRule.quotaUsedTxBytes,
+                            isBlocked = evalRule.isBlocked,
+                            bandwidthLimitKbps = evalRule.bandwidthLimitKbps,
+                            connectionTimeLimitMinutes = evalRule.connectionTimeLimitMinutes,
+                            scheduleEnabled = evalRule.scheduleEnabled,
+                            scheduleStartHour = evalRule.scheduleStartHour,
+                            scheduleEndHour = evalRule.scheduleEndHour,
+                            dataLimitBytes = evalRule.dataLimitBytes,
+                            quotaResetPeriod = evalRule.quotaResetPeriod,
+                            quotaUsedRxBytes = evalRule.quotaUsedRxBytes,
+                            quotaUsedTxBytes = evalRule.quotaUsedTxBytes,
+                            quotaWindowId = evalRule.quotaWindowId,
+                            quotaWindowStartEpochMs = evalRule.quotaWindowStartEpochMs,
+                            quotaLastUpdatedEpochMs = evalRule.quotaLastUpdatedEpochMs,
+                            quotaResetGeneration = evalRule.quotaResetGeneration,
                         )
                         ClientCard(
                             client = offlineClientView,
@@ -571,6 +589,9 @@ fun ClientsPage(
             onSave = { rule ->
                 actions.onSaveRule(rule)
                 selectedClientForEdit = null
+            },
+            onResetQuotaUsage = {
+                actions.onResetClientQuotaUsage(client.cleanMac)
             },
         )
     }
@@ -731,6 +752,19 @@ private fun ClientCard(
                     )
                 }
 
+                // Data Usage Limit (Quota) badge
+                val quotaColor = when {
+                    client.isQuotaExceeded -> Color(0xFFFF5252)
+                    isCurrentlyConnected && (state == EnforcementState.ENFORCEMENT_UNAVAILABLE || state == EnforcementState.DEGRADED_MULTI_CLIENT) && client.dataLimitBytes > 0L -> Color(0xFFFFA000)
+                    client.dataLimitBytes > 0L -> Color(0xFF00BFA5)
+                    else -> ShizziTheme.colors.onSurfaceMuted
+                }
+                BadgeChip(
+                    label = client.formattedQuotaBadgeLabel(isCurrentlyConnected),
+                    color = quotaColor,
+                    icon = Icons.Filled.DataUsage,
+                )
+
                 // Live traffic badge for connected clients
                 if (isCurrentlyConnected && (client.rxBytes > 0L || client.txBytes > 0L)) {
                     BadgeChip(
@@ -757,6 +791,23 @@ private fun ClientCard(
                         icon = Icons.Filled.Schedule,
                     )
                 }
+            }
+
+            if (client.dataLimitBytes > 0L || client.quotaUsedTotalBytes > 0L || isCurrentlyConnected) {
+                Spacer(Modifier.height(6.dp))
+                val isIncompleteAttribution = client.unattributedPostNatObserved ||
+                    (isCurrentlyConnected && client.datapathMode == DatapathMode.DIRECT_TUN_FALLBACK && !client.kernelNetfilterAvailable)
+                val attributionNote = if (isIncompleteAttribution) {
+                    "Usage may be incomplete (unattributed post-NAT / fallback traffic observed)"
+                } else {
+                    "Attributed traffic (${client.quotaResetPeriod.displayName})"
+                }
+                Text(
+                    text = "$attributionNote • ↓ ${DataQuota.formatBytes(client.quotaUsedRxBytes)} · ↑ ${DataQuota.formatBytes(client.quotaUsedTxBytes)} (Total: ${DataQuota.formatBytes(client.quotaUsedTotalBytes)})",
+                    fontSize = 10.sp,
+                    color = if (isIncompleteAttribution) Color(0xFFFFA000) else ShizziTheme.colors.onSurfaceMuted,
+                    modifier = Modifier.testTag("client_quota_attribution_${client.cleanMac}"),
+                )
             }
 
             Spacer(Modifier.height(8.dp))
@@ -835,12 +886,30 @@ internal fun ConfigureClientDialog(
     client: ConnectedClient,
     onDismiss: () -> Unit,
     onSave: (ClientRule) -> Unit,
+    onResetQuotaUsage: () -> Unit = {},
 ) {
     var alias by remember(client.cleanMac) { mutableStateOf(client.alias) }
     var isBlocked by remember(client.cleanMac) { mutableStateOf(client.isBlocked) }
     var bandwidthMbpsText by remember(client.cleanMac, client.bandwidthLimitKbps) {
         mutableStateOf(formatKbpsAsMbps(client.bandwidthLimitKbps))
     }
+    var dataLimitMbText by remember(client.cleanMac, client.dataLimitBytes) {
+        mutableStateOf(DataQuota.formatBytesAsMbInput(client.dataLimitBytes))
+    }
+    var quotaResetPeriod by remember(client.cleanMac, client.quotaResetPeriod) {
+        mutableStateOf(client.quotaResetPeriod)
+    }
+    var localUsedRxBytes by remember(client.cleanMac, client.quotaUsedRxBytes) {
+        mutableLongStateOf(client.quotaUsedRxBytes)
+    }
+    var localUsedTxBytes by remember(client.cleanMac, client.quotaUsedTxBytes) {
+        mutableLongStateOf(client.quotaUsedTxBytes)
+    }
+    var localResetGeneration by remember(client.cleanMac, client.quotaResetGeneration) {
+        mutableLongStateOf(client.quotaResetGeneration)
+    }
+    var showResetQuotaConfirmDialog by remember { mutableStateOf(false) }
+
     var durationMinutes by remember(client.cleanMac) { mutableIntStateOf(client.connectionTimeLimitMinutes) }
     var scheduleEnabled by remember(client.cleanMac) { mutableStateOf(client.scheduleEnabled) }
     var scheduleStartHour by remember(client.cleanMac) { mutableIntStateOf(client.scheduleStartHour.coerceIn(0, 23)) }
@@ -850,10 +919,17 @@ internal fun ConfigureClientDialog(
     val bandwidthValidation = remember(bandwidthMbpsText) {
         validateMbpsInput(bandwidthMbpsText)
     }
+    val dataLimitValidation = remember(dataLimitMbText) {
+        DataQuota.validateDataLimitMbInput(dataLimitMbText)
+    }
     val scheduleHoursValid = remember(scheduleEnabled, scheduleStartHour, scheduleEndHour) {
         isValidScheduleHours(scheduleEnabled, scheduleStartHour, scheduleEndHour)
     }
-    val canSave = bandwidthValidation.isValid && scheduleHoursValid
+    val canSave = bandwidthValidation.isValid && dataLimitValidation.isValid && scheduleHoursValid
+
+    val effectiveLimitBytes = dataLimitValidation.bytes ?: client.dataLimitBytes
+    val localTotalBytes = (localUsedRxBytes.coerceAtLeast(0L) + localUsedTxBytes.coerceAtLeast(0L)).coerceAtLeast(0L)
+    val windowSpec = remember(quotaResetPeriod) { DataQuota.computeCurrentWindow(quotaResetPeriod) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -943,6 +1019,108 @@ internal fun ConfigureClientDialog(
                         .fillMaxWidth()
                         .testTag("bandwidth_limit_mbps_input"),
                 )
+
+                Spacer(Modifier.height(16.dp))
+
+                // Per-Client Data Usage Limit (Quota) in MB
+                OutlinedTextField(
+                    value = dataLimitMbText,
+                    onValueChange = { dataLimitMbText = it },
+                    label = { Text("Data Usage Limit (MB)") },
+                    suffix = { Text("MB") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    isError = !dataLimitValidation.isValid,
+                    supportingText = {
+                        if (dataLimitValidation.errorMessage != null) {
+                            Text(
+                                text = dataLimitValidation.errorMessage,
+                                color = Color(0xFFFF5252),
+                                modifier = Modifier.testTag("data_limit_error_text"),
+                            )
+                        } else {
+                            val previewBytes = dataLimitValidation.bytes ?: 0L
+                            val previewFormatted = if (previewBytes <= 0L) "Unlimited" else DataQuota.formatBytes(previewBytes)
+                            Text(
+                                text = "0 = Unlimited • 1 GB = 1024 MB (Selected: $previewFormatted)",
+                                modifier = Modifier.testTag("data_limit_helper_text"),
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("data_limit_mb_input"),
+                )
+
+                Spacer(Modifier.height(10.dp))
+
+                Text(
+                    text = "Quota Reset Period",
+                    fontWeight = FontWeight.SemiBold,
+                    style = ShizziTheme.typography.body,
+                )
+                Text(
+                    text = "When accumulated download + upload usage resets to 0 B",
+                    fontSize = 11.sp,
+                    color = ShizziTheme.colors.onSurfaceMuted,
+                )
+                Spacer(Modifier.height(6.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    QuotaResetPeriod.entries.forEach { period ->
+                        LimitChip(
+                            label = period.displayName,
+                            isSelected = quotaResetPeriod == period,
+                            onClick = { quotaResetPeriod = period },
+                            modifier = Modifier.testTag("quota_period_${period.name.lowercase()}"),
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                val usageSummaryText = if (effectiveLimitBytes <= 0L) {
+                    "Usage this period: ${DataQuota.formatBytes(localTotalBytes)} / Unlimited • ↓ ${DataQuota.formatBytes(localUsedRxBytes)} · ↑ ${DataQuota.formatBytes(localUsedTxBytes)}"
+                } else {
+                    val pct = ((localTotalBytes.toDouble() / effectiveLimitBytes.toDouble()) * 100.0).toInt().coerceIn(0, 999)
+                    val rem = (effectiveLimitBytes - localTotalBytes).coerceAtLeast(0L)
+                    "Usage this period: ${DataQuota.formatBytes(localTotalBytes)} / ${DataQuota.formatBytes(effectiveLimitBytes)} ($pct%) • ${DataQuota.formatBytes(rem)} left (↓ ${DataQuota.formatBytes(localUsedRxBytes)} · ↑ ${DataQuota.formatBytes(localUsedTxBytes)})"
+                }
+
+                Text(
+                    text = usageSummaryText,
+                    fontSize = 11.sp,
+                    color = if (effectiveLimitBytes > 0L && localTotalBytes >= effectiveLimitBytes) {
+                        Color(0xFFFF5252)
+                    } else {
+                        ShizziTheme.colors.onSurfaceMuted
+                    },
+                    modifier = Modifier.testTag("quota_usage_summary_text"),
+                )
+                Text(
+                    text = "Next reset: ${windowSpec.nextResetFormatted}",
+                    fontSize = 11.sp,
+                    color = ShizziTheme.colors.onSurfaceMuted,
+                    modifier = Modifier.testTag("quota_next_reset_text"),
+                )
+
+                Spacer(Modifier.height(6.dp))
+
+                OutlinedButton(
+                    onClick = { showResetQuotaConfirmDialog = true },
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.testTag("reset_quota_usage_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text("Reset Usage")
+                }
 
                 Spacer(Modifier.height(16.dp))
 
@@ -1073,9 +1251,13 @@ internal fun ConfigureClientDialog(
             Button(
                 onClick = {
                     val resolvedKbps = bandwidthValidation.kbps ?: return@Button
+                    val resolvedDataLimitBytes = dataLimitValidation.bytes ?: return@Button
                     if (!isValidScheduleHours(scheduleEnabled, scheduleStartHour, scheduleEndHour)) {
                         return@Button
                     }
+                    val nowMs = System.currentTimeMillis()
+                    val currentWindow = DataQuota.computeCurrentWindow(quotaResetPeriod, nowMs)
+                    val periodChanged = quotaResetPeriod != client.quotaResetPeriod
                     onSave(
                         ClientRule(
                             mac = client.cleanMac,
@@ -1086,6 +1268,14 @@ internal fun ConfigureClientDialog(
                             scheduleEnabled = scheduleEnabled,
                             scheduleStartHour = scheduleStartHour,
                             scheduleEndHour = scheduleEndHour,
+                            dataLimitBytes = resolvedDataLimitBytes,
+                            quotaResetPeriod = quotaResetPeriod,
+                            quotaUsedRxBytes = localUsedRxBytes,
+                            quotaUsedTxBytes = localUsedTxBytes,
+                            quotaWindowId = if (periodChanged || client.quotaWindowId.isBlank()) currentWindow.windowId else client.quotaWindowId,
+                            quotaWindowStartEpochMs = if (periodChanged || client.quotaWindowStartEpochMs <= 0L) currentWindow.windowStartEpochMs else client.quotaWindowStartEpochMs,
+                            quotaLastUpdatedEpochMs = nowMs,
+                            quotaResetGeneration = localResetGeneration,
                         ),
                     )
                 },
@@ -1105,6 +1295,42 @@ internal fun ConfigureClientDialog(
             }
         },
     )
+
+    if (showResetQuotaConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showResetQuotaConfirmDialog = false },
+            title = { Text("Reset Data Usage?") },
+            text = {
+                Text(
+                    text = "Reset accumulated download and upload data usage for ${client.displayName} (${client.cleanMac}) to 0 B for the current period? Your configured data limit, speed limit, schedule, and block rules will not be changed.",
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        localUsedRxBytes = 0L
+                        localUsedTxBytes = 0L
+                        localResetGeneration += 1L
+                        onResetQuotaUsage()
+                        showResetQuotaConfirmDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ShizziTheme.colors.primary),
+                    modifier = Modifier.testTag("confirm_reset_quota_button"),
+                ) {
+                    Text("Reset Usage")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showResetQuotaConfirmDialog = false },
+                    modifier = Modifier.testTag("cancel_reset_quota_button"),
+                ) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
 
     activeHourPicker?.let { target ->
         val currentSelected = if (target == HourPickerTarget.START) scheduleStartHour else scheduleEndHour
@@ -1261,6 +1487,7 @@ private fun HourPickerDialog(
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun AddClientDialog(
     onDismiss: () -> Unit,
@@ -1269,13 +1496,23 @@ private fun AddClientDialog(
     var macInput by remember { mutableStateOf("") }
     var aliasInput by remember { mutableStateOf("") }
     var isBlocked by remember { mutableStateOf(false) }
+    var dataLimitMbText by remember { mutableStateOf("0") }
+    var quotaResetPeriod by remember { mutableStateOf(QuotaResetPeriod.MANUAL) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    val dataLimitValidation = remember(dataLimitMbText) {
+        DataQuota.validateDataLimitMbInput(dataLimitMbText)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add Host by MAC") },
         text = {
-            Column {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+            ) {
                 Text(
                     text = "Enter the hardware MAC address of the device to pre-configure its access policy.",
                     fontSize = 12.sp,
@@ -1308,6 +1545,41 @@ private fun AddClientDialog(
                     modifier = Modifier.fillMaxWidth().testTag("add_alias_input"),
                 )
 
+                Spacer(Modifier.height(8.dp))
+
+                OutlinedTextField(
+                    value = dataLimitMbText,
+                    onValueChange = { dataLimitMbText = it },
+                    label = { Text("Data Usage Limit (MB)") },
+                    suffix = { Text("MB") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    isError = !dataLimitValidation.isValid,
+                    supportingText = {
+                        if (dataLimitValidation.errorMessage != null) {
+                            Text(dataLimitValidation.errorMessage, color = Color(0xFFFF5252))
+                        } else {
+                            Text("0 = Unlimited • 1 GB = 1024 MB")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().testTag("add_data_limit_mb_input"),
+                )
+
+                Spacer(Modifier.height(6.dp))
+
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    QuotaResetPeriod.entries.forEach { period ->
+                        LimitChip(
+                            label = period.displayName,
+                            isSelected = quotaResetPeriod == period,
+                            onClick = { quotaResetPeriod = period },
+                        )
+                    }
+                }
+
                 Spacer(Modifier.height(12.dp))
 
                 Row(
@@ -1332,14 +1604,21 @@ private fun AddClientDialog(
                         errorMessage = "Invalid MAC address format (must be XX:XX:XX:XX:XX:XX)"
                         return@Button
                     }
+                    val resolvedDataLimitBytes = dataLimitValidation.bytes ?: return@Button
+                    val window = DataQuota.computeCurrentWindow(quotaResetPeriod)
                     onAdd(
                         ClientRule(
                             mac = clean,
                             alias = aliasInput.trim(),
                             isBlocked = isBlocked,
+                            dataLimitBytes = resolvedDataLimitBytes,
+                            quotaResetPeriod = quotaResetPeriod,
+                            quotaWindowId = window.windowId,
+                            quotaWindowStartEpochMs = window.windowStartEpochMs,
                         ),
                     )
                 },
+                enabled = dataLimitValidation.isValid,
                 colors = ButtonDefaults.buttonColors(containerColor = ShizziTheme.colors.primary),
                 modifier = Modifier.testTag("confirm_add_mac_button"),
             ) {
@@ -1359,6 +1638,7 @@ private fun LimitChip(
     label: String,
     isSelected: Boolean,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val bg = if (isSelected) ShizziTheme.colors.primary.copy(alpha = 0.2f) else ShizziTheme.colors.surfaceVariant
     val border = if (isSelected) ShizziTheme.colors.primary else ShizziTheme.colors.onSurfaceMuted.copy(alpha = 0.25f)
@@ -1368,7 +1648,7 @@ private fun LimitChip(
         shape = RoundedCornerShape(14.dp),
         color = bg,
         border = BorderStroke(1.dp, border),
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick),
     ) {
