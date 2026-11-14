@@ -39,4 +39,34 @@ interface ITetherService {
     String collectBpfSnapshotNow();
 
     void resetClientQuota(String mac);
+
+    String setBpfRefreshOnMissConfig(boolean enabled, int cooldownMs);
+
+    String setDeepTupleDiagnosticsEnabled(boolean enabled);
+
+    String resetBpfDiagnosticsCounters();
+
+    String setPhaseDEnforcementMode(String mode);
+
+    String recordPhaseDDeliveryTestMarker(String markerType, String note);
+
+    String selectBlockingMode(String mode);
+
+    String checkPreNatCapability();
+
+    String reviewPreNatScopedProbe();
+
+    String runPreNatScopedProbe(boolean userConfirmed);
+
+    String activatePreNatBlockingMode();
+
+    String restoreBpfBlockingMode();
+
+    String checkSoftApCapability();
+
+    String runSoftApLiveProbe(String clientAMac, String clientBMac, boolean userConfirmed, int disconnectTimeoutMs);
+
+    String activateSoftApBlockingMode();
+
+    void updateDomainRules(String domainRulesJson);
 }

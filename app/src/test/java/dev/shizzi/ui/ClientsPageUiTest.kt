@@ -5,6 +5,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -13,6 +14,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
 import dev.shizzi.ClientRule
 import dev.shizzi.ConnectedClient
@@ -483,13 +485,13 @@ class ClientsPageComposeTest {
             .performClick()
         composeTestRule.waitForIdle()
 
-        // About modal displays shizzy lua, Version 0.10.2, Author: GeraldoDev, GitHub button, and Close button
+        // About modal displays shizzy lua, Version 0.10.3-debug, Author: GeraldoDev, GitHub button, and Close button
         composeTestRule.onNodeWithTag("about_modal_title")
             .assertIsDisplayed()
             .assertTextContains("shizzy lua")
         composeTestRule.onNodeWithTag("about_modal_version")
             .assertIsDisplayed()
-            .assertTextContains("Version 0.10.2")
+            .assertTextContains("Version ${dev.shizzi.BuildConfig.VERSION_NAME}")
         composeTestRule.onNodeWithTag("about_modal_author")
             .assertIsDisplayed()
             .assertTextContains("Author: GeraldoDev")
@@ -596,4 +598,659 @@ class ClientsPageComposeTest {
         assertEquals(0L, savedRule!!.quotaUsedTxBytes)
         assertEquals(2L, savedRule!!.quotaResetGeneration)
     }
+
+    @Test
+    fun `13 v0_10_3_debug Developer Settings renders BPF Attribution Diagnostics panel confirms Reset Counters captures snapshot and exports redacted files`() {
+        val baseContext = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val appInstance = dev.shizzi.App()
+        android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+            .apply {
+                isAccessible = true
+                invoke(appInstance, baseContext)
+            }
+        dev.shizzi.App::class.java.getDeclaredField("instance").apply {
+            isAccessible = true
+            set(null, appInstance)
+        }
+
+        var refreshOnMissToggled: Boolean? = null
+        var deepTupleDiagToggled: Boolean? = null
+        var selectedPhaseDMode: dev.shizzi.PhaseDEnforcementMode? = null
+        var lastRecordedMarker: String? = null
+        var captureCalled = 0
+        var resetCountersCalled = 0
+
+        val sampleReport = dev.shizzi.BpfAttributionStatusReport(
+            experimentalEnabled = true,
+            state = dev.shizzi.ExperimentalBpfState.MAPPINGS_AVAILABLE,
+            collectionStatus = dev.shizzi.BpfCollectionStatus.OK,
+            snapshotHealth = dev.shizzi.BpfSnapshotHealth.OK,
+            lastSuccessfulRefreshEpochMs = 1_700_000_000_000L,
+            snapshotAgeMs = 240L,
+            lastCollectionDurationMs = 9L,
+            totalCollectionsAttempted = 12L,
+            totalCollectionsSucceeded = 12L,
+            totalCollectionsFailed = 0L,
+            activeMappedFlows = 5,
+            totalEligiblePackets = 200L,
+            totalEligibleBytes = 240_000L,
+            totalAttributedPackets = 190L,
+            totalAttributedBytes = 228_000L,
+            directAttributedPackets = 40L,
+            directAttributedBytes = 48_000L,
+            bpfAttributedPackets = 150L,
+            bpfAttributedBytes = 180_000L,
+            unknownForwardedPackets = 10L,
+            unknownForwardedBytes = 12_000L,
+            unattributedPacketsByReason = mapOf(dev.shizzi.UnattributedReason.TUPLE_NOT_PRESENT.name to 10L),
+            unattributedBytesByReason = mapOf(dev.shizzi.UnattributedReason.TUPLE_NOT_PRESENT.name to 12_000L),
+            perClientCounts = listOf(
+                dev.shizzi.ClientProtocolFlowCounts(
+                    mac = "E2:15:CD:54:E4:9B",
+                    originalIpv4 = "192.168.167.151",
+                    tcpFlows = 4,
+                    udpFlows = 1,
+                ),
+            ),
+        )
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                SettingsPage(
+                    state = SettingsState(
+                        shizuku = ShizukuState.Ready(uid = 2000, isRoot = false),
+                        permissions = emptyList(),
+                        theme = ThemeChoice.DARK,
+                        design = DesignLanguage.MATERIAL_EXPRESSIVE,
+                        accent = AccentChoice.Default,
+                        customAccents = emptyList(),
+                        isLogging = true,
+                        vpnMode = VpnMode.AUTO,
+                        isRunningDiagnostics = false,
+                        automation = AutomationState(isEnabled = false, token = ""),
+                        dnsSettings = DnsSettings(),
+                        experimentalBpfEnabled = true,
+                        bpfRefreshOnMissEnabled = false,
+                        bpfDeepTupleDiagnosticsEnabled = false,
+                        bpfExportPseudonymousIds = false,
+                        phaseDEnforcementMode = dev.shizzi.PhaseDEnforcementMode.DIAGNOSTIC,
+                        bpfReport = sampleReport,
+                    ),
+                    actions = SettingsActions(
+                        onSetTheme = {},
+                        onSetDesign = {},
+                        onSetAccent = {},
+                        onAddCustomAccent = {},
+                        onSetLogging = {},
+                        onSetVpnMode = {},
+                        onSetDnsPreset = {},
+                        onSetCustomDns = { _, _ -> },
+                        onOpenClients = {},
+                        onOpenLog = {},
+                        onOpenFirewallDiagnostic = {},
+                        onSetExperimentalBpfEnabled = {},
+                        onSetBpfRefreshOnMissEnabled = { refreshOnMissToggled = it },
+                        onSetBpfDeepTupleDiagnosticsEnabled = { deepTupleDiagToggled = it },
+                        onSetBpfExportPseudonymousIds = {},
+                        onSetPhaseDEnforcementMode = { selectedPhaseDMode = it },
+                        onRecordPhaseDDeliveryTestMarker = { type, _ -> lastRecordedMarker = type },
+                        onCollectBpfSnapshotNow = { captureCalled++ },
+                        onResetBpfDiagnosticsCounters = { resetCountersCalled++ },
+                        onRunProbes = {},
+                        onGrantPermission = {},
+                        onShizukuAction = {},
+                        onRestartOnboarding = {},
+                        automation = AutomationActions(
+                            onSetEnabled = {},
+                            onRegenerateToken = {},
+                        ),
+                    ),
+                    toasts = rememberToastState(),
+                    onBack = {},
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Verify BPF Attribution Diagnostics (Debug) card and health/coverage/reasons
+        composeTestRule.onNodeWithTag("bpf_diagnostics_debug_card")
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("bpf_diag_snapshot_health")
+            .assertTextContains("OK")
+        composeTestRule.onNodeWithTag("bpf_diag_coverage_summary")
+            .assertTextContains("95.00%", substring = true)
+        composeTestRule.onNodeWithTag("bpf_diag_top_reasons")
+            .assertTextContains("TUPLE_NOT_PRESENT=10p", substring = true)
+
+        // Toggle Phase B Refresh-on-Miss switch
+        composeTestRule.onNodeWithTag("bpf_refresh_on_miss_switch")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(true, refreshOnMissToggled)
+
+        // Verify Phase B latency/breaker and Phase C Deep Tuple Diagnostics switch & stats
+        composeTestRule.onNodeWithTag("bpf_phase_b_latency_breaker")
+            .performScrollTo()
+            .assertTextContains("state=CLOSED", substring = true)
+        composeTestRule.onNodeWithTag("bpf_deep_tuple_diag_switch")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(true, deepTupleDiagToggled)
+        composeTestRule.onNodeWithTag("bpf_phase_c_stats")
+            .performScrollTo()
+            .assertTextContains("Phase C Flows:", substring = true)
+
+        // Verify Phase D mode buttons, stats, and delivery test markers
+        composeTestRule.onNodeWithTag("phase_d_mode_diagnostic_button")
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("phase_d_mode_enforcement_button")
+            .performScrollTo()
+            .assertIsDisplayed()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(dev.shizzi.PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT, selectedPhaseDMode)
+
+        composeTestRule.onNodeWithTag("phase_d_stats")
+            .performScrollTo()
+            .assertTextContains("Phase D: mode=DIAGNOSTIC", substring = true)
+        composeTestRule.onNodeWithTag("phase_d_post_block_stats")
+            .performScrollTo()
+            .assertTextContains("Post-Block:", substring = true)
+
+        composeTestRule.onNodeWithTag("phase_d_mark_test_start_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals("TEST_SESSION_START", lastRecordedMarker)
+
+        // Click Capture snapshot button
+        composeTestRule.onNodeWithTag("bpf_capture_snapshot_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(1, captureCalled)
+
+        // Click Reset counters -> opens confirmation dialog -> Cancel does not reset -> Confirm resets
+        composeTestRule.onNodeWithTag("bpf_reset_counters_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("bpf_reset_counters_dialog").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("bpf_reset_counters_cancel_button").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(0, resetCountersCalled)
+
+        composeTestRule.onNodeWithTag("bpf_reset_counters_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("bpf_reset_counters_confirm_button").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(1, resetCountersCalled)
+
+        // Verify export helper writes redacted Markdown + JSON files with debug FileProvider authority
+        val exported = writeBpfDiagnosticsExportFiles(
+            context = baseContext,
+            report = sampleReport,
+            includePseudonymousIds = false,
+            timestampMs = 1700000000123L,
+        )
+        assertEquals("dev.shizzyluna.proxy.debug.exports", exported.authority)
+        assertTrue(exported.markdownFile.exists())
+        assertTrue(exported.jsonFile.exists())
+        assertFalse(dev.shizzi.DiagnosticRedactor.containsUnredactedPii(exported.markdownFile.readText()))
+        assertFalse(dev.shizzi.DiagnosticRedactor.containsUnredactedPii(exported.jsonFile.readText()))
+    }
+
+    @Test
+    fun `14 v0_10_8_debug SettingsPage renders 2-option Blocking Mode radio group without Pre-NAT and shows legacy migration status`() {
+        val baseContext = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val appInstance = dev.shizzi.App()
+        android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+            .apply {
+                isAccessible = true
+                invoke(appInstance, baseContext)
+            }
+        dev.shizzi.App::class.java.getDeclaredField("instance").apply {
+            isAccessible = true
+            set(null, appInstance)
+        }
+
+        var selectedMode: dev.shizzi.BlockingMode? = null
+        var restoreClicked = 0
+        var openDomainBlockingClicked = 0
+
+        val preNatReport = dev.shizzi.PreNatModeDiagnosticReport(
+            requestedMode = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+            effectiveMode = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+            runtimeState = dev.shizzi.PreNatRuntimeState.CURRENT_ACTIVE,
+            exclusiveEngineInvariant = true,
+            legacyPreNatMigrated = true,
+            legacyPreNatCleanupVerified = true,
+        )
+        val reportWithPreNat = dev.shizzi.BpfAttributionStatusReport(
+            preNatDiagnostics = preNatReport,
+        )
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                SettingsPage(
+                    state = SettingsState(
+                        shizuku = ShizukuState.Ready(uid = 2000, isRoot = false),
+                        permissions = emptyList(),
+                        theme = ThemeChoice.DARK,
+                        design = DesignLanguage.MATERIAL_EXPRESSIVE,
+                        accent = AccentChoice.Default,
+                        customAccents = emptyList(),
+                        isLogging = true,
+                        vpnMode = VpnMode.AUTO,
+                        isRunningDiagnostics = false,
+                        automation = AutomationState(isEnabled = false, token = ""),
+                        dnsSettings = DnsSettings(),
+                        requestedBlockingMode = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+                        bpfReport = reportWithPreNat,
+                    ),
+                    actions = SettingsActions(
+                        onSetTheme = {},
+                        onSetDesign = {},
+                        onSetAccent = {},
+                        onAddCustomAccent = {},
+                        onSetLogging = {},
+                        onSetVpnMode = {},
+                        onSetDnsPreset = {},
+                        onSetCustomDns = { _, _ -> },
+                        onOpenClients = {},
+                        onOpenDomainBlocking = { openDomainBlockingClicked++ },
+                        onOpenLog = {},
+                        onSelectBlockingMode = { selectedMode = it },
+                        onRestoreBpfMode = { restoreClicked++ },
+                        onRunProbes = {},
+                        onGrantPermission = {},
+                        onShizukuAction = {},
+                        onRestartOnboarding = {},
+                        automation = AutomationActions(
+                            onSetEnabled = {},
+                            onRegenerateToken = {},
+                        ),
+                    ),
+                    toasts = rememberToastState(),
+                    onBack = {},
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("blocking_mode_card")
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("blocking_mode_active_modes")
+            .performScrollTo()
+            .assertTextContains("Requested mode: BPF_NAT_VPN • Active mode: BPF_NAT_VPN", substring = true)
+        composeTestRule.onNodeWithTag("legacy_prenat_migration_status")
+            .performScrollTo()
+            .assertTextContains("migrated=true • cleanupVerified=true", substring = true)
+
+        // Verify Pre-NAT radio is removed (only 2 selectable modes: BPF/NAT + VPN and SoftAP MAC Block)
+        composeTestRule.onAllNodesWithTag("blocking_mode_radio_prenat").assertCountEquals(0)
+
+        // Radio selection
+        composeTestRule.onNodeWithTag("blocking_mode_radio_bpf")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(dev.shizzi.BlockingMode.BPF_NAT_VPN, selectedMode)
+
+        composeTestRule.onNodeWithTag("prenat_restore_engine_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(1, restoreClicked)
+    }
+
+    @Test
+    fun `15 v0_10_7_debug SettingsPage and ClientsPage render BlockingMode selector SoftAP live probe dialog throttle warnings and offline blocked hosts`() {
+        val baseContext = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val appInstance = dev.shizzi.App()
+        android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+            .apply {
+                isAccessible = true
+                invoke(appInstance, baseContext)
+            }
+        dev.shizzi.App::class.java.getDeclaredField("instance").apply {
+            isAccessible = true
+            set(null, appInstance)
+        }
+
+        var selectedMode: dev.shizzi.BlockingMode? = null
+        var softApCheckCapabilityClicked = 0
+        var softApLiveProbeArgs: Triple<String, String, Boolean>? = null
+        var softApActivateClicked = 0
+
+        val softApReport = dev.shizzi.SoftApModeDiagnosticReport(
+            selectedMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            effectiveMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            engineState = dev.shizzi.SoftApEngineState.ACTIVE,
+            exclusiveEngineInvariant = true,
+            capabilityReport = dev.shizzi.SoftApCapabilityReport(
+                executionIdentity = dev.shizzi.SoftApExecutionIdentity(
+                    shizukuState = "SHIZUKU_RUNNING",
+                    shizukuRunning = true,
+                    shizukuPermissionGranted = true,
+                    uid = "2000",
+                    gid = "2000",
+                    selinuxContext = "u:r:shell:s0",
+                    capEff = "0000000000000000",
+                    provenance = "LIVE_SHIZUKU_USERSERVICE_PROCESS",
+                ),
+                getSoftApConfigSupported = true,
+                setSoftApConfigSupported = true,
+                builderSetBlockedListSupported = true,
+                forceDisconnectSupported = true,
+                configSnapshot = dev.shizzi.SoftApConfigSnapshot(
+                    readable = true,
+                    clientControlByUserEnabled = true,
+                    blockedClientMacs = listOf("10:22:33:44:55:66", "E2:15:CD:54:E4:9B"),
+                    allowedClientMacs = emptyList(),
+                    configFingerprint = "a1b2c3d4e5f60718",
+                ),
+                calculatedState = dev.shizzi.SoftApEngineState.ACTIVE,
+            ),
+            liveProbeResult = dev.shizzi.SoftApLiveProbeResult(
+                executed = true,
+                probePassed = true,
+                userConfirmed = true,
+                clientAMac = "E2:15:CD:54:E4:9B",
+                clientBMac = "AA:BB:CC:DD:EE:FF",
+                clientADisconnected = true,
+                clientADisconnectLatencyMs = 320L,
+                clientBRemainedConnected = true,
+                readbackVerifiedBlockRemoved = true,
+                resultingState = dev.shizzi.SoftApEngineState.READY,
+            ),
+            journalSnapshot = dev.shizzi.SoftApJournalSnapshot(
+                engineGeneration = 1L,
+                commitPhase = "APPLIED_VERIFIED",
+                priorBlockedMacs = listOf("10:22:33:44:55:66"),
+                appOwnedMacs = listOf("E2:15:CD:54:E4:9B"),
+                rollbackRequired = false,
+            ),
+            clientRecords = listOf(
+                dev.shizzi.SoftApClientEnforcementRecord(
+                    mac = "E2:15:CD:54:E4:9B",
+                    activeReasons = setOf(dev.shizzi.SoftApClientBlockReason.MANUAL_BLOCK),
+                    desiredBlocked = true,
+                    appliedState = dev.shizzi.SoftApAppliedState.BLOCK_CONFIRMED,
+                ),
+            ),
+        )
+        // Set effectiveModeNullable to BPF_NAT_VPN initially so the "Activate SoftAP" button is enabled in SettingsPage
+        val preNatReport = dev.shizzi.PreNatModeDiagnosticReport(
+            requestedMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            effectiveMode = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+            effectiveModeNullable = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+            runtimeState = dev.shizzi.PreNatRuntimeState.CURRENT_ACTIVE,
+            exclusiveEngineInvariant = true,
+            bpfNatVpnDropPathEnabled = true,
+            preNatDropPathEnabled = false,
+            softApMacBlockEnabled = false,
+        )
+        val combinedReport = dev.shizzi.BpfAttributionStatusReport(
+            preNatDiagnostics = preNatReport,
+            softApDiagnostics = softApReport,
+        )
+
+        val clientA = ConnectedClient(
+            ip = "192.168.43.101",
+            mac = "E2:15:CD:54:E4:9B",
+            alias = "galaxy-a",
+            interfaceName = "ap0",
+            isBlocked = false,
+            bandwidthLimitKbps = 5000,
+        )
+        val clientB = ConnectedClient(
+            ip = "192.168.43.102",
+            mac = "AA:BB:CC:DD:EE:FF",
+            alias = "pixel-b",
+            interfaceName = "ap0",
+            isBlocked = false,
+        )
+
+        val showClientsPage = androidx.compose.runtime.mutableStateOf(false)
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                if (!showClientsPage.value) {
+                    SettingsPage(
+                        state = SettingsState(
+                            shizuku = ShizukuState.Ready(uid = 2000, isRoot = false),
+                            permissions = emptyList(),
+                            theme = ThemeChoice.DARK,
+                            design = DesignLanguage.MATERIAL_EXPRESSIVE,
+                            accent = AccentChoice.Default,
+                            customAccents = emptyList(),
+                            isLogging = true,
+                            vpnMode = VpnMode.AUTO,
+                            isRunningDiagnostics = false,
+                            automation = AutomationState(isEnabled = false, token = ""),
+                            dnsSettings = DnsSettings(),
+                            requestedBlockingMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+                            connectedClients = listOf(clientA, clientB),
+                            clientRules = listOf(
+                                ClientRule(
+                                    mac = "E2:15:CD:54:E4:9B",
+                                    alias = "Galaxy A",
+                                    bandwidthLimitKbps = 5000,
+                                ),
+                            ),
+                            bpfReport = combinedReport,
+                        ),
+                        actions = SettingsActions(
+                            onSetTheme = {},
+                            onSetDesign = {},
+                            onSetAccent = {},
+                            onAddCustomAccent = {},
+                            onSetLogging = {},
+                            onSetVpnMode = {},
+                            onSetDnsPreset = {},
+                            onSetCustomDns = { _, _ -> },
+                            onOpenClients = {},
+                            onOpenLog = {},
+                            onSelectBlockingMode = { selectedMode = it },
+                            onCheckSoftApCapability = { softApCheckCapabilityClicked++ },
+                            onRunSoftApLiveProbe = { a, b, confirmed, _ ->
+                                softApLiveProbeArgs = Triple(a, b, confirmed)
+                            },
+                            onActivateSoftApMode = { softApActivateClicked++ },
+                            onRunProbes = {},
+                            onGrantPermission = {},
+                            onShizukuAction = {},
+                            onRestartOnboarding = {},
+                            automation = AutomationActions(
+                                onSetEnabled = {},
+                                onRegenerateToken = {},
+                            ),
+                        ),
+                        toasts = rememberToastState(),
+                        onBack = {},
+                    )
+                } else {
+                    // ClientsPage when client A is already disconnected from Wi-Fi by SoftAP MAC blocklist
+                    ClientsPage(
+                        clients = listOf(clientB),
+                        actions = ClientActions(
+                            onToggleBlock = { _, _ -> },
+                            onSaveRule = {},
+                            onRemoveRule = {},
+                            onRefresh = {},
+                        ),
+                        savedRules = emptyList(),
+                        bpfReport = combinedReport,
+                        onBack = {},
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Verify SoftAP radio option + SoftAP engine state badge + warnings
+        composeTestRule.onNodeWithTag("blocking_mode_radio_softap")
+            .performScrollTo()
+            .assertIsDisplayed()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK, selectedMode)
+
+        composeTestRule.onNodeWithTag("softap_engine_state_badge")
+            .performScrollTo()
+            .assertTextContains("ACTIVE", substring = true)
+        composeTestRule.onNodeWithTag("softap_warning_banner")
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("softap_throttle_warning_banner")
+            .performScrollTo()
+            .assertIsDisplayed()
+
+        // Verify SoftAP action buttons and 2-client live probe dialog
+        composeTestRule.onNodeWithTag("softap_check_capability_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(1, softApCheckCapabilityClicked)
+
+        composeTestRule.onNodeWithTag("softap_activate_mode_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(1, softApActivateClicked)
+
+        composeTestRule.onNodeWithTag("softap_run_live_probe_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("softap_live_probe_dialog").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("softap_confirm_live_probe_button").performClick()
+        composeTestRule.waitForIdle()
+        assertNotNull(softApLiveProbeArgs)
+        assertEquals("E2:15:CD:54:E4:9B", softApLiveProbeArgs!!.first)
+        assertEquals("AA:BB:CC:DD:EE:FF", softApLiveProbeArgs!!.second)
+        assertEquals(true, softApLiveProbeArgs!!.third)
+
+        // Switch to ClientsPage -> verify SoftAP active mode banner, disconnected SoftAP-blocked client retained, and bandwidth limit input disabled in Configure dialog
+        showClientsPage.value = true
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("softap_active_mode_banner")
+            .assertIsDisplayed()
+
+        // Client E2:15:CD:54:E4:9B is disconnected from connectedClients, yet remains visible via SoftAP ownership/enforcement records
+        composeTestRule.onNodeWithTag("clients_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("client_card_E2:15:CD:54:E4:9B"))
+        composeTestRule.onNodeWithTag("client_card_E2:15:CD:54:E4:9B")
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("softap_status_E2:15:CD:54:E4:9B")
+            .assertTextContains("SoftAP: BLOCK_CONFIRMED", substring = true)
+
+        // Open Configure dialog -> verify bandwidth limit input is disabled with SoftAP notice
+        composeTestRule.onNodeWithTag("configure_client_E2:15:CD:54:E4:9B")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("bandwidth_limit_mbps_input")
+            .performScrollTo()
+            .assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("softap_throttle_disabled_notice", useUnmergedTree = true)
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun `16 v0_10_8_debug DomainBlockingPage renders Global and Per-Host tabs Global-also-applies notice and validates domain input inline`() {
+        val rulesState = androidx.compose.runtime.mutableStateListOf(
+            dev.shizzi.DomainRule(
+                id = "g1",
+                scope = dev.shizzi.DomainRuleScope.GLOBAL,
+                normalizedDomain = "doubleclick.net",
+                matchMode = dev.shizzi.DomainMatchMode.INCLUDE_SUBDOMAINS,
+                enabled = true,
+            ),
+        )
+        val clientA = ConnectedClient(
+            ip = "192.168.43.101",
+            mac = "E2:15:CD:54:E4:9B",
+            alias = "galaxy-a",
+            interfaceName = "ap0",
+            isBlocked = false,
+        )
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                DomainBlockingPage(
+                    domainRules = rulesState.toList(),
+                    connectedClients = listOf(clientA),
+                    savedClientRules = emptyList(),
+                    actions = DomainBlockingActions(
+                        onUpsertRule = { _, rawDomain, scope, clientMac, matchMode, enabled ->
+                            val v = dev.shizzi.DomainNormalizer.validateAndNormalize(rawDomain)
+                            if (v.isValid) {
+                                rulesState.add(
+                                    dev.shizzi.DomainRule(
+                                        scope = scope,
+                                        clientMac = clientMac,
+                                        normalizedDomain = v.normalizedDomain!!,
+                                        matchMode = matchMode,
+                                        enabled = enabled,
+                                    ),
+                                )
+                            }
+                            v
+                        },
+                    ),
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Verify capability banner and existing global rule card
+        composeTestRule.onNodeWithTag("domain_capability_banner").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_rule_card_doubleclick.net"))
+        composeTestRule.onNodeWithTag("domain_rule_card_doubleclick.net").assertIsDisplayed()
+
+        // Switch to Per Host tab -> verify "Global rules also apply" notice
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_tab_client"))
+        composeTestRule.onNodeWithTag("domain_tab_client").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_global_also_applies_notice"))
+        composeTestRule.onNodeWithTag("domain_global_also_applies_notice")
+            .assertIsDisplayed()
+            .assertTextContains("Global rules also apply", substring = true)
+
+        // Open Add Host Domain dialog -> enter invalid URL -> verify inline error
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_add_client_button"))
+        composeTestRule.onNodeWithTag("domain_add_client_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_rule_dialog").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("domain_input_field").performTextReplacement("https://bad.example.com/path")
+        composeTestRule.onNodeWithTag("domain_dialog_save_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_input_error").assertIsDisplayed()
+
+        // Replace with valid wildcard domain "*.TikTok.com." -> verify normalized rule card appears
+        composeTestRule.onNodeWithTag("domain_input_field").performTextReplacement("*.TikTok.com.")
+        composeTestRule.onNodeWithTag("domain_dialog_save_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_rule_card_tiktok.com"))
+        composeTestRule.onNodeWithTag("domain_rule_card_tiktok.com").assertIsDisplayed()
+    }
 }
+

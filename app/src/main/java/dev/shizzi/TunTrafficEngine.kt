@@ -82,6 +82,8 @@ object TunTrafficEngine {
         val bpfAttributedPackets: AtomicLong = AtomicLong(0L),
         val conntrackAttributedPackets: AtomicLong = AtomicLong(0L),
         val forwardedPackets: AtomicLong = AtomicLong(0L),
+        val uploadForwardedPackets: AtomicLong = AtomicLong(0L),
+        val downloadForwardedPackets: AtomicLong = AtomicLong(0L),
         val droppedPackets: AtomicLong = AtomicLong(0L),
         val blockedDropPackets: AtomicLong = AtomicLong(0L),
         val shapingDropPackets: AtomicLong = AtomicLong(0L),
@@ -94,6 +96,18 @@ object TunTrafficEngine {
         val policyVersionBlockedDrops: AtomicLong = AtomicLong(0L),
         val policyVersionShapedPackets: AtomicLong = AtomicLong(0L),
         val quotaDropPackets: AtomicLong = AtomicLong(0L),
+        val decisionsRecomputed: AtomicLong = AtomicLong(0L),
+        val staleAllowCacheHitsPrevented: AtomicLong = AtomicLong(0L),
+        val verifiedAllowedAfterBlockPackets: AtomicLong = AtomicLong(0L),
+        val verifiedAllowedAfterBlockBytes: AtomicLong = AtomicLong(0L),
+        val verifiedDroppedAfterBlockPackets: AtomicLong = AtomicLong(0L),
+        val verifiedDroppedAfterBlockBytes: AtomicLong = AtomicLong(0L),
+        val pinnedFlowEnforcedPackets: AtomicLong = AtomicLong(0L),
+        val pinnedFlowEnforcedBytes: AtomicLong = AtomicLong(0L),
+        @Volatile var lastTransitionType: String = "NONE",
+        @Volatile var lastTransitionAtWallMs: Long = 0L,
+        @Volatile var lastTransitionAtMonoMs: Long = 0L,
+        @Volatile var verifiedFlowsAtTransition: Int = 0,
         @Volatile var policyBaselinePostNatUnmatched: Long = 0L,
         @Volatile var lastSeenAt: Long = 0L,
         @Volatile var lastLoggedPackets: Long = -1L,
@@ -168,18 +182,41 @@ object TunTrafficEngine {
         val isSmallControlPacket: Boolean,
         val isNonInitialFragment: Boolean = false,
         val isTcpSyn: Boolean = false,
-    )
+        val isTcpFinOrRst: Boolean = false,
+        val isTcpAckOnly: Boolean = false,
+    ) {
+        @Volatile
+        internal var resolvedAttribution: PacketAttribution? = null
+    }
 
     internal data class PacketAttribution(
         val mac: String?,
         val source: AttributionSource,
+        val unattributedReason: UnattributedReason? = null,
+        val fallbackAttempted: Boolean = false,
+        val refreshedSnapshotHit: Boolean = false,
+        val pinnedFlowHit: Boolean = false,
     )
 
     internal data class EvaluationDetail(
         val decision: PacketDecision,
         val paceDelayMs: Long = 0L,
         val policyVersion: Long = 1L,
-    )
+        val domainDecision: DomainPacketDecision? = null,
+    ) {
+        val reason: String
+            get() = when {
+                domainDecision?.blocked == true -> domainDecision.reason.code
+                decision == PacketDecision.DROP -> "BLOCKED_CLIENT_POLICY"
+                decision == PacketDecision.DROP_AQM -> "AQM_SHAPING_DROP"
+                decision == PacketDecision.RATE_LIMIT -> "RATE_LIMITED"
+                domainDecision?.unknownOwnerClientRuleSkipped == true -> DomainDropOrSkipReason.DOMAIN_CLIENT_OWNER_UNKNOWN.code
+                else -> "ALLOW"
+            }
+
+        val synthesizedDnsResponse: ByteArray?
+            get() = domainDecision?.synthesizedDnsResponse
+    }
 
     internal data class FlowKey(
         val version: Int = 4,
@@ -372,15 +409,443 @@ object TunTrafficEngine {
     val unmatchedPackets = AtomicLong(0L)
     val postNatUnmatchedPackets = AtomicLong(0L)
     val unknownForwardedBytes = AtomicLong(0L)
+
+    val totalEligiblePackets = AtomicLong(0L)
+    val totalEligibleBytes = AtomicLong(0L)
+    val totalAttributedPackets = AtomicLong(0L)
+    val totalAttributedBytes = AtomicLong(0L)
+
     val directAttributedPackets = AtomicLong(0L)
+    val directAttributedBytes = AtomicLong(0L)
     val bpfAttributedPackets = AtomicLong(0L)
+    val bpfAttributedBytes = AtomicLong(0L)
     val conntrackAttributedPackets = AtomicLong(0L)
+    val conntrackAttributedBytes = AtomicLong(0L)
+
+    val unattributedPacketsByReason = ConcurrentHashMap<UnattributedReason, AtomicLong>()
+    val unattributedBytesByReason = ConcurrentHashMap<UnattributedReason, AtomicLong>()
+
+    val ipv4EligiblePackets = AtomicLong(0L)
+    val ipv4EligibleBytes = AtomicLong(0L)
+    val ipv4AttributedPackets = AtomicLong(0L)
+    val ipv4AttributedBytes = AtomicLong(0L)
+    val ipv4UnattributedPackets = AtomicLong(0L)
+    val ipv4UnattributedBytes = AtomicLong(0L)
+
+    val ipv6EligiblePackets = AtomicLong(0L)
+    val ipv6EligibleBytes = AtomicLong(0L)
+    val ipv6AttributedPackets = AtomicLong(0L)
+    val ipv6AttributedBytes = AtomicLong(0L)
+    val ipv6UnattributedPackets = AtomicLong(0L)
+    val ipv6UnattributedBytes = AtomicLong(0L)
+
+    val tcpEligiblePackets = AtomicLong(0L)
+    val tcpEligibleBytes = AtomicLong(0L)
+    val tcpAttributedPackets = AtomicLong(0L)
+    val tcpAttributedBytes = AtomicLong(0L)
+    val tcpUnattributedPackets = AtomicLong(0L)
+    val tcpUnattributedBytes = AtomicLong(0L)
+
+    val udpEligiblePackets = AtomicLong(0L)
+    val udpEligibleBytes = AtomicLong(0L)
+    val udpAttributedPackets = AtomicLong(0L)
+    val udpAttributedBytes = AtomicLong(0L)
+    val udpUnattributedPackets = AtomicLong(0L)
+    val udpUnattributedBytes = AtomicLong(0L)
+
+    val icmpEligiblePackets = AtomicLong(0L)
+    val icmpEligibleBytes = AtomicLong(0L)
+    val icmpAttributedPackets = AtomicLong(0L)
+    val icmpAttributedBytes = AtomicLong(0L)
+    val icmpUnattributedPackets = AtomicLong(0L)
+    val icmpUnattributedBytes = AtomicLong(0L)
+
+    val otherProtoEligiblePackets = AtomicLong(0L)
+    val otherProtoEligibleBytes = AtomicLong(0L)
+    val otherProtoAttributedPackets = AtomicLong(0L)
+    val otherProtoAttributedBytes = AtomicLong(0L)
+    val otherProtoUnattributedPackets = AtomicLong(0L)
+    val otherProtoUnattributedBytes = AtomicLong(0L)
+
+    val uploadEligiblePackets = AtomicLong(0L)
+    val uploadEligibleBytes = AtomicLong(0L)
+    val uploadAttributedPackets = AtomicLong(0L)
+    val uploadAttributedBytes = AtomicLong(0L)
+    val uploadUnattributedPackets = AtomicLong(0L)
+    val uploadUnattributedBytes = AtomicLong(0L)
+
+    val downloadEligiblePackets = AtomicLong(0L)
+    val downloadEligibleBytes = AtomicLong(0L)
+    val downloadAttributedPackets = AtomicLong(0L)
+    val downloadAttributedBytes = AtomicLong(0L)
+    val downloadUnattributedPackets = AtomicLong(0L)
+    val downloadUnattributedBytes = AtomicLong(0L)
+
+    val conntrackFallbackAttemptedCount = AtomicLong(0L)
+    val conntrackFallbackSucceededCount = AtomicLong(0L)
+    val conntrackFallbackFailedCount = AtomicLong(0L)
+    val conntrackPermissionDeniedCount = AtomicLong(0L)
+    val conntrackBackoffSkippedCount = AtomicLong(0L)
+
+    const val DEFAULT_CONNTRACK_UNAVAILABLE_BACKOFF_MS = 300_000L
+
+    @Volatile
+    var conntrackUnavailableBackoffMs: Long = DEFAULT_CONNTRACK_UNAVAILABLE_BACKOFF_MS
+
+    @Volatile
+    var conntrackClockMillisProvider: () -> Long = { System.currentTimeMillis() }
+
+    @Volatile
+    private var conntrackBackoffUntilMs: Long = 0L
+
+    val postRefreshAttributedPackets = AtomicLong(0L)
+    val postRefreshAttributedBytes = AtomicLong(0L)
+
     val ambiguousOrStaleLookups = AtomicLong(0L)
     val localControlPackets = AtomicLong(0L)
+    val localControlBytes = AtomicLong(0L)
     val unsupportedOrFragmentPackets = AtomicLong(0L)
+
+    // Phase D (`v0.10.5-debug`) state & diagnostics counters
+    internal data class VerifiedFlowPin(
+        val flowKey: TranslatedFlowKey,
+        val verifiedMac: String,
+        val originalClientIp: String,
+        val sessionGeneration: Long,
+        val bindingGeneration: Long,
+        val pinnedAtMonoMs: Long,
+        var lastSeenMonoMs: Long,
+    )
+
+    const val MAX_VERIFIED_FLOW_PINS = 2_048
+    const val VERIFIED_FLOW_PIN_TTL_MS = 120_000L
+    private const val MAX_PHASE_D_TRANSITION_EVENTS = 128
+    private const val MAX_PHASE_D_LIFECYCLE_EVENTS = 64
+    private const val MAX_PHASE_D_TEST_MARKERS = 64
+
+    @Volatile
+    var phaseDMode: PhaseDEnforcementMode = PhaseDEnforcementMode.DIAGNOSTIC
+        private set
+
+    private val verifiedFlowPinsLock = Any()
+    private val verifiedFlowPins = object : LinkedHashMap<TranslatedFlowKey, VerifiedFlowPin>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<TranslatedFlowKey, VerifiedFlowPin>?): Boolean {
+            return size > MAX_VERIFIED_FLOW_PINS
+        }
+    }
+
+    private val phaseDEventsLock = Any()
+    private val policyTransitionSequence = AtomicLong(0L)
+    private val interfaceLifecycleSequence = AtomicLong(0L)
+    private val deliveryTestMarkerSequence = AtomicLong(0L)
+    private val policyTransitionEvents = ArrayDeque<PhaseDPolicyTransitionEvent>()
+    private val interfaceLifecycleEvents = ArrayDeque<PhaseDInterfaceLifecycleEvent>()
+    private val deliveryTestMarkers = ArrayDeque<PhaseDDeliveryTestMarker>()
+
+    @Volatile
+    private var lastObservedLifecycleState: PhaseDInterfaceLifecycleState =
+        PhaseDInterfaceLifecycleState.WAITING_FOR_INTERFACES
+
+    val unknownForwardedAfterBlockPackets = AtomicLong(0L)
+    val unknownForwardedAfterBlockBytes = AtomicLong(0L)
+    val unknownPostBlockByProtocolAndDirection = ConcurrentHashMap<String, AtomicLong>()
+    val unknownPostBlockBytesByProtocolAndDirection = ConcurrentHashMap<String, AtomicLong>()
+
+    val establishedTcpMissingFromBpfPackets = AtomicLong(0L)
+    val establishedTcpMissingFromBpfBytes = AtomicLong(0L)
+    val establishedTcpPinnedMatchedPackets = AtomicLong(0L)
+    val establishedTcpPinnedMatchedBytes = AtomicLong(0L)
+    val tcpKeepaliveOrAckOnlyPackets = AtomicLong(0L)
+    val tcpSynPacketsSeen = AtomicLong(0L)
+    val tcpFinOrRstPacketsSeen = AtomicLong(0L)
+    val udp443PostBlockUnattributedPackets = AtomicLong(0L)
+    val udp443PostBlockUnattributedBytes = AtomicLong(0L)
+    val udp53PostBlockUnattributedPackets = AtomicLong(0L)
+    val udp53PostBlockUnattributedBytes = AtomicLong(0L)
+    val pinnedFlowHitsInDiagnosticMode = AtomicLong(0L)
+    val pinnedFlowEnforcedDropsInEnforcementMode = AtomicLong(0L)
 
     val bpfAttributor = NatFlowAttributor()
     val bpfReader = BpfMapReader(attributor = bpfAttributor)
+    val deepTupleTracker = DeepTupleDiagnosticsTracker()
+
+    /**
+     * Exclusive Blocking Mode (`v0.10.8-debug`) enforcement gate:
+     * - `true` when `effectiveMode == BlockingMode.BPF_NAT_VPN` and not in `RECOVERY_REQUIRED`.
+     * - `false` when `effectiveMode == BlockingMode.SOFTAP_MAC_BLOCK` or `RECOVERY_REQUIRED` so
+     *   two whole-client packet-blocking engines are NEVER active simultaneously, while read-only BPF telemetry
+     *   and shared domain filtering continue.
+     */
+    @Volatile
+    var bpfNatVpnEnforcementEnabled: Boolean = true
+
+    init {
+        bpfAttributor.onSnapshotPublished = { snap ->
+            for ((ipv6Addr, verifiedMac) in snap.ipv6ClientBindings) {
+                if (verifiedMac in activeConnectedMacs) {
+                    bindClientIp(verifiedMac, ipv6Addr)
+                }
+            }
+            if (deepTupleDiagnosticsEnabled || bpfRefreshOnMissEnabled) {
+                deepTupleTracker.onSnapshotPublished(snap)
+            }
+            recordSnapshotFlowsInVerifiedPinCache(snap)
+            val ready = (snap.collectionStatus == BpfCollectionStatus.OK || snap.collectionStatus == BpfCollectionStatus.EMPTY_VALID) &&
+                snap.resolvedDownstreamIfIndex > 0 && snap.resolvedUpstreamIfIndex > 0
+            if (ready) {
+                maybeRecordInterfaceLifecycleState(
+                    PhaseDInterfaceLifecycleState.ATTRIBUTION_READY,
+                    "BPF snapshot seq=${snap.snapshotSequence} ready (downIfIndex=${snap.resolvedDownstreamIfIndex}, upIfIndex=${snap.resolvedUpstreamIfIndex})",
+                )
+            }
+        }
+    }
+
+    internal fun recordSnapshotFlowsInVerifiedPinCache(snap: NatFlowSnapshot) {
+        if (snap.flowsByTuple.isEmpty()) return
+        val nowMono = if (snap.collectedAtMonotonicMs > 0L) snap.collectedAtMonotonicMs else bpfAttributor.monotonicClockMs()
+        synchronized(verifiedFlowPinsLock) {
+            for ((key, mapping) in snap.flowsByTuple) {
+                if (mapping.verifiedMac.isBlank() || mapping.verifiedMac !in activeConnectedMacs) continue
+                val existing = verifiedFlowPins[key]
+                verifiedFlowPins[key] = VerifiedFlowPin(
+                    flowKey = key,
+                    verifiedMac = mapping.verifiedMac,
+                    originalClientIp = mapping.origClientIp,
+                    sessionGeneration = snap.sessionGeneration,
+                    bindingGeneration = snap.bindingGeneration,
+                    pinnedAtMonoMs = existing?.pinnedAtMonoMs ?: nowMono,
+                    lastSeenMonoMs = nowMono,
+                )
+            }
+        }
+    }
+
+    internal fun pinVerifiedBpfFlow(
+        flowKey: TranslatedFlowKey,
+        verifiedMac: String,
+        originalClientIp: String,
+        sessionGen: Long = bpfAttributor.currentSessionGeneration,
+        bindingGen: Long = bpfAttributor.currentBindingGeneration,
+        nowMonoMs: Long = bpfAttributor.monotonicClockMs(),
+    ) {
+        synchronized(verifiedFlowPinsLock) {
+            val existing = verifiedFlowPins[flowKey]
+            verifiedFlowPins[flowKey] = VerifiedFlowPin(
+                flowKey = flowKey,
+                verifiedMac = verifiedMac,
+                originalClientIp = originalClientIp,
+                sessionGeneration = sessionGen,
+                bindingGeneration = bindingGen,
+                pinnedAtMonoMs = existing?.pinnedAtMonoMs ?: nowMonoMs,
+                lastSeenMonoMs = nowMonoMs,
+            )
+        }
+    }
+
+    internal fun invalidateVerifiedFlowPin(flowKey: TranslatedFlowKey) {
+        synchronized(verifiedFlowPinsLock) {
+            verifiedFlowPins.remove(flowKey)
+        }
+    }
+
+    internal fun invalidateVerifiedFlowPinsForMac(mac: String): Int {
+        val clean = mac.uppercase().trim()
+        var removed = 0
+        synchronized(verifiedFlowPinsLock) {
+            val it = verifiedFlowPins.entries.iterator()
+            while (it.hasNext()) {
+                val entry = it.next()
+                if (entry.value.verifiedMac == clean) {
+                    it.remove()
+                    removed++
+                }
+            }
+        }
+        return removed
+    }
+
+    internal fun lookupVerifiedFlowPin(
+        flowKey: TranslatedFlowKey,
+        nowMonoMs: Long = bpfAttributor.monotonicClockMs(),
+    ): VerifiedFlowPin? {
+        val curSessionGen = bpfAttributor.currentSessionGeneration
+        synchronized(verifiedFlowPinsLock) {
+            val pin = verifiedFlowPins[flowKey] ?: return null
+            if (pin.sessionGeneration != curSessionGen ||
+                (nowMonoMs - pin.lastSeenMonoMs) > VERIFIED_FLOW_PIN_TTL_MS ||
+                pin.verifiedMac !in activeConnectedMacs
+            ) {
+                verifiedFlowPins.remove(flowKey)
+                return null
+            }
+            val currentBoundMac = ipToMac[pin.originalClientIp]
+            if (currentBoundMac != pin.verifiedMac) {
+                verifiedFlowPins.remove(flowKey)
+                return null
+            }
+            pin.lastSeenMonoMs = nowMonoMs
+            return pin
+        }
+    }
+
+    internal fun getVerifiedFlowPinCacheSize(): Int =
+        synchronized(verifiedFlowPinsLock) { verifiedFlowPins.size }
+
+    internal fun recordPolicyTransitionEvent(
+        transitionType: String,
+        mac: String,
+        verifiedFlows: Int = getAttributedFlowCount(mac.takeIf { it.length == 17 }),
+        queueInvalidated: Int = 0,
+        detail: String = "",
+    ): PhaseDPolicyTransitionEvent {
+        val cleanMac = mac.uppercase().trim()
+        val nowWall = conntrackClockMillisProvider()
+        val nowMono = System.nanoTime() / 1_000_000L
+        val counters = if (cleanMac.length == 17 && cleanMac != "00:00:00:00:00:00") {
+            countersByMac.getOrPut(cleanMac) { ClientTrafficCounters(cleanMac) }
+        } else {
+            null
+        }
+        val policyGen = counters?.policyVersion?.get() ?: 1L
+        if (counters != null) {
+            counters.lastTransitionType = transitionType
+            counters.lastTransitionAtWallMs = nowWall
+            counters.lastTransitionAtMonoMs = nowMono
+            counters.verifiedFlowsAtTransition = verifiedFlows
+        }
+        val event = PhaseDPolicyTransitionEvent(
+            eventSequence = policyTransitionSequence.incrementAndGet(),
+            timestampMonoMs = nowMono,
+            timestampEpochMs = nowWall,
+            transitionType = transitionType,
+            clientMac = cleanMac.ifBlank { "GLOBAL" },
+            clientIp = ipToMac.entries.firstOrNull { !it.key.contains(':') && it.value == cleanMac }?.key.orEmpty(),
+            policyGeneration = policyGen,
+            sessionGeneration = bpfAttributor.currentSessionGeneration,
+            bindingGeneration = bpfAttributor.currentBindingGeneration,
+            snapshotSequence = bpfAttributor.currentSnapshot().snapshotSequence,
+            verifiedFlowsAtTransition = verifiedFlows,
+            queuedPacketsPurged = queueInvalidated,
+            detail = detail,
+        )
+        synchronized(phaseDEventsLock) {
+            policyTransitionEvents.addLast(event)
+            while (policyTransitionEvents.size > MAX_PHASE_D_TRANSITION_EVENTS) {
+                policyTransitionEvents.removeFirst()
+            }
+        }
+        if (transitionType == "ALLOW_TO_BLOCK" || transitionType == "QUOTA_EXHAUSTED") {
+            recordDeliveryTestMarker(
+                markerType = "POLICY_ACTIVATED",
+                mac = cleanMac,
+                note = "$transitionType ($detail)".trim(),
+            )
+        }
+        return event
+    }
+
+    internal fun maybeRecordInterfaceLifecycleState(
+        state: PhaseDInterfaceLifecycleState,
+        reason: String,
+        force: Boolean = false,
+    ) {
+        if (!force && lastObservedLifecycleState == state) return
+        lastObservedLifecycleState = state
+        val snap = bpfAttributor.currentSnapshot()
+        val nowMono = System.nanoTime() / 1_000_000L
+        val event = PhaseDInterfaceLifecycleEvent(
+            eventSequence = interfaceLifecycleSequence.incrementAndGet(),
+            timestampMonoMs = nowMono,
+            state = state.name,
+            downstreamIface = snap.downstreamIface.ifBlank { activeDownstreamName },
+            upstreamIface = snap.upstreamIface.ifBlank { activeUpstreamName },
+            osDownstreamIfIndex = snap.resolvedDownstreamIfIndex.takeIf { it > 0 } ?: snap.downstreamIfIndex.takeIf { it > 0 },
+            osUpstreamIfIndex = snap.resolvedUpstreamIfIndex.takeIf { it > 0 } ?: snap.upstreamIfIndex.takeIf { it > 0 },
+            inferredDownstreamIfIndex = snap.inferredDownstreamIfIndex,
+            inferredUpstreamIfIndex = snap.inferredUpstreamIfIndex,
+            sessionGeneration = bpfAttributor.currentSessionGeneration,
+        )
+        synchronized(phaseDEventsLock) {
+            interfaceLifecycleEvents.addLast(event)
+            while (interfaceLifecycleEvents.size > MAX_PHASE_D_LIFECYCLE_EVENTS) {
+                interfaceLifecycleEvents.removeFirst()
+            }
+        }
+    }
+
+    fun recordDeliveryTestMarker(
+        markerType: String,
+        mac: String = "",
+        note: String = "",
+    ): PhaseDDeliveryTestMarker {
+        val nowWall = conntrackClockMillisProvider()
+        val nowMono = System.nanoTime() / 1_000_000L
+        val cleanMac = mac.uppercase().trim()
+        val marker = PhaseDDeliveryTestMarker(
+            markerSequence = deliveryTestMarkerSequence.incrementAndGet(),
+            markerType = markerType.uppercase().trim().ifBlank { "TEST_MARKER" },
+            timestampMonoMs = nowMono,
+            timestampEpochMs = nowWall,
+            phaseDMode = phaseDMode.name,
+            sessionGeneration = bpfAttributor.currentSessionGeneration,
+            snapshotSequence = bpfAttributor.currentSnapshot().snapshotSequence,
+            blockedClientsCount = policiesByMac.values.count { it.isNonQuotaBlocked },
+            quotaExhaustedClientsCount = quotaRecordsByMac.values.count { it.isQuotaExceeded },
+            note = if (cleanMac.isNotBlank()) "[$cleanMac] ${note.trim()}".trim() else note.trim(),
+        )
+        synchronized(phaseDEventsLock) {
+            deliveryTestMarkers.addLast(marker)
+            while (deliveryTestMarkers.size > MAX_PHASE_D_TEST_MARKERS) {
+                deliveryTestMarkers.removeFirst()
+            }
+        }
+        SessionLog.info(
+            "PhaseDMarker: seq=${marker.markerSequence} type=${marker.markerType} mac=${cleanMac.ifBlank { "ALL" }} mode=${marker.phaseDMode} note=${marker.note}",
+        )
+        return marker
+    }
+
+    /**
+     * Configures the Phase D operating mode (`DIAGNOSTIC` default vs `EXPERIMENTAL_ENFORCEMENT` opt-in)
+     * at runtime without restarting the tethering service or rebuilding the APK.
+     */
+    @Synchronized
+    fun configurePhaseDMode(mode: PhaseDEnforcementMode) {
+        val previous = phaseDMode
+        phaseDMode = mode
+        if (previous != mode) {
+            recordPolicyTransitionEvent(
+                transitionType = "PHASE_D_MODE_CHANGED",
+                mac = "GLOBAL",
+                verifiedFlows = getAttributedFlowCount(null),
+                queueInvalidated = 0,
+                detail = "${previous.name} -> ${mode.name}",
+            )
+            if (mode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT) {
+                if (!bpfRefreshOnMissEnabled) {
+                    bpfRefreshOnMissEnabled = true
+                    bpfReader.refreshOnMissCooldownMs = 150L
+                }
+                for ((mac, pol) in policiesByMac) {
+                    val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
+                    reconcileQueuedPacketsForPolicyChange(mac, pol, counters)
+                }
+            }
+            SessionLog.info("PhaseD: mode changed ${previous.name} -> ${mode.name}")
+        }
+    }
+
+    internal fun isAnyClientCurrentlyBlockedOrQuotaExhausted(): Boolean {
+        for ((mac, pol) in policiesByMac) {
+            if (pol.isBlocked) return true
+            if (quotaRecordsByMac[mac]?.isQuotaExceeded == true) return true
+        }
+        for (q in quotaRecordsByMac.values) {
+            if (q.isQuotaExceeded) return true
+        }
+        return false
+    }
 
     @Volatile
     var isExperimentalBpfEnabled: Boolean = true
@@ -388,6 +853,26 @@ object TunTrafficEngine {
 
     @Volatile
     var bpfPollIntervalMs: Long = BpfMapReader.DEFAULT_POLL_INTERVAL_MS
+        private set
+
+    /**
+     * Phase B controlled experiment toggle: OFF by default.
+     * When enabled, an unattributed packet due to `TUPLE_NOT_PRESENT` or `SNAPSHOT_STALE`
+     * triggers a non-blocking, single-flight, cooldown-bounded async BPF snapshot refresh.
+     */
+    @Volatile
+    var bpfRefreshOnMissEnabled: Boolean = false
+        private set
+
+    /**
+     * Phase C deep tuple & owner diagnostics toggle: OFF by default (`v0.10.4-debug`).
+     */
+    @Volatile
+    var deepTupleDiagnosticsEnabled: Boolean = false
+        private set
+
+    @Volatile
+    var unknownOwnerPacketPolicy: String = "ALLOW"
         private set
 
     @Volatile
@@ -420,6 +905,14 @@ object TunTrafficEngine {
         return HashMap(ipToMac) to HashSet(activeConnectedMacs)
     }
 
+    fun getActiveConnectedMacsSnapshot(): Set<String> = HashSet(activeConnectedMacs)
+
+    fun getBoundIpsForMac(mac: String): Set<String> =
+        macToIps[mac.uppercase().trim()]?.toSet().orEmpty()
+
+    fun getClientPolicy(mac: String): EnforcedClientPolicy? =
+        policiesByMac[mac.uppercase().trim()]
+
     /**
      * Configures the experimental BPF NAT flow attribution reader.
      */
@@ -441,6 +934,176 @@ object TunTrafficEngine {
             intervalMs = bpfPollIntervalMs,
             sessionActive = running.get() && datapathMode == DatapathMode.USERSPACE_PROXY,
         )
+        if (!enabled) {
+            maybeRecordInterfaceLifecycleState(
+                PhaseDInterfaceLifecycleState.DEGRADED_OR_STOPPED,
+                "Experimental BPF disabled",
+            )
+        } else if (downstreamIface.isBlank() || upstreamIface.isBlank()) {
+            maybeRecordInterfaceLifecycleState(
+                PhaseDInterfaceLifecycleState.WAITING_FOR_INTERFACES,
+                "Waiting for downstream/upstream interface names",
+            )
+        } else {
+            maybeRecordInterfaceLifecycleState(
+                PhaseDInterfaceLifecycleState.BINDING_INTERFACES,
+                "Binding interfaces down=$downstreamIface up=$upstreamIface",
+            )
+        }
+    }
+
+    /**
+     * Configures the Phase B controlled async refresh-on-miss experiment (OFF by default).
+     */
+    @Synchronized
+    fun configureBpfRefreshOnMiss(
+        enabled: Boolean,
+        cooldownMs: Long = BpfMapReader.DEFAULT_REFRESH_ON_MISS_COOLDOWN_MS,
+    ) {
+        bpfRefreshOnMissEnabled = enabled
+        bpfReader.refreshOnMissCooldownMs = cooldownMs.coerceIn(100L, 10_000L)
+        if (enabled) {
+            bpfReader.resetDiagnosticCounters()
+        }
+    }
+
+    /**
+     * Configures the Phase C deep tuple & owner diagnostics tracker (OFF by default).
+     */
+    @Synchronized
+    fun configureDeepTupleDiagnostics(
+        enabled: Boolean,
+        maxTrackedFlows: Int = DeepTupleDiagnosticsTracker.DEFAULT_MAX_TRACKED_FLOWS,
+        maxSampleRecords: Int = DeepTupleDiagnosticsTracker.DEFAULT_MAX_SAMPLE_RECORDS,
+        flowTtlMs: Long = DeepTupleDiagnosticsTracker.DEFAULT_FLOW_TTL_MS,
+    ) {
+        deepTupleDiagnosticsEnabled = enabled
+        deepTupleTracker.maxTrackedFlows = maxTrackedFlows.coerceIn(16, 8_192)
+        deepTupleTracker.maxSampleRecords = maxSampleRecords.coerceIn(16, 1_024)
+        deepTupleTracker.flowTtlMs = flowTtlMs.coerceIn(1_000L, 600_000L)
+        if (!enabled) {
+            deepTupleTracker.reset()
+        }
+    }
+
+    /**
+     * Resets ONLY the BPF/NAT attribution diagnostic counters while strictly preserving
+     * all active client policies, connected bindings, token buckets, pacing queues,
+     * per-client traffic counters, and persisted quota records.
+     */
+    fun resetAttributionDiagnosticsCounters() {
+        unmatchedPackets.set(0L)
+        postNatUnmatchedPackets.set(0L)
+        unknownForwardedBytes.set(0L)
+        totalEligiblePackets.set(0L)
+        totalEligibleBytes.set(0L)
+        totalAttributedPackets.set(0L)
+        totalAttributedBytes.set(0L)
+        directAttributedPackets.set(0L)
+        directAttributedBytes.set(0L)
+        bpfAttributedPackets.set(0L)
+        bpfAttributedBytes.set(0L)
+        conntrackAttributedPackets.set(0L)
+        conntrackAttributedBytes.set(0L)
+        unattributedPacketsByReason.clear()
+        unattributedBytesByReason.clear()
+        ipv4EligiblePackets.set(0L)
+        ipv4EligibleBytes.set(0L)
+        ipv4AttributedPackets.set(0L)
+        ipv4AttributedBytes.set(0L)
+        ipv4UnattributedPackets.set(0L)
+        ipv4UnattributedBytes.set(0L)
+        ipv6EligiblePackets.set(0L)
+        ipv6EligibleBytes.set(0L)
+        ipv6AttributedPackets.set(0L)
+        ipv6AttributedBytes.set(0L)
+        ipv6UnattributedPackets.set(0L)
+        ipv6UnattributedBytes.set(0L)
+        tcpEligiblePackets.set(0L)
+        tcpEligibleBytes.set(0L)
+        tcpAttributedPackets.set(0L)
+        tcpAttributedBytes.set(0L)
+        tcpUnattributedPackets.set(0L)
+        tcpUnattributedBytes.set(0L)
+        udpEligiblePackets.set(0L)
+        udpEligibleBytes.set(0L)
+        udpAttributedPackets.set(0L)
+        udpAttributedBytes.set(0L)
+        udpUnattributedPackets.set(0L)
+        udpUnattributedBytes.set(0L)
+        icmpEligiblePackets.set(0L)
+        icmpEligibleBytes.set(0L)
+        icmpAttributedPackets.set(0L)
+        icmpAttributedBytes.set(0L)
+        icmpUnattributedPackets.set(0L)
+        icmpUnattributedBytes.set(0L)
+        otherProtoEligiblePackets.set(0L)
+        otherProtoEligibleBytes.set(0L)
+        otherProtoAttributedPackets.set(0L)
+        otherProtoAttributedBytes.set(0L)
+        otherProtoUnattributedPackets.set(0L)
+        otherProtoUnattributedBytes.set(0L)
+        uploadEligiblePackets.set(0L)
+        uploadEligibleBytes.set(0L)
+        uploadAttributedPackets.set(0L)
+        uploadAttributedBytes.set(0L)
+        uploadUnattributedPackets.set(0L)
+        uploadUnattributedBytes.set(0L)
+        downloadEligiblePackets.set(0L)
+        downloadEligibleBytes.set(0L)
+        downloadAttributedPackets.set(0L)
+        downloadAttributedBytes.set(0L)
+        downloadUnattributedPackets.set(0L)
+        downloadUnattributedBytes.set(0L)
+        conntrackFallbackAttemptedCount.set(0L)
+        conntrackFallbackSucceededCount.set(0L)
+        conntrackFallbackFailedCount.set(0L)
+        conntrackPermissionDeniedCount.set(0L)
+        conntrackBackoffSkippedCount.set(0L)
+        conntrackBackoffUntilMs = 0L
+        lastConntrackResolveMs = 0L
+        postRefreshAttributedPackets.set(0L)
+        postRefreshAttributedBytes.set(0L)
+        ambiguousOrStaleLookups.set(0L)
+        localControlPackets.set(0L)
+        localControlBytes.set(0L)
+        unsupportedOrFragmentPackets.set(0L)
+        unknownForwardedAfterBlockPackets.set(0L)
+        unknownForwardedAfterBlockBytes.set(0L)
+        unknownPostBlockByProtocolAndDirection.clear()
+        unknownPostBlockBytesByProtocolAndDirection.clear()
+        establishedTcpMissingFromBpfPackets.set(0L)
+        establishedTcpMissingFromBpfBytes.set(0L)
+        establishedTcpPinnedMatchedPackets.set(0L)
+        establishedTcpPinnedMatchedBytes.set(0L)
+        tcpKeepaliveOrAckOnlyPackets.set(0L)
+        tcpSynPacketsSeen.set(0L)
+        tcpFinOrRstPacketsSeen.set(0L)
+        udp443PostBlockUnattributedPackets.set(0L)
+        udp443PostBlockUnattributedBytes.set(0L)
+        udp53PostBlockUnattributedPackets.set(0L)
+        udp53PostBlockUnattributedBytes.set(0L)
+        pinnedFlowHitsInDiagnosticMode.set(0L)
+        pinnedFlowEnforcedDropsInEnforcementMode.set(0L)
+        synchronized(phaseDEventsLock) {
+            policyTransitionEvents.clear()
+            interfaceLifecycleEvents.clear()
+            deliveryTestMarkers.clear()
+        }
+        bpfAttributor.resetDiagnosticCounters()
+        bpfReader.resetDiagnosticCounters()
+        deepTupleTracker.reset()
+        for (c in countersByMac.values) {
+            c.policyBaselinePostNatUnmatched = 0L
+            c.decisionsRecomputed.set(0L)
+            c.staleAllowCacheHitsPrevented.set(0L)
+            c.verifiedAllowedAfterBlockPackets.set(0L)
+            c.verifiedAllowedAfterBlockBytes.set(0L)
+            c.verifiedDroppedAfterBlockPackets.set(0L)
+            c.verifiedDroppedAfterBlockBytes.set(0L)
+            c.pinnedFlowEnforcedPackets.set(0L)
+            c.pinnedFlowEnforcedBytes.set(0L)
+        }
     }
 
     /**
@@ -482,24 +1145,220 @@ object TunTrafficEngine {
             else -> ExperimentalBpfState.MAPPINGS_AVAILABLE
         }
 
+        val snapshotHealth = when {
+            !isExperimentalBpfEnabled -> BpfSnapshotHealth.UNAVAILABLE
+            lastAttempt.attemptStatus == BpfCollectionStatus.PARSE_FAILURE ||
+                lastAttempt.attemptStatus == BpfCollectionStatus.TRUNCATED -> BpfSnapshotHealth.PARSE_FAILURE
+            !hasPublishedSnapshot -> BpfSnapshotHealth.UNAVAILABLE
+            isStale -> BpfSnapshotHealth.STALE
+            else -> BpfSnapshotHealth.OK
+        }
+
         var totalBlockedDrops = 0L
+        var totalBlockedBytes = 0L
         var totalShapeDrops = 0L
         var totalShapedPkts = 0L
         for (c in countersByMac.values) {
             totalBlockedDrops += c.blockedDropPackets.get()
+            totalBlockedBytes += c.droppedBytes.get()
             totalShapeDrops += c.shapingDropPackets.get()
             totalShapedPkts += c.shapedPackets.get()
         }
 
+        val reasonPacketsMap = LinkedHashMap<String, Long>()
+        val reasonBytesMap = LinkedHashMap<String, Long>()
+        for (reason in UnattributedReason.entries) {
+            val p = unattributedPacketsByReason[reason]?.get() ?: 0L
+            val b = unattributedBytesByReason[reason]?.get() ?: 0L
+            if (p > 0L || b > 0L) {
+                reasonPacketsMap[reason.name] = p
+                reasonBytesMap[reason.name] = b
+            }
+        }
+
+        var blockedClients = 0
+        var quotaExhaustedClients = 0
+        var throttledClients = 0
+        for ((mac, pol) in policiesByMac) {
+            val q = quotaRecordsByMac[mac]
+            val qExceeded = q?.isQuotaExceeded == true || pol.isQuotaOnlyBlock
+            if (pol.isNonQuotaBlocked) blockedClients++
+            if (qExceeded) quotaExhaustedClients++
+            if (pol.bandwidthLimitKbps > 0) throttledClients++
+        }
+
+        val latencyPercentiles = bpfReader.getRefreshLatencyPercentiles()
+        val deepSnap = deepTupleTracker.snapshot()
+        val nowWall = conntrackClockMillisProvider()
+        val backoffRemainingMs = (conntrackBackoffUntilMs - nowWall).coerceAtLeast(0L)
+
+        val allKnownMacs = (activeConnectedMacs + countersByMac.keys + snap.perClientCounts.map { it.mac }).sorted()
+        val perClientVerifiedSummaries = allKnownMacs.map { mac ->
+            val c = countersByMac[mac]
+            val pol = policiesByMac[mac]
+            val q = quotaRecordsByMac[mac]
+            val bpfIpv4 = snap.perClientCounts.find { it.mac == mac }?.originalIpv4.orEmpty()
+            val boundIpv4 = macToIps[mac]?.firstOrNull { !it.contains(':') }.orEmpty()
+            PerClientVerifiedTrafficSummary(
+                mac = mac,
+                originalIpv4 = bpfIpv4.ifBlank { boundIpv4 },
+                activeFlows = getAttributedFlowCount(mac),
+                verifiedUploadPackets = c?.uploadForwardedPackets?.get() ?: 0L,
+                verifiedUploadBytes = c?.txBytes?.get() ?: 0L,
+                verifiedDownloadPackets = c?.downloadForwardedPackets?.get() ?: 0L,
+                verifiedDownloadBytes = c?.rxBytes?.get() ?: 0L,
+                directIpPackets = c?.directAttributedPackets?.get() ?: 0L,
+                bpfNatPackets = c?.bpfAttributedPackets?.get() ?: 0L,
+                conntrackPackets = c?.conntrackAttributedPackets?.get() ?: 0L,
+                blockedDropPackets = c?.blockedDropPackets?.get() ?: 0L,
+                blockedDropBytes = c?.droppedBytes?.get() ?: 0L,
+                isBlocked = pol?.isNonQuotaBlocked == true,
+                isQuotaExhausted = q?.isQuotaExceeded == true || pol?.isQuotaOnlyBlock == true,
+                isThrottled = (pol?.bandwidthLimitKbps ?: 0) > 0,
+            )
+        }
+
+        val perClientPostTransitionSummaries = allKnownMacs.map { mac ->
+            val c = countersByMac[mac]
+            val pol = policiesByMac[mac]
+            val q = quotaRecordsByMac[mac]
+            val bpfIpv4 = snap.perClientCounts.find { it.mac == mac }?.originalIpv4.orEmpty()
+            val boundIpv4 = macToIps[mac]?.firstOrNull { !it.contains(':') }.orEmpty()
+            val isNonQuotaBlock = pol?.isNonQuotaBlocked == true
+            val isQuotaExhausted = q?.isQuotaExceeded == true || pol?.isQuotaOnlyBlock == true
+            val isThrottled = (pol?.bandwidthLimitKbps ?: 0) > 0
+            val restrictionKind = when {
+                isNonQuotaBlock && isQuotaExhausted -> "BLOCK+QUOTA_EXHAUSTED"
+                isNonQuotaBlock -> "BLOCK"
+                isQuotaExhausted -> "QUOTA_EXHAUSTED"
+                isThrottled -> "THROTTLED"
+                else -> "NONE"
+            }
+            PhaseDClientPostTransitionSummary(
+                mac = mac,
+                originalIpv4 = bpfIpv4.ifBlank { boundIpv4 },
+                policyGeneration = c?.policyVersion?.get() ?: 1L,
+                lastTransitionType = c?.lastTransitionType ?: "NONE",
+                lastTransitionMonoMs = c?.lastTransitionAtMonoMs ?: 0L,
+                verifiedFlowsAtTransition = c?.verifiedFlowsAtTransition ?: 0,
+                decisionsRecomputed = c?.decisionsRecomputed?.get() ?: 0L,
+                staleAllowCacheHitsPrevented = c?.staleAllowCacheHitsPrevented?.get() ?: 0L,
+                verifiedAllowedAfterBlockPackets = c?.verifiedAllowedAfterBlockPackets?.get() ?: 0L,
+                verifiedAllowedAfterBlockBytes = c?.verifiedAllowedAfterBlockBytes?.get() ?: 0L,
+                verifiedDroppedAfterBlockPackets = c?.verifiedDroppedAfterBlockPackets?.get() ?: 0L,
+                verifiedDroppedAfterBlockBytes = c?.verifiedDroppedAfterBlockBytes?.get() ?: 0L,
+                pinnedFlowEnforcedPackets = c?.pinnedFlowEnforcedPackets?.get() ?: 0L,
+                pinnedFlowEnforcedBytes = c?.pinnedFlowEnforcedBytes?.get() ?: 0L,
+            )
+        }
+
+        val currentLifecycleState = when {
+            !isExperimentalBpfEnabled || datapathMode == DatapathMode.DIRECT_TUN_FALLBACK || isMultiClientDegraded ->
+                PhaseDInterfaceLifecycleState.DEGRADED_OR_STOPPED
+            (snap.downstreamIface.ifBlank { activeDownstreamName }).isBlank() ||
+                (snap.upstreamIface.ifBlank { activeUpstreamName }).isBlank() ->
+                PhaseDInterfaceLifecycleState.WAITING_FOR_INTERFACES
+            hasPublishedSnapshot && !isStale && snap.resolvedDownstreamIfIndex > 0 && snap.resolvedUpstreamIfIndex > 0 ->
+                PhaseDInterfaceLifecycleState.ATTRIBUTION_READY
+            else ->
+                PhaseDInterfaceLifecycleState.BINDING_INTERFACES
+        }
+
+        val evidenceConfidence = when {
+            !isExperimentalBpfEnabled ||
+                snapshotHealth == BpfSnapshotHealth.UNAVAILABLE ||
+                snapshotHealth == BpfSnapshotHealth.PARSE_FAILURE ->
+                PhaseDEvidenceConfidence.PATH_NOT_OBSERVABLE
+            snapshotHealth == BpfSnapshotHealth.OK && unmatchedPackets.get() == 0L ->
+                PhaseDEvidenceConfidence.VERIFIED_OWNER
+            else ->
+                PhaseDEvidenceConfidence.UNKNOWN_OWNER
+        }
+
+        val postBlockProtoPkts = LinkedHashMap<String, Long>()
+        val postBlockProtoBytes = LinkedHashMap<String, Long>()
+        for (key in unknownPostBlockByProtocolAndDirection.keys.sorted()) {
+            val pkts = unknownPostBlockByProtocolAndDirection[key]?.get() ?: 0L
+            val bytes = unknownPostBlockBytesByProtocolAndDirection[key]?.get() ?: 0L
+            if (pkts > 0L || bytes > 0L) {
+                postBlockProtoPkts[key] = pkts
+                postBlockProtoBytes[key] = bytes
+            }
+        }
+        val u443Pkts = udp443PostBlockUnattributedPackets.get()
+        val u443Bytes = udp443PostBlockUnattributedBytes.get()
+        if (u443Pkts > 0L || u443Bytes > 0L) {
+            postBlockProtoPkts["UDP/443"] = u443Pkts
+            postBlockProtoBytes["UDP/443"] = u443Bytes
+        }
+        val u53Pkts = udp53PostBlockUnattributedPackets.get()
+        val u53Bytes = udp53PostBlockUnattributedBytes.get()
+        if (u53Pkts > 0L || u53Bytes > 0L) {
+            postBlockProtoPkts["UDP/53"] = u53Pkts
+            postBlockProtoBytes["UDP/53"] = u53Bytes
+        }
+
+        val transitionsSnap: List<PhaseDPolicyTransitionEvent>
+        val lifecycleSnap: List<PhaseDInterfaceLifecycleEvent>
+        val markersSnap: List<PhaseDDeliveryTestMarker>
+        synchronized(phaseDEventsLock) {
+            transitionsSnap = policyTransitionEvents.toList()
+            lifecycleSnap = interfaceLifecycleEvents.toList()
+            markersSnap = deliveryTestMarkers.toList()
+        }
+
+        val phaseDReport = PhaseDStatusReport(
+            phaseDMode = phaseDMode,
+            evidenceConfidence = evidenceConfidence,
+            interfaceLifecycleState = currentLifecycleState,
+            policyTransitionEvents = transitionsSnap,
+            postTransitionVerifiedClientTraffic = perClientPostTransitionSummaries,
+            unknownForwardedAfterBlockPackets = unknownForwardedAfterBlockPackets.get(),
+            unknownForwardedAfterBlockBytes = unknownForwardedAfterBlockBytes.get(),
+            unknownPostBlockByProtocolAndDirection = postBlockProtoPkts,
+            unknownPostBlockBytesByProtocolAndDirection = postBlockProtoBytes,
+            verifiedFlowsAtTransitionTotal = perClientPostTransitionSummaries.sumOf { it.verifiedFlowsAtTransition.toLong() },
+            staleAllowCacheHitsPreventedTotal = perClientPostTransitionSummaries.sumOf { it.staleAllowCacheHitsPrevented },
+            decisionsRecomputedTotal = perClientPostTransitionSummaries.sumOf { it.decisionsRecomputed },
+            verifiedAllowedAfterBlockPacketsTotal = perClientPostTransitionSummaries.sumOf { it.verifiedAllowedAfterBlockPackets },
+            verifiedAllowedAfterBlockBytesTotal = perClientPostTransitionSummaries.sumOf { it.verifiedAllowedAfterBlockBytes },
+            verifiedDroppedAfterBlockPacketsTotal = perClientPostTransitionSummaries.sumOf { it.verifiedDroppedAfterBlockPackets },
+            verifiedDroppedAfterBlockBytesTotal = perClientPostTransitionSummaries.sumOf { it.verifiedDroppedAfterBlockBytes },
+            activePinnedVerifiedFlowsCount = getVerifiedFlowPinCacheSize(),
+            pinnedFlowHitsInDiagnosticMode = pinnedFlowHitsInDiagnosticMode.get(),
+            pinnedFlowEnforcedDropsInEnforcementMode = pinnedFlowEnforcedDropsInEnforcementMode.get(),
+            queuedPacketsPurgedOnTransitionTotal = transitionsSnap.sumOf { it.queuedPacketsPurged.toLong() },
+            establishedTcpMissingFromBpfPackets = establishedTcpMissingFromBpfPackets.get(),
+            establishedTcpMissingFromBpfBytes = establishedTcpMissingFromBpfBytes.get(),
+            establishedTcpPinnedMatchedPackets = establishedTcpPinnedMatchedPackets.get(),
+            establishedTcpPinnedMatchedBytes = establishedTcpPinnedMatchedBytes.get(),
+            tcpKeepaliveOrAckOnlyPackets = tcpKeepaliveOrAckOnlyPackets.get(),
+            tcpSynPacketsSeen = tcpSynPacketsSeen.get(),
+            tcpFinOrRstPacketsSeen = tcpFinOrRstPacketsSeen.get(),
+            udp443PostBlockUnattributedPackets = u443Pkts,
+            udp443PostBlockUnattributedBytes = u443Bytes,
+            udp53PostBlockUnattributedPackets = u53Pkts,
+            udp53PostBlockUnattributedBytes = u53Bytes,
+            interfaceLifecycleEvents = lifecycleSnap,
+            deliveryTestMarkers = markersSnap,
+            lastPolicyActivatedEpochMs = markersSnap.lastOrNull { it.markerType == "POLICY_ACTIVATED" }?.timestampEpochMs ?: 0L,
+        )
+
         return BpfAttributionStatusReport(
             experimentalEnabled = isExperimentalBpfEnabled,
             state = state,
+            snapshotHealth = snapshotHealth,
             collectionStatus = snap.collectionStatus,
             collectionError = snap.collectionError,
             parserVersion = BpfDumpParser.PARSER_VERSION,
             pollIntervalMs = bpfPollIntervalMs,
+            snapshotSequence = snap.snapshotSequence,
             snapshotAgeMs = ageMs,
+            lastSuccessfulRefreshEpochMs = snap.publishedAtEpochMs,
             lastCollectionDurationMs = snap.collectionDurationMs,
+            totalCollectionsAttempted = bpfReader.totalCollectionsAttempted.get(),
+            totalCollectionsSucceeded = bpfReader.totalCollectionsSucceeded.get(),
+            totalCollectionsFailed = bpfReader.totalCollectionsFailed.get(),
             sessionGeneration = snap.sessionGeneration,
             bindingGeneration = snap.bindingGeneration,
             downstreamIface = snap.downstreamIface.ifBlank { activeDownstreamName },
@@ -544,19 +1403,123 @@ object TunTrafficEngine {
             lastAttemptRejectedLineCount = lastAttempt.rejectedLineCount,
             lastAttemptRejectedByReason = lastAttempt.rejectedByReason,
             lastAttemptRejectedLines = lastAttempt.rejectedLines,
+            snapshotPublishRejectedByReason = bpfAttributor.getPublishRejectedByReasonSnapshot(),
+            totalEligiblePackets = totalEligiblePackets.get(),
+            totalEligibleBytes = totalEligibleBytes.get(),
+            totalAttributedPackets = totalAttributedPackets.get(),
+            totalAttributedBytes = totalAttributedBytes.get(),
             directAttributedPackets = directAttributedPackets.get(),
+            directAttributedBytes = directAttributedBytes.get(),
             bpfAttributedPackets = bpfAttributedPackets.get(),
+            bpfAttributedBytes = bpfAttributedBytes.get(),
             conntrackAttributedPackets = conntrackAttributedPackets.get(),
+            conntrackAttributedBytes = conntrackAttributedBytes.get(),
             unknownForwardedPackets = unmatchedPackets.get(),
             unknownForwardedBytes = unknownForwardedBytes.get(),
+            unattributedPacketsByReason = reasonPacketsMap,
+            unattributedBytesByReason = reasonBytesMap,
+            trafficSplit = BpfTrafficSplitCounters(
+                ipv4EligiblePackets = ipv4EligiblePackets.get(),
+                ipv4EligibleBytes = ipv4EligibleBytes.get(),
+                ipv4AttributedPackets = ipv4AttributedPackets.get(),
+                ipv4AttributedBytes = ipv4AttributedBytes.get(),
+                ipv4UnattributedPackets = ipv4UnattributedPackets.get(),
+                ipv4UnattributedBytes = ipv4UnattributedBytes.get(),
+                ipv6EligiblePackets = ipv6EligiblePackets.get(),
+                ipv6EligibleBytes = ipv6EligibleBytes.get(),
+                ipv6AttributedPackets = ipv6AttributedPackets.get(),
+                ipv6AttributedBytes = ipv6AttributedBytes.get(),
+                ipv6UnattributedPackets = ipv6UnattributedPackets.get(),
+                ipv6UnattributedBytes = ipv6UnattributedBytes.get(),
+                tcpEligiblePackets = tcpEligiblePackets.get(),
+                tcpEligibleBytes = tcpEligibleBytes.get(),
+                tcpAttributedPackets = tcpAttributedPackets.get(),
+                tcpAttributedBytes = tcpAttributedBytes.get(),
+                tcpUnattributedPackets = tcpUnattributedPackets.get(),
+                tcpUnattributedBytes = tcpUnattributedBytes.get(),
+                udpEligiblePackets = udpEligiblePackets.get(),
+                udpEligibleBytes = udpEligibleBytes.get(),
+                udpAttributedPackets = udpAttributedPackets.get(),
+                udpAttributedBytes = udpAttributedBytes.get(),
+                udpUnattributedPackets = udpUnattributedPackets.get(),
+                udpUnattributedBytes = udpUnattributedBytes.get(),
+                icmpEligiblePackets = icmpEligiblePackets.get(),
+                icmpEligibleBytes = icmpEligibleBytes.get(),
+                icmpAttributedPackets = icmpAttributedPackets.get(),
+                icmpAttributedBytes = icmpAttributedBytes.get(),
+                icmpUnattributedPackets = icmpUnattributedPackets.get(),
+                icmpUnattributedBytes = icmpUnattributedBytes.get(),
+                otherProtoEligiblePackets = otherProtoEligiblePackets.get(),
+                otherProtoEligibleBytes = otherProtoEligibleBytes.get(),
+                otherProtoAttributedPackets = otherProtoAttributedPackets.get(),
+                otherProtoAttributedBytes = otherProtoAttributedBytes.get(),
+                otherProtoUnattributedPackets = otherProtoUnattributedPackets.get(),
+                otherProtoUnattributedBytes = otherProtoUnattributedBytes.get(),
+                uploadEligiblePackets = uploadEligiblePackets.get(),
+                uploadEligibleBytes = uploadEligibleBytes.get(),
+                uploadAttributedPackets = uploadAttributedPackets.get(),
+                uploadAttributedBytes = uploadAttributedBytes.get(),
+                uploadUnattributedPackets = uploadUnattributedPackets.get(),
+                uploadUnattributedBytes = uploadUnattributedBytes.get(),
+                downloadEligiblePackets = downloadEligiblePackets.get(),
+                downloadEligibleBytes = downloadEligibleBytes.get(),
+                downloadAttributedPackets = downloadAttributedPackets.get(),
+                downloadAttributedBytes = downloadAttributedBytes.get(),
+                downloadUnattributedPackets = downloadUnattributedPackets.get(),
+                downloadUnattributedBytes = downloadUnattributedBytes.get(),
+            ),
+            conntrackFallbackAttemptedCount = conntrackFallbackAttemptedCount.get(),
+            conntrackFallbackSucceededCount = conntrackFallbackSucceededCount.get(),
+            conntrackFallbackFailedCount = conntrackFallbackFailedCount.get(),
+            conntrackPermissionDeniedCount = conntrackPermissionDeniedCount.get(),
+            conntrackBackoffActive = backoffRemainingMs > 0L,
+            conntrackBackoffRemainingMs = backoffRemainingMs,
+            conntrackBackoffSkippedCount = conntrackBackoffSkippedCount.get(),
+            activeConnectedClientsCount = activeConnectedMacs.size,
+            blockedClientsCount = blockedClients,
+            quotaExhaustedClientsCount = quotaExhaustedClients,
+            throttledClientsCount = throttledClients,
+            bpfRefreshOnMissEnabled = bpfRefreshOnMissEnabled,
+            refreshOnMissCooldownMs = bpfReader.refreshOnMissCooldownMs,
+            refreshCircuitBreakerState = bpfReader.circuitBreakerState.name,
+            refreshOnMissTriggeredCount = bpfReader.refreshOnMissTriggeredCount.get(),
+            refreshOnMissCoalescedInFlightCount = bpfReader.refreshOnMissCoalescedInFlightCount.get(),
+            refreshOnMissSuppressedCooldownCount = bpfReader.refreshOnMissSuppressedCooldownCount.get(),
+            refreshOnMissCompletedCount = bpfReader.refreshOnMissCompletedCount.get(),
+            missRefreshFailedCount = bpfReader.missRefreshFailedCount.get(),
+            missRefreshSuppressedBreakerCount = bpfReader.missRefreshSuppressedBreakerCount.get(),
+            missRefreshSuppressedIneligibleCount = bpfReader.missRefreshSuppressedIneligibleCount.get(),
+            missRefreshQueueOverflowCount = bpfReader.missRefreshQueueOverflowCount.get(),
+            refreshOnMissLastLatencyMs = bpfReader.refreshOnMissLastLatencyMs.get(),
+            missRefreshLatency = latencyPercentiles,
+            postRefreshAttributedPackets = postRefreshAttributedPackets.get(),
+            postRefreshAttributedBytes = postRefreshAttributedBytes.get(),
+            postRefreshFlowKeysResolved = deepSnap.postRefreshFlowKeysResolved,
+            postRefreshFirstSubsequentAttributedPackets = deepSnap.postRefreshFirstSubsequentAttributedPackets,
+            postRefreshFirstSubsequentAttributedBytes = deepSnap.postRefreshFirstSubsequentAttributedBytes,
+            refreshOnMissAutoDisabled = bpfReader.refreshOnMissAutoDisabled,
+            refreshOnMissAutoDisableReason = bpfReader.refreshOnMissAutoDisableReason,
+            deepTupleDiagnosticsEnabled = deepTupleDiagnosticsEnabled,
+            unknownOwnerPacketPolicy = unknownOwnerPacketPolicy,
+            deepTupleDiagnostics = deepSnap,
+            perClientVerifiedSummaries = perClientVerifiedSummaries,
             ambiguousOrStaleLookups = ambiguousOrStaleLookups.get(),
             localControlPackets = localControlPackets.get(),
+            localControlBytes = localControlBytes.get(),
             unsupportedOrFragmentPackets = unsupportedOrFragmentPackets.get(),
             blockedDropPackets = totalBlockedDrops,
+            blockedDropBytes = totalBlockedBytes,
             shapingDropPackets = totalShapeDrops,
             shapedPackets = totalShapedPkts,
             rejectedOldGenerationCount = bpfAttributor.rejectedOldGenerationCount.get(),
             tupleReuseGuardTriggeredCount = bpfAttributor.tupleReuseGuardTriggeredCount.get(),
+            phaseD = phaseDReport,
+            preNatDiagnostics = ExclusiveBlockingModeController.buildDiagnosticReport(),
+            softApDiagnostics = ExclusiveBlockingModeController.buildSoftApDiagnosticReport(),
+            domainDiagnostics = DomainFilterEngine.buildDiagnosticReport(
+                legacyPreNatMigrated = true,
+                legacyPreNatCleanupClean = ExclusiveBlockingModeController.legacyPreNatCleanupVerified,
+            ),
         )
     }
 
@@ -572,9 +1535,22 @@ object TunTrafficEngine {
     ): ParcelFileDescriptor? {
         stop()
         activeUpstreamName = upstreamInterfaceName
-        bpfAttributor.onSessionOrUpstreamChanged(
+        synchronized(verifiedFlowPinsLock) {
+            verifiedFlowPins.clear()
+        }
+        val newGen = bpfAttributor.onSessionOrUpstreamChanged(
             downstreamIface = activeDownstreamName,
             upstreamIface = upstreamInterfaceName,
+        )
+        ExclusiveBlockingModeController.onSessionOrInterfacesChanged(
+            downstreamIface = activeDownstreamName,
+            upstreamIface = upstreamInterfaceName,
+            newSessionGeneration = newGen,
+        )
+        maybeRecordInterfaceLifecycleState(
+            if (activeDownstreamName.isBlank()) PhaseDInterfaceLifecycleState.WAITING_FOR_INTERFACES else PhaseDInterfaceLifecycleState.BINDING_INTERFACES,
+            "Attach userspace proxy upstream=$upstreamInterfaceName downstream=$activeDownstreamName",
+            force = true,
         )
 
         return runCatching {
@@ -650,6 +1626,11 @@ object TunTrafficEngine {
         activeUpstreamName = upstreamInterfaceName
         datapathMode = DatapathMode.DIRECT_TUN_FALLBACK
         fallbackReason = reason
+        maybeRecordInterfaceLifecycleState(
+            PhaseDInterfaceLifecycleState.DEGRADED_OR_STOPPED,
+            "Direct TUN fallback: $reason",
+            force = true,
+        )
         SessionLog.warn(
             "Datapath: mode=DIRECT_TUN_FALLBACK attached=false upstream=$upstreamInterfaceName reason=$reason",
         )
@@ -660,6 +1641,10 @@ object TunTrafficEngine {
         stopInternal()
         datapathMode = DatapathMode.INACTIVE
         fallbackReason = null
+        maybeRecordInterfaceLifecycleState(
+            PhaseDInterfaceLifecycleState.DEGRADED_OR_STOPPED,
+            "Userspace proxy stopped",
+        )
     }
 
     private fun stopInternal() {
@@ -692,6 +1677,9 @@ object TunTrafficEngine {
         macToIps.clear()
         flowToMacCache.clear()
         flowTimestamps.clear()
+        synchronized(verifiedFlowPinsLock) {
+            verifiedFlowPins.clear()
+        }
         lastLoggedClientMap.clear()
         uploadBucketsByMac.clear()
         downloadBucketsByMac.clear()
@@ -699,22 +1687,29 @@ object TunTrafficEngine {
         sampleLogTimestamps.clear()
         totalUploadPackets.set(0L)
         totalDownloadPackets.set(0L)
-        unmatchedPackets.set(0L)
-        postNatUnmatchedPackets.set(0L)
-        unknownForwardedBytes.set(0L)
-        directAttributedPackets.set(0L)
-        bpfAttributedPackets.set(0L)
-        conntrackAttributedPackets.set(0L)
-        ambiguousOrStaleLookups.set(0L)
-        localControlPackets.set(0L)
-        unsupportedOrFragmentPackets.set(0L)
+        bpfRefreshOnMissEnabled = false
+        deepTupleDiagnosticsEnabled = false
+        phaseDMode = PhaseDEnforcementMode.DIAGNOSTIC
+        bpfNatVpnEnforcementEnabled = true
+        conntrackBackoffUntilMs = 0L
+        lastConntrackResolveMs = 0L
+        resetAttributionDiagnosticsCounters()
         bpfAttributor.onSessionOrUpstreamChanged("", "")
         isConntrackAvailable = false
         lastConntrackReadStatus = "NOT_TESTED"
         lastConntrackPollLatencyMs = 0L
         lastConntrackParsedFlows = 0
         isMultiClientDegraded = false
+        DomainFilterEngine.replaceAllRules(emptyList())
+        DomainFilterEngine.resetVolatileSessionState()
     }
+
+    fun updateDomainRules(rules: List<DomainRule>): Long {
+        DomainFilterEngine.replaceAllRules(rules)
+        return DomainFilterEngine.currentRuleGeneration()
+    }
+
+    fun getBpfStatusReport(): BpfAttributionStatusReport = getBpfAttributionReport()
 
     fun resetClientDropCounters(mac: String) {
         val cleanMac = mac.uppercase().trim()
@@ -894,7 +1889,12 @@ object TunTrafficEngine {
                     SessionLog.info(
                         "Quota: mac=$cleanMac calendar period rolled over (${existing.windowId} -> ${rolled.windowId}); usage reset to 0 B",
                     )
+                    ExclusiveBlockingModeController.softApEngine.removeClientBlockReasonOverride(
+                        cleanMac,
+                        SoftApClientBlockReason.QUOTA_EXHAUSTED,
+                    )
                     flushQuotaCheckpointNow()
+                    HostFirewall.reconcileSoftApFromQuotaChange()
                 }
             }
             return rolled
@@ -935,6 +1935,8 @@ object TunTrafficEngine {
         countersByMac[cleanMac]?.let { counters ->
             counters.rxBytes.set(0L)
             counters.txBytes.set(0L)
+            counters.uploadForwardedPackets.set(0L)
+            counters.downloadForwardedPackets.set(0L)
             counters.quotaDropPackets.set(0L)
             counters.policyVersion.incrementAndGet()
             counters.policyVersionBlockedDrops.set(0L)
@@ -942,6 +1944,10 @@ object TunTrafficEngine {
                 counters.droppedPackets.set(0L)
                 counters.blockedDropPackets.set(0L)
                 counters.droppedBytes.set(0L)
+                counters.verifiedDroppedAfterBlockPackets.set(0L)
+                counters.verifiedDroppedAfterBlockBytes.set(0L)
+                counters.verifiedAllowedAfterBlockPackets.set(0L)
+                counters.verifiedAllowedAfterBlockBytes.set(0L)
             }
         }
 
@@ -955,7 +1961,19 @@ object TunTrafficEngine {
             }
         }
 
+        recordPolicyTransitionEvent(
+            transitionType = "QUOTA_RESET",
+            mac = cleanMac,
+            verifiedFlows = getAttributedFlowCount(cleanMac),
+            queueInvalidated = 0,
+            detail = "resetGeneration=${updated.resetGeneration}",
+        )
+        ExclusiveBlockingModeController.softApEngine.removeClientBlockReasonOverride(
+            cleanMac,
+            SoftApClientBlockReason.QUOTA_EXHAUSTED,
+        )
         flushQuotaCheckpointNow()
+        HostFirewall.reconcileSoftApFromQuotaChange()
         SessionLog.info("Quota: mac=$cleanMac usage manually reset to 0 B (generation=${updated.resetGeneration})")
         return updated
     }
@@ -1027,10 +2045,36 @@ object TunTrafficEngine {
         }
 
         if (crossedLimit) {
+            val counters = countersByMac.getOrPut(cleanMac) { ClientTrafficCounters(cleanMac) }
+            counters.policyVersion.incrementAndGet()
+            counters.policyVersionBlockedDrops.set(0L)
+            counters.policyBaselinePostNatUnmatched = postNatUnmatchedPackets.get()
+            var queuePurged = 0
+            if (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT) {
+                val effectivePol = policy ?: policiesByMac[cleanMac] ?: EnforcedClientPolicy(
+                    mac = cleanMac,
+                    isBlocked = true,
+                    blockReason = "Data limit reached",
+                    dataLimitBytes = updated.sanitizedLimitBytes,
+                )
+                queuePurged = reconcileQueuedPacketsForPolicyChange(cleanMac, effectivePol, counters)
+            }
+            recordPolicyTransitionEvent(
+                transitionType = "QUOTA_EXHAUSTED",
+                mac = cleanMac,
+                verifiedFlows = getAttributedFlowCount(cleanMac),
+                queueInvalidated = queuePurged,
+                detail = DataQuota.formatUsageSummary(updated.usedTotalBytes, updated.sanitizedLimitBytes),
+            )
             SessionLog.info(
                 "Quota: mac=$cleanMac reached data limit (${DataQuota.formatUsageSummary(updated.usedTotalBytes, updated.sanitizedLimitBytes)}) period=${updated.resetPeriod.displayName}",
             )
+            ExclusiveBlockingModeController.softApEngine.addClientBlockReasonOverride(
+                cleanMac,
+                SoftApClientBlockReason.QUOTA_EXHAUSTED,
+            )
             maybeFlushQuotaCheckpoint(nowMs, force = true)
+            HostFirewall.reconcileSoftApFromQuotaChange()
         } else {
             unflushedQuotaBytes.addAndGet(packetBytes.coerceAtLeast(0).toLong())
             maybeFlushQuotaCheckpoint(nowMs, force = false)
@@ -1064,6 +2108,7 @@ object TunTrafficEngine {
                 flowTimestamps.remove(flowKey)
             }
         }
+        removed += invalidateVerifiedFlowPinsForMac(cleanMac)
         countersByMac[cleanMac]?.let { counters ->
             counters.policyVersion.incrementAndGet()
             counters.policyVersionBlockedDrops.set(0L)
@@ -1076,6 +2121,9 @@ object TunTrafficEngine {
     fun clearFlowCache() {
         flowToMacCache.clear()
         flowTimestamps.clear()
+        synchronized(verifiedFlowPinsLock) {
+            verifiedFlowPins.clear()
+        }
     }
 
     fun getAttributedFlowCount(mac: String? = null): Int {
@@ -1086,7 +2134,10 @@ object TunTrafficEngine {
         val clean = mac.uppercase().trim()
         val cacheCount = flowToMacCache.values.count { it == clean }
         val bpfCount = snap.flowsByTuple.values.count { it.verifiedMac == clean }
-        return cacheCount + bpfCount
+        val pinCount = synchronized(verifiedFlowPinsLock) {
+            verifiedFlowPins.values.count { it.verifiedMac == clean && it.flowKey !in snap.flowsByTuple }
+        }
+        return cacheCount + bpfCount + pinCount
     }
 
     /**
@@ -1111,7 +2162,16 @@ object TunTrafficEngine {
             for (pkt in drained) {
                 refundQuotaBytes(disconnectedMac, pkt.length, pkt.isUpload)
             }
+            invalidateVerifiedFlowPinsForMac(disconnectedMac)
+            recordPolicyTransitionEvent(
+                transitionType = "CLIENT_DISCONNECT",
+                mac = disconnectedMac,
+                verifiedFlows = 0,
+                queueInvalidated = drained.size,
+                detail = "Client disconnected from downstream interface",
+            )
         }
+        val newlyConnectedMacs = currentConnectedMacs - previousConnectedMacs
         activeConnectedMacs.retainAll(currentConnectedMacs)
         activeConnectedMacs.addAll(currentConnectedMacs)
 
@@ -1154,6 +2214,7 @@ object TunTrafficEngine {
             }
 
             val existingSet = macToIps.getOrPut(mac) { ConcurrentHashMap.newKeySet() }
+            val previousIpsForMac = existingSet.toSet()
             existingSet.removeIf { oldIp ->
                 if (oldIp !in verifiedIps) {
                     ipToMac.remove(oldIp, mac)
@@ -1164,6 +2225,7 @@ object TunTrafficEngine {
                 val previousMac = ipToMac.put(ip, mac)
                 if (previousMac != null && previousMac != mac) {
                     macToIps[previousMac]?.remove(ip)
+                    invalidateVerifiedFlowPinsForMac(previousMac)
                 }
                 existingSet.add(ip)
             }
@@ -1171,6 +2233,25 @@ object TunTrafficEngine {
             countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
 
             val sortedIps = existingSet.sorted()
+            if (mac in newlyConnectedMacs) {
+                recordPolicyTransitionEvent(
+                    transitionType = "CLIENT_RECONNECT",
+                    mac = mac,
+                    verifiedFlows = getAttributedFlowCount(mac),
+                    queueInvalidated = 0,
+                    detail = "ips=[${sortedIps.joinToString(",")}]",
+                )
+            } else if (previousIpsForMac.isNotEmpty() && previousIpsForMac != existingSet.toSet()) {
+                invalidateVerifiedFlowPinsForMac(mac)
+                recordPolicyTransitionEvent(
+                    transitionType = "IP_MAC_BINDING_CHANGED",
+                    mac = mac,
+                    verifiedFlows = getAttributedFlowCount(mac),
+                    queueInvalidated = 0,
+                    detail = "ips=[${sortedIps.joinToString(",")}]",
+                )
+            }
+
             val mapSignature = "${host.interfaceName}:${sortedIps.joinToString(",")}"
             if (lastLoggedClientMap[mac] != mapSignature) {
                 lastLoggedClientMap[mac] = mapSignature
@@ -1181,8 +2262,26 @@ object TunTrafficEngine {
         }
 
         if (detectedDownstreamIface.isNotBlank() && detectedDownstreamIface != activeDownstreamName) {
+            val prevDown = activeDownstreamName
             activeDownstreamName = detectedDownstreamIface
             bpfAttributor.syncInterfaces(activeDownstreamName, activeUpstreamName)
+            ExclusiveBlockingModeController.onSessionOrInterfacesChanged(
+                downstreamIface = activeDownstreamName,
+                upstreamIface = activeUpstreamName,
+                newSessionGeneration = bpfAttributor.currentSessionGeneration,
+            )
+            recordPolicyTransitionEvent(
+                transitionType = "INTERFACE_REBIND",
+                mac = "GLOBAL",
+                verifiedFlows = getAttributedFlowCount(null),
+                queueInvalidated = 0,
+                detail = "downstream=${prevDown.ifBlank { "none" }}->$activeDownstreamName upstream=$activeUpstreamName",
+            )
+            maybeRecordInterfaceLifecycleState(
+                if (activeUpstreamName.isBlank()) PhaseDInterfaceLifecycleState.WAITING_FOR_INTERFACES else PhaseDInterfaceLifecycleState.BINDING_INTERFACES,
+                "Downstream interface bound: $activeDownstreamName",
+                force = true,
+            )
         }
         if (previousConnectedMacs != currentConnectedMacs || previousIpToMac != ipToMac) {
             bpfAttributor.onClientBindingsUpdated()
@@ -1228,7 +2327,54 @@ object TunTrafficEngine {
                 counters.policyVersionBlockedDrops.set(0L)
                 counters.policyVersionShapedPackets.set(0L)
                 counters.policyBaselinePostNatUnmatched = postNatUnmatchedPackets.get()
-                reconcileQueuedPacketsForPolicyChange(mac, policy, counters)
+                val queueInvalidated = reconcileQueuedPacketsForPolicyChange(mac, policy, counters)
+                val verifiedFlowsNow = getAttributedFlowCount(mac)
+                val wasNonQuotaBlocked = oldPolicy?.isNonQuotaBlocked == true
+                val wasQuotaBlocked = oldPolicy?.isQuotaOnlyBlock == true
+                val wasAnyBlocked = oldPolicy?.isBlocked == true
+                when {
+                    !wasNonQuotaBlocked && policy.isNonQuotaBlocked -> {
+                        counters.verifiedAllowedAfterBlockPackets.set(0L)
+                        counters.verifiedAllowedAfterBlockBytes.set(0L)
+                        counters.verifiedDroppedAfterBlockPackets.set(0L)
+                        counters.verifiedDroppedAfterBlockBytes.set(0L)
+                        if (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT && bpfRefreshOnMissEnabled) {
+                            bpfReader.requestAsyncRefreshOnMiss(UnattributedReason.TUPLE_NOT_PRESENT)
+                        }
+                        recordPolicyTransitionEvent(
+                            transitionType = "ALLOW_TO_BLOCK",
+                            mac = mac,
+                            verifiedFlows = verifiedFlowsNow,
+                            queueInvalidated = queueInvalidated,
+                            detail = policy.blockReason ?: "Manually blocked",
+                        )
+                    }
+                    !wasQuotaBlocked && policy.isQuotaOnlyBlock -> {
+                        counters.verifiedAllowedAfterBlockPackets.set(0L)
+                        counters.verifiedAllowedAfterBlockBytes.set(0L)
+                        counters.verifiedDroppedAfterBlockPackets.set(0L)
+                        counters.verifiedDroppedAfterBlockBytes.set(0L)
+                        if (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT && bpfRefreshOnMissEnabled) {
+                            bpfReader.requestAsyncRefreshOnMiss(UnattributedReason.TUPLE_NOT_PRESENT)
+                        }
+                        recordPolicyTransitionEvent(
+                            transitionType = "QUOTA_EXHAUSTED",
+                            mac = mac,
+                            verifiedFlows = verifiedFlowsNow,
+                            queueInvalidated = queueInvalidated,
+                            detail = policy.blockReason ?: "Data limit reached",
+                        )
+                    }
+                    wasAnyBlocked && !policy.isBlocked -> {
+                        recordPolicyTransitionEvent(
+                            transitionType = "UNBLOCK",
+                            mac = mac,
+                            verifiedFlows = verifiedFlowsNow,
+                            queueInvalidated = queueInvalidated,
+                            detail = "Unblocked",
+                        )
+                    }
+                }
             }
             if (oldPolicy != null && oldPolicy.isBlocked && !policy.isBlocked) {
                 // Client transitioned from blocked to allowed: reset drop/match counters and purge cached flows
@@ -1238,6 +2384,10 @@ object TunTrafficEngine {
                 counters.quotaDropPackets.set(0L)
                 counters.droppedBytes.set(0L)
                 counters.matchedPackets.set(0L)
+                counters.verifiedAllowedAfterBlockPackets.set(0L)
+                counters.verifiedAllowedAfterBlockBytes.set(0L)
+                counters.verifiedDroppedAfterBlockPackets.set(0L)
+                counters.verifiedDroppedAfterBlockBytes.set(0L)
                 for ((flowKey, mappedMac) in flowToMacCache.entries.toList()) {
                     if (mappedMac == mac) {
                         flowToMacCache.remove(flowKey, mappedMac)
@@ -1312,6 +2462,10 @@ object TunTrafficEngine {
         if (degraded != isMultiClientDegraded) {
             isMultiClientDegraded = degraded
             if (degraded) {
+                maybeRecordInterfaceLifecycleState(
+                    PhaseDInterfaceLifecycleState.DEGRADED_OR_STOPPED,
+                    "Multi-client NAT isolation degraded",
+                )
                 SessionLog.warn(
                     "Degraded: multi-client userspace NAT isolation degraded (conntrack, kernel netfilter, and fresh BPF mappings unavailable)",
                 )
@@ -1340,6 +2494,7 @@ object TunTrafficEngine {
                 )
             }
         }
+        ExclusiveBlockingModeController.onPoliciesUpdated()
     }
 
     /**
@@ -1350,18 +2505,30 @@ object TunTrafficEngine {
         mac: String,
         newPolicy: EnforcedClientPolicy,
         counters: ClientTrafficCounters,
-    ) {
-        val queue = pacingQueuesByMac[mac] ?: return
-        if (newPolicy.isNonQuotaBlocked) {
-            val cancelled = queue.drainAll()
-            for (pkt in cancelled) {
+    ): Int {
+        val queue = pacingQueuesByMac[mac] ?: return 0
+        val quotaExceeded = quotaRecordsByMac[mac]?.isQuotaExceeded == true || newPolicy.isQuotaOnlyBlock
+        val shouldPurge = newPolicy.isNonQuotaBlocked ||
+            (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT && (newPolicy.isBlocked || quotaExceeded))
+        if (!shouldPurge) return 0
+        val cancelled = queue.drainAll()
+        for (pkt in cancelled) {
+            if (newPolicy.isNonQuotaBlocked) {
                 refundQuotaBytes(mac, pkt.length, pkt.isUpload)
-                counters.droppedPackets.incrementAndGet()
-                counters.blockedDropPackets.incrementAndGet()
-                counters.policyVersionBlockedDrops.incrementAndGet()
-                counters.droppedBytes.addAndGet(pkt.length.toLong())
             }
+            counters.droppedPackets.incrementAndGet()
+            counters.blockedDropPackets.incrementAndGet()
+            counters.policyVersionBlockedDrops.incrementAndGet()
+            if (quotaExceeded && !newPolicy.isNonQuotaBlocked) {
+                counters.quotaDropPackets.incrementAndGet()
+            }
+            counters.droppedBytes.addAndGet(pkt.length.toLong())
+            counters.decisionsRecomputed.incrementAndGet()
+            counters.staleAllowCacheHitsPrevented.incrementAndGet()
+            counters.verifiedDroppedAfterBlockPackets.incrementAndGet()
+            counters.verifiedDroppedAfterBlockBytes.addAndGet(pkt.length.toLong())
         }
+        return cancelled.size
     }
 
     fun getQueuedPacketCountForClient(mac: String): Int {
@@ -1486,20 +2653,44 @@ object TunTrafficEngine {
             while (true) {
                 val pkt = queue.pollIfDue(nowNs) ?: break
                 val currentPolicy = policiesByMac[mac]
+                val quotaRecord = quotaRecordsByMac[mac]
                 val counters = countersByMac.getOrPut(mac) { ClientTrafficCounters(mac) }
+                val isNonQuotaBlocked = currentPolicy != null && currentPolicy.isNonQuotaBlocked
+                val isQuotaBlocked = (currentPolicy?.isQuotaOnlyBlock == true) || (quotaRecord?.isQuotaExceeded == true)
+                val isVersionStale = pkt.policyVersionAtEnqueue != counters.policyVersion.get()
+                val shouldDropInCurrentMode = bpfNatVpnEnforcementEnabled && (
+                    isNonQuotaBlocked ||
+                        (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT &&
+                            (isQuotaBlocked || (isVersionStale && (currentPolicy?.isBlocked == true || isQuotaBlocked))))
+                    )
                 // Re-evaluate current policy before releasing a queued packet
-                if (currentPolicy != null && currentPolicy.isNonQuotaBlocked) {
-                    refundQuotaBytes(mac, pkt.length, pkt.isUpload)
+                if (shouldDropInCurrentMode) {
+                    if (isNonQuotaBlocked) {
+                        refundQuotaBytes(mac, pkt.length, pkt.isUpload)
+                    }
                     counters.droppedPackets.incrementAndGet()
                     counters.blockedDropPackets.incrementAndGet()
                     counters.policyVersionBlockedDrops.incrementAndGet()
+                    if (isQuotaBlocked && !isNonQuotaBlocked) {
+                        counters.quotaDropPackets.incrementAndGet()
+                    }
                     counters.droppedBytes.addAndGet(pkt.length.toLong())
+                    counters.decisionsRecomputed.incrementAndGet()
+                    counters.staleAllowCacheHitsPrevented.incrementAndGet()
+                    counters.verifiedDroppedAfterBlockPackets.incrementAndGet()
+                    counters.verifiedDroppedAfterBlockBytes.addAndGet(pkt.length.toLong())
                     continue
+                }
+                if (isNonQuotaBlocked || isQuotaBlocked) {
+                    counters.verifiedAllowedAfterBlockPackets.incrementAndGet()
+                    counters.verifiedAllowedAfterBlockBytes.addAndGet(pkt.length.toLong())
                 }
                 counters.forwardedPackets.incrementAndGet()
                 if (pkt.isUpload) {
+                    counters.uploadForwardedPackets.incrementAndGet()
                     counters.txBytes.addAndGet(pkt.length.toLong())
                 } else {
+                    counters.downloadForwardedPackets.incrementAndGet()
                     counters.rxBytes.addAndGet(pkt.length.toLong())
                 }
                 pkt.targetFd?.let { fd ->
@@ -1529,8 +2720,19 @@ object TunTrafficEngine {
                 val meta = parsePacketMeta(buf, n)
                 if (meta != null) {
                     val attr = resolveClientMacWithSource(meta, isUpload = true)
-                    val detail = evaluateAndShapeDetailed(meta, attr.mac, isUpload = true, attributionSource = attr.source)
+                    val detail = evaluateAndShapeDetailed(
+                        meta = meta,
+                        matchedMac = attr.mac,
+                        isUpload = true,
+                        attributionSource = attr.source,
+                        rawPacket = buf,
+                        rawLength = n,
+                    )
                     if (detail.decision == PacketDecision.DROP || detail.decision == PacketDecision.DROP_AQM) {
+                        val synthResp = detail.domainDecision?.synthesizedDnsResponse
+                        if (synthResp != null && synthResp.isNotEmpty()) {
+                            writePacket(tunFd, synthResp, synthResp.size)
+                        }
                         continue
                     }
                     if (detail.decision == PacketDecision.RATE_LIMIT && attr.mac != null && detail.paceDelayMs > 0L) {
@@ -1694,15 +2896,27 @@ object TunTrafficEngine {
         resolveClientMacWithSource(meta, isUpload).mac
 
     /**
-     * Resolves which verified connected client MAC owns [meta] and records the attribution source.
+     * Resolves which verified connected client MAC owns [meta] and records the attribution source
+     * and structured [UnattributedReason] without altering datapath forwarding decisions.
      */
     internal fun resolveClientMacWithSource(meta: PacketMeta, isUpload: Boolean): PacketAttribution {
+        fun record(attr: PacketAttribution): PacketAttribution {
+            meta.resolvedAttribution = attr
+            return attr
+        }
+
         if (isLinkLocalMulticastControl(meta)) {
-            return PacketAttribution(null, AttributionSource.UNMATCHED_UNKNOWN)
+            return record(PacketAttribution(null, AttributionSource.UNMATCHED_UNKNOWN, unattributedReason = null))
         }
         if (meta.isNonInitialFragment) {
             unsupportedOrFragmentPackets.incrementAndGet()
-            return PacketAttribution(null, AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT)
+            return record(
+                PacketAttribution(
+                    mac = null,
+                    source = AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT,
+                    unattributedReason = UnattributedReason.NON_INITIAL_FRAGMENT,
+                ),
+            )
         }
 
         val tetherSideIp = if (isUpload) meta.srcIp else meta.dstIp
@@ -1715,13 +2929,13 @@ object TunTrafficEngine {
         // 1. Direct lookup in verified IP -> MAC table
         ipToMac[tetherSideIp]?.let { mac ->
             if (mac in activeConnectedMacs) {
-                return PacketAttribution(mac, AttributionSource.DIRECT_IP)
+                return record(PacketAttribution(mac, AttributionSource.DIRECT_IP))
             }
         }
         if (normalizedTetherIp.isNotEmpty() && normalizedTetherIp != tetherSideIp) {
             ipToMac[normalizedTetherIp]?.let { mac ->
                 if (mac in activeConnectedMacs) {
-                    return PacketAttribution(mac, AttributionSource.DIRECT_IP)
+                    return record(PacketAttribution(mac, AttributionSource.DIRECT_IP))
                 }
             }
         }
@@ -1731,16 +2945,45 @@ object TunTrafficEngine {
             // Non-TCP/UDP protocols on post-NAT cannot be disambiguated by transport ports
             if (meta.protocol != 6 && meta.protocol != 17) {
                 unsupportedOrFragmentPackets.incrementAndGet()
-                return PacketAttribution(null, AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT)
+                return record(
+                    PacketAttribution(
+                        mac = null,
+                        source = AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT,
+                        unattributedReason = UnattributedReason.UNSUPPORTED_PROTOCOL,
+                    ),
+                )
             }
             if (tetherSidePort !in 1..65535 || remoteSidePort !in 1..65535) {
                 unsupportedOrFragmentPackets.incrementAndGet()
-                return PacketAttribution(null, AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT)
+                return record(
+                    PacketAttribution(
+                        mac = null,
+                        source = AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT,
+                        unattributedReason = UnattributedReason.INVALID_OR_MISSING_PORTS,
+                    ),
+                )
+            }
+
+            var bpfFailureReason: UnattributedReason = if (meta.version == 6) {
+                UnattributedReason.IPV6_NOT_SUPPORTED_BY_BPF_MAP
+            } else {
+                UnattributedReason.NO_ACTIVE_SNAPSHOT
             }
 
             // 2a. Experimental BPF NAT flow attribution (never caches ALLOW decisions; resolves owner per packet)
             if (isExperimentalBpfEnabled && meta.version == 4) {
-                val outcome = bpfAttributor.resolveTranslatedPacket(
+                val translatedKey = TranslatedFlowKey(
+                    family = 4,
+                    protocol = meta.protocol,
+                    translatedIp = tetherSideIp,
+                    translatedPort = tetherSidePort,
+                    remoteIp = remoteSideIp,
+                    remotePort = remoteSidePort,
+                )
+                if (meta.isTcpSyn) {
+                    invalidateVerifiedFlowPin(translatedKey)
+                }
+                val detailed = bpfAttributor.resolveTranslatedPacketDetailed(
                     family = meta.version,
                     protocol = meta.protocol,
                     packetSrcIp = meta.srcIp,
@@ -1752,24 +2995,131 @@ object TunTrafficEngine {
                     ipToMac = ipToMac,
                     activeConnectedMacs = activeConnectedMacs,
                 )
-                when (outcome) {
+                val pktBytesLong = meta.length.coerceAtLeast(0).toLong()
+                when (val outcome = detailed.outcome) {
                     is AttributionOutcome.Matched -> {
-                        return PacketAttribution(outcome.mac, AttributionSource.BPF_NAT)
+                        if (meta.isTcpFinOrRst) {
+                            invalidateVerifiedFlowPin(translatedKey)
+                        } else {
+                            pinVerifiedBpfFlow(
+                                flowKey = translatedKey,
+                                verifiedMac = outcome.mac,
+                                originalClientIp = outcome.mapping.origClientIp,
+                                sessionGen = outcome.mapping.sessionGeneration,
+                                bindingGen = outcome.mapping.bindingGeneration,
+                            )
+                        }
+                        val refreshedSnapMono = bpfReader.lastRefreshOnMissPublishedSnapshotMonoMs.get()
+                        val isPostRefreshHit = bpfRefreshOnMissEnabled &&
+                            refreshedSnapMono > 0L &&
+                            outcome.mapping.collectedAtMonotonicMs == refreshedSnapMono
+                        return record(
+                            PacketAttribution(
+                                mac = outcome.mac,
+                                source = AttributionSource.BPF_NAT,
+                                refreshedSnapshotHit = isPostRefreshHit,
+                            ),
+                        )
                     }
                     is AttributionOutcome.Ambiguous,
                     is AttributionOutcome.StaleSnapshot,
                     is AttributionOutcome.StaleOrInvalidated,
                     -> {
+                        val reason = detailed.failureReason ?: UnattributedReason.OTHER_UNKNOWN
+                        if (outcome is AttributionOutcome.StaleSnapshot && !meta.isTcpSyn) {
+                            val pin = lookupVerifiedFlowPin(translatedKey)
+                            if (meta.isTcpFinOrRst) {
+                                invalidateVerifiedFlowPin(translatedKey)
+                            }
+                            if (pin != null) {
+                                if (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT) {
+                                    if (meta.protocol == 6) {
+                                        establishedTcpPinnedMatchedPackets.incrementAndGet()
+                                        establishedTcpPinnedMatchedBytes.addAndGet(pktBytesLong)
+                                    }
+                                    if (bpfRefreshOnMissEnabled) {
+                                        bpfReader.requestAsyncRefreshOnMiss(reason)
+                                    }
+                                    return record(
+                                        PacketAttribution(
+                                            mac = pin.verifiedMac,
+                                            source = AttributionSource.BPF_NAT,
+                                            pinnedFlowHit = true,
+                                        ),
+                                    )
+                                } else {
+                                    pinnedFlowHitsInDiagnosticMode.incrementAndGet()
+                                }
+                            }
+                            if (meta.protocol == 6) {
+                                establishedTcpMissingFromBpfPackets.incrementAndGet()
+                                establishedTcpMissingFromBpfBytes.addAndGet(pktBytesLong)
+                            }
+                        } else if (meta.isTcpFinOrRst) {
+                            invalidateVerifiedFlowPin(translatedKey)
+                        }
                         ambiguousOrStaleLookups.incrementAndGet()
-                        return PacketAttribution(null, AttributionSource.UNMATCHED_AMBIGUOUS_OR_STALE)
+                        if (bpfRefreshOnMissEnabled && reason == UnattributedReason.SNAPSHOT_STALE) {
+                            bpfReader.requestAsyncRefreshOnMiss(reason)
+                        }
+                        return record(
+                            PacketAttribution(
+                                mac = null,
+                                source = AttributionSource.UNMATCHED_AMBIGUOUS_OR_STALE,
+                                unattributedReason = reason,
+                            ),
+                        )
                     }
                     AttributionOutcome.Unknown -> {
+                        bpfFailureReason = detailed.failureReason ?: UnattributedReason.TUPLE_NOT_PRESENT
+                        if (!meta.isTcpSyn &&
+                            (bpfFailureReason == UnattributedReason.TUPLE_NOT_PRESENT ||
+                                bpfFailureReason == UnattributedReason.SNAPSHOT_STALE)
+                        ) {
+                            val pin = lookupVerifiedFlowPin(translatedKey)
+                            if (meta.isTcpFinOrRst) {
+                                invalidateVerifiedFlowPin(translatedKey)
+                            }
+                            if (pin != null) {
+                                if (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT) {
+                                    if (meta.protocol == 6) {
+                                        establishedTcpPinnedMatchedPackets.incrementAndGet()
+                                        establishedTcpPinnedMatchedBytes.addAndGet(pktBytesLong)
+                                    }
+                                    if (bpfRefreshOnMissEnabled) {
+                                        bpfReader.requestAsyncRefreshOnMiss(bpfFailureReason)
+                                    }
+                                    return record(
+                                        PacketAttribution(
+                                            mac = pin.verifiedMac,
+                                            source = AttributionSource.BPF_NAT,
+                                            pinnedFlowHit = true,
+                                        ),
+                                    )
+                                } else {
+                                    pinnedFlowHitsInDiagnosticMode.incrementAndGet()
+                                }
+                            }
+                        } else if (meta.isTcpFinOrRst) {
+                            invalidateVerifiedFlowPin(translatedKey)
+                        }
+                        if (meta.protocol == 6 && !meta.isTcpSyn) {
+                            establishedTcpMissingFromBpfPackets.incrementAndGet()
+                            establishedTcpMissingFromBpfBytes.addAndGet(pktBytesLong)
+                        }
+                        if (bpfRefreshOnMissEnabled &&
+                            (bpfFailureReason == UnattributedReason.TUPLE_NOT_PRESENT ||
+                                bpfFailureReason == UnattributedReason.SNAPSHOT_STALE)
+                        ) {
+                            bpfReader.requestAsyncRefreshOnMiss(bpfFailureReason)
+                        }
                         // Fall through to check procfs conntrack if readable
                     }
                 }
             }
 
             // 2b. Procfs conntrack fallback (when readable on the device)
+            conntrackFallbackAttemptedCount.incrementAndGet()
             val normalizedRemoteIp = normalizeIp(remoteSideIp).ifEmpty { remoteSideIp }
             val flowKey = FlowKey(
                 version = meta.version,
@@ -1782,7 +3132,14 @@ object TunTrafficEngine {
             flowToMacCache[flowKey]?.let { cachedMac ->
                 if (cachedMac in activeConnectedMacs) {
                     flowTimestamps[flowKey] = System.currentTimeMillis()
-                    return PacketAttribution(cachedMac, AttributionSource.CONNTRACK_PROCFS)
+                    conntrackFallbackSucceededCount.incrementAndGet()
+                    return record(
+                        PacketAttribution(
+                            mac = cachedMac,
+                            source = AttributionSource.CONNTRACK_PROCFS,
+                            fallbackAttempted = true,
+                        ),
+                    )
                 }
                 flowToMacCache.remove(flowKey, cachedMac)
                 flowTimestamps.remove(flowKey)
@@ -1792,10 +3149,25 @@ object TunTrafficEngine {
             flowToMacCache[flowKey]?.let { resolvedMac ->
                 if (resolvedMac in activeConnectedMacs) {
                     flowTimestamps[flowKey] = System.currentTimeMillis()
-                    return PacketAttribution(resolvedMac, AttributionSource.CONNTRACK_PROCFS)
+                    conntrackFallbackSucceededCount.incrementAndGet()
+                    return record(
+                        PacketAttribution(
+                            mac = resolvedMac,
+                            source = AttributionSource.CONNTRACK_PROCFS,
+                            fallbackAttempted = true,
+                        ),
+                    )
                 }
             }
-            return PacketAttribution(null, AttributionSource.UNMATCHED_UNKNOWN)
+            conntrackFallbackFailedCount.incrementAndGet()
+            return record(
+                PacketAttribution(
+                    mac = null,
+                    source = AttributionSource.UNMATCHED_UNKNOWN,
+                    unattributedReason = bpfFailureReason,
+                    fallbackAttempted = true,
+                ),
+            )
         }
 
         // 3. IPv6 SLAAC in testtun prefix (`2001:db8::/64`) or link-local (`fe80::/64`)
@@ -1803,34 +3175,59 @@ object TunTrafficEngine {
             extractMacFromIpv6Eui64(tetherSideIp)?.let { euiMac ->
                 if (euiMac in activeConnectedMacs) {
                     bindClientIp(euiMac, tetherSideIp)
-                    return PacketAttribution(euiMac, AttributionSource.DIRECT_IP)
+                    return record(PacketAttribution(euiMac, AttributionSource.DIRECT_IP))
                 }
             }
 
             ipToMac[tetherSideIp]?.let { neighborMac ->
                 if (neighborMac in activeConnectedMacs) {
-                    return PacketAttribution(neighborMac, AttributionSource.DIRECT_IP)
+                    return record(PacketAttribution(neighborMac, AttributionSource.DIRECT_IP))
                 }
             }
             if (normalizedTetherIp.isNotEmpty()) {
                 ipToMac[normalizedTetherIp]?.let { neighborMac ->
                     if (neighborMac in activeConnectedMacs) {
-                        return PacketAttribution(neighborMac, AttributionSource.DIRECT_IP)
+                        return record(PacketAttribution(neighborMac, AttributionSource.DIRECT_IP))
                     }
                 }
             }
+            return record(
+                PacketAttribution(
+                    mac = null,
+                    source = AttributionSource.UNMATCHED_UNKNOWN,
+                    unattributedReason = UnattributedReason.IP_BINDING_MISSING_OR_CHANGED,
+                ),
+            )
         }
 
         // 4. Unmapped private IPv4 address lookup against control-plane neighbor table
         if (meta.version == 4 && isPrivateIpv4(tetherSideIp)) {
             ipToMac[tetherSideIp]?.let { neighborMac ->
                 if (neighborMac in activeConnectedMacs) {
-                    return PacketAttribution(neighborMac, AttributionSource.DIRECT_IP)
+                    return record(PacketAttribution(neighborMac, AttributionSource.DIRECT_IP))
                 }
             }
+            return record(
+                PacketAttribution(
+                    mac = null,
+                    source = AttributionSource.UNMATCHED_UNKNOWN,
+                    unattributedReason = UnattributedReason.IP_BINDING_MISSING_OR_CHANGED,
+                ),
+            )
         }
 
-        return PacketAttribution(null, AttributionSource.UNMATCHED_UNKNOWN)
+        val fallbackReason = if (meta.version == 6) {
+            UnattributedReason.IPV6_NOT_SUPPORTED_BY_BPF_MAP
+        } else {
+            UnattributedReason.OTHER_UNKNOWN
+        }
+        return record(
+            PacketAttribution(
+                mac = null,
+                source = AttributionSource.UNMATCHED_UNKNOWN,
+                unattributedReason = fallbackReason,
+            ),
+        )
     }
 
     internal fun isLinkLocalMulticastControl(meta: PacketMeta): Boolean {
@@ -1845,24 +3242,149 @@ object TunTrafficEngine {
         matchedMac: String?,
         isUpload: Boolean,
         attributionSource: AttributionSource = AttributionSource.DIRECT_IP,
-    ): PacketDecision = evaluateAndShapeDetailed(meta, matchedMac, isUpload, attributionSource).decision
+        rawPacket: ByteArray? = null,
+        rawLength: Int = meta.length,
+    ): PacketDecision = evaluateAndShapeDetailed(meta, matchedMac, isUpload, attributionSource, rawPacket, rawLength).decision
 
     internal fun evaluateAndShapeDetailed(
         meta: PacketMeta,
         matchedMac: String?,
         isUpload: Boolean,
         attributionSource: AttributionSource = AttributionSource.DIRECT_IP,
+        rawPacket: ByteArray? = null,
+        rawLength: Int = meta.length,
     ): EvaluationDetail {
+        val pktBytes = meta.length.coerceAtLeast(0).toLong()
+
         // Local IPv6 multicast control frames (fe80:: -> ff02::2 RS/RA/MLD) are link-local
-        // control traffic, not internet browsing traffic.
+        // control traffic, not internet browsing traffic; excluded from eligible denominator.
         if (isLinkLocalMulticastControl(meta)) {
             localControlPackets.incrementAndGet()
+            localControlBytes.addAndGet(pktBytes)
             return EvaluationDetail(PacketDecision.ALLOW)
+        }
+
+        totalEligiblePackets.incrementAndGet()
+        totalEligibleBytes.addAndGet(pktBytes)
+
+        if (meta.version == 6) {
+            ipv6EligiblePackets.incrementAndGet()
+            ipv6EligibleBytes.addAndGet(pktBytes)
+        } else {
+            ipv4EligiblePackets.incrementAndGet()
+            ipv4EligibleBytes.addAndGet(pktBytes)
+        }
+
+        when (meta.protocol) {
+            6 -> {
+                tcpEligiblePackets.incrementAndGet()
+                tcpEligibleBytes.addAndGet(pktBytes)
+                if (meta.isTcpSyn) tcpSynPacketsSeen.incrementAndGet()
+                if (meta.isTcpFinOrRst) tcpFinOrRstPacketsSeen.incrementAndGet()
+                if (meta.isTcpAckOnly) tcpKeepaliveOrAckOnlyPackets.incrementAndGet()
+            }
+            17 -> {
+                udpEligiblePackets.incrementAndGet()
+                udpEligibleBytes.addAndGet(pktBytes)
+            }
+            1, 58 -> {
+                icmpEligiblePackets.incrementAndGet()
+                icmpEligibleBytes.addAndGet(pktBytes)
+            }
+            else -> {
+                otherProtoEligiblePackets.incrementAndGet()
+                otherProtoEligibleBytes.addAndGet(pktBytes)
+            }
+        }
+
+        if (isUpload) {
+            uploadEligiblePackets.incrementAndGet()
+            uploadEligibleBytes.addAndGet(pktBytes)
+        } else {
+            downloadEligiblePackets.incrementAndGet()
+            downloadEligibleBytes.addAndGet(pktBytes)
         }
 
         if (matchedMac == null) {
             unmatchedPackets.incrementAndGet()
-            unknownForwardedBytes.addAndGet(meta.length.toLong())
+            unknownForwardedBytes.addAndGet(pktBytes)
+
+            if (isAnyClientCurrentlyBlockedOrQuotaExhausted()) {
+                unknownForwardedAfterBlockPackets.incrementAndGet()
+                unknownForwardedAfterBlockBytes.addAndGet(pktBytes)
+                val protoName = when (meta.protocol) {
+                    6 -> "TCP"
+                    17 -> "UDP"
+                    1, 58 -> "ICMP"
+                    else -> "OTHER"
+                }
+                val famName = if (meta.version == 6) "IPv6" else "IPv4"
+                val dirName = if (isUpload) "UPLOAD" else "DOWNLOAD"
+                val bucketKey = "${protoName}_${famName}_${dirName}"
+                unknownPostBlockByProtocolAndDirection.computeIfAbsent(bucketKey) { AtomicLong(0L) }.incrementAndGet()
+                unknownPostBlockBytesByProtocolAndDirection.computeIfAbsent(bucketKey) { AtomicLong(0L) }.addAndGet(pktBytes)
+                if (meta.protocol == 17 && (meta.srcPort == 443 || meta.dstPort == 443)) {
+                    udp443PostBlockUnattributedPackets.incrementAndGet()
+                    udp443PostBlockUnattributedBytes.addAndGet(pktBytes)
+                }
+                if (meta.protocol == 17 && (meta.srcPort == 53 || meta.dstPort == 53)) {
+                    udp53PostBlockUnattributedPackets.incrementAndGet()
+                    udp53PostBlockUnattributedBytes.addAndGet(pktBytes)
+                }
+            }
+
+            if (meta.version == 6) {
+                ipv6UnattributedPackets.incrementAndGet()
+                ipv6UnattributedBytes.addAndGet(pktBytes)
+            } else {
+                ipv4UnattributedPackets.incrementAndGet()
+                ipv4UnattributedBytes.addAndGet(pktBytes)
+            }
+
+            when (meta.protocol) {
+                6 -> {
+                    tcpUnattributedPackets.incrementAndGet()
+                    tcpUnattributedBytes.addAndGet(pktBytes)
+                }
+                17 -> {
+                    udpUnattributedPackets.incrementAndGet()
+                    udpUnattributedBytes.addAndGet(pktBytes)
+                }
+                1, 58 -> {
+                    icmpUnattributedPackets.incrementAndGet()
+                    icmpUnattributedBytes.addAndGet(pktBytes)
+                }
+                else -> {
+                    otherProtoUnattributedPackets.incrementAndGet()
+                    otherProtoUnattributedBytes.addAndGet(pktBytes)
+                }
+            }
+
+            if (isUpload) {
+                uploadUnattributedPackets.incrementAndGet()
+                uploadUnattributedBytes.addAndGet(pktBytes)
+            } else {
+                downloadUnattributedPackets.incrementAndGet()
+                downloadUnattributedBytes.addAndGet(pktBytes)
+            }
+
+            val reason = meta.resolvedAttribution?.unattributedReason ?: when {
+                meta.isNonInitialFragment -> UnattributedReason.NON_INITIAL_FRAGMENT
+                attributionSource == AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT -> {
+                    if (meta.protocol != 6 && meta.protocol != 17) {
+                        UnattributedReason.UNSUPPORTED_PROTOCOL
+                    } else {
+                        UnattributedReason.INVALID_OR_MISSING_PORTS
+                    }
+                }
+                attributionSource == AttributionSource.UNMATCHED_AMBIGUOUS_OR_STALE ->
+                    UnattributedReason.TUPLE_AMBIGUOUS
+                meta.version == 6 -> UnattributedReason.IPV6_NOT_SUPPORTED_BY_BPF_MAP
+                else -> UnattributedReason.TUPLE_NOT_PRESENT
+            }
+            unattributedPacketsByReason.computeIfAbsent(reason) { AtomicLong(0L) }.incrementAndGet()
+            unattributedBytesByReason.computeIfAbsent(reason) { AtomicLong(0L) }.addAndGet(pktBytes)
+
             val srcNorm = normalizeIp(meta.srcIp)
             val dstNorm = normalizeIp(meta.dstIp)
             val isPostNat = meta.srcIp == TUN_LOCAL_V4 ||
@@ -1874,6 +3396,66 @@ object TunTrafficEngine {
             if (isPostNat) {
                 postNatUnmatchedPackets.incrementAndGet()
             }
+            if (deepTupleDiagnosticsEnabled || bpfRefreshOnMissEnabled) {
+                val snap = bpfAttributor.currentSnapshot()
+                val isPrivateSide = meta.version == 4 && isPrivateIpv4(if (isUpload) meta.srcIp else meta.dstIp)
+                val role = when {
+                    isPostNat && isUpload -> PreNatOrPostNatRole.POST_NAT_UPSTREAM
+                    isPostNat && !isUpload -> PreNatOrPostNatRole.POST_NAT_DOWNSTREAM
+                    isPrivateSide -> PreNatOrPostNatRole.PRE_NAT_CLIENT
+                    else -> PreNatOrPostNatRole.UNKNOWN
+                }
+                val origin = if (isPrivateSide) {
+                    TupleRoleOrigin.TUN_PACKET_PRE_NAT
+                } else {
+                    TupleRoleOrigin.TUN_PACKET_POST_NAT
+                }
+                val canonicalTuple = CanonicalFlowTuple(
+                    networkSessionGeneration = bpfAttributor.currentSessionGeneration,
+                    bindingGeneration = bpfAttributor.currentBindingGeneration,
+                    ipFamily = meta.version,
+                    transportProtocol = meta.protocol,
+                    direction = if (isUpload) "UPLOAD" else "DOWNLOAD",
+                    srcIp = meta.srcIp,
+                    srcPortOrIcmpId = meta.srcPort,
+                    dstIp = meta.dstIp,
+                    dstPortOrIcmpId = meta.dstPort,
+                    preNatOrPostNatRole = role,
+                )
+                deepTupleTracker.onPacketMiss(
+                    tuple = canonicalTuple,
+                    packetBytes = meta.length,
+                    missReason = reason,
+                    snapshot = snap,
+                    directionConfidence = DirectionConfidence.KNOWN,
+                    tupleRoleOrigin = origin,
+                )
+            }
+            var unknownOwnerDomainDecision: DomainPacketDecision? = null
+            if (isUpload && rawPacket != null && rawLength > 0) {
+                unknownOwnerDomainDecision = DomainFilterEngine.evaluateUploadPacket(
+                    rawPacket = rawPacket,
+                    length = rawLength,
+                    srcIp = meta.srcIp,
+                    matchedMac = null,
+                    ownerVerified = false,
+                    fromDedicatedHotspotTun = true,
+                    isHostOriginated = false,
+                )
+                if (unknownOwnerDomainDecision.blocked) {
+                    maybeLogTrafficSample(
+                        meta = meta,
+                        isUpload = isUpload,
+                        matchedMac = null,
+                        decision = PacketDecision.DROP,
+                        attributionSource = attributionSource,
+                    )
+                    return EvaluationDetail(
+                        decision = PacketDecision.DROP,
+                        domainDecision = unknownOwnerDomainDecision,
+                    )
+                }
+            }
             maybeLogTrafficSample(
                 meta = meta,
                 isUpload = isUpload,
@@ -1881,26 +3463,104 @@ object TunTrafficEngine {
                 decision = PacketDecision.ALLOW,
                 attributionSource = attributionSource,
             )
-            return EvaluationDetail(PacketDecision.ALLOW)
+            return EvaluationDetail(
+                decision = PacketDecision.ALLOW,
+                domainDecision = unknownOwnerDomainDecision,
+            )
+        }
+
+        totalAttributedPackets.incrementAndGet()
+        totalAttributedBytes.addAndGet(pktBytes)
+
+        if (meta.version == 6) {
+            ipv6AttributedPackets.incrementAndGet()
+            ipv6AttributedBytes.addAndGet(pktBytes)
+        } else {
+            ipv4AttributedPackets.incrementAndGet()
+            ipv4AttributedBytes.addAndGet(pktBytes)
+        }
+
+        when (meta.protocol) {
+            6 -> {
+                tcpAttributedPackets.incrementAndGet()
+                tcpAttributedBytes.addAndGet(pktBytes)
+            }
+            17 -> {
+                udpAttributedPackets.incrementAndGet()
+                udpAttributedBytes.addAndGet(pktBytes)
+            }
+            1, 58 -> {
+                icmpAttributedPackets.incrementAndGet()
+                icmpAttributedBytes.addAndGet(pktBytes)
+            }
+            else -> {
+                otherProtoAttributedPackets.incrementAndGet()
+                otherProtoAttributedBytes.addAndGet(pktBytes)
+            }
+        }
+
+        if (isUpload) {
+            uploadAttributedPackets.incrementAndGet()
+            uploadAttributedBytes.addAndGet(pktBytes)
+        } else {
+            downloadAttributedPackets.incrementAndGet()
+            downloadAttributedBytes.addAndGet(pktBytes)
+        }
+
+        if (meta.resolvedAttribution?.refreshedSnapshotHit == true) {
+            postRefreshAttributedPackets.incrementAndGet()
+            postRefreshAttributedBytes.addAndGet(pktBytes)
         }
 
         val counters = countersByMac.getOrPut(matchedMac) { ClientTrafficCounters(matchedMac) }
         counters.lastSeenAt = System.currentTimeMillis()
         counters.seenPackets.incrementAndGet()
+        val isPinnedHit = meta.resolvedAttribution?.pinnedFlowHit == true
+        if (isPinnedHit) {
+            counters.decisionsRecomputed.incrementAndGet()
+            counters.staleAllowCacheHitsPrevented.incrementAndGet()
+        }
         when (attributionSource) {
             AttributionSource.BPF_NAT -> {
                 bpfAttributedPackets.incrementAndGet()
+                bpfAttributedBytes.addAndGet(pktBytes)
                 counters.bpfAttributedPackets.incrementAndGet()
+                if ((deepTupleDiagnosticsEnabled || bpfRefreshOnMissEnabled) &&
+                    meta.version == 4 &&
+                    (meta.protocol == 6 || meta.protocol == 17)
+                ) {
+                    val tetherSideIp = if (isUpload) meta.srcIp else meta.dstIp
+                    val tetherSidePort = if (isUpload) meta.srcPort else meta.dstPort
+                    val remoteSideIp = if (isUpload) meta.dstIp else meta.srcIp
+                    val remoteSidePort = if (isUpload) meta.dstPort else meta.srcPort
+                    val flowKey = TranslatedFlowKey(
+                        family = 4,
+                        protocol = meta.protocol,
+                        translatedIp = tetherSideIp,
+                        translatedPort = tetherSidePort,
+                        remoteIp = remoteSideIp,
+                        remotePort = remoteSidePort,
+                    )
+                    val resolvedFirstAfterRefresh = deepTupleTracker.onPacketAttributedByBpf(
+                        flowKey = flowKey,
+                        packetBytes = meta.length,
+                        snapshot = bpfAttributor.currentSnapshot(),
+                    )
+                    if (resolvedFirstAfterRefresh && meta.resolvedAttribution?.refreshedSnapshotHit != true) {
+                        postRefreshAttributedPackets.incrementAndGet()
+                        postRefreshAttributedBytes.addAndGet(pktBytes)
+                    }
+                }
             }
             AttributionSource.DIRECT_IP -> {
                 directAttributedPackets.incrementAndGet()
+                directAttributedBytes.addAndGet(pktBytes)
                 counters.directAttributedPackets.incrementAndGet()
             }
             AttributionSource.CONNTRACK_PROCFS -> {
                 conntrackAttributedPackets.incrementAndGet()
+                conntrackAttributedBytes.addAndGet(pktBytes)
                 counters.conntrackAttributedPackets.incrementAndGet()
-                directAttributedPackets.incrementAndGet()
-                counters.directAttributedPackets.incrementAndGet()
             }
             else -> {}
         }
@@ -1910,54 +3570,123 @@ object TunTrafficEngine {
         val policy = policiesByMac[matchedMac]
         val hasConfiguredQuota = (policy?.dataLimitBytes ?: 0L) > 0L || (quotaRecordBefore?.isQuotaEnabled == true)
         val hasActivePolicy = policy != null &&
-            (policy.isNonQuotaBlocked || policy.bandwidthLimitKbps > 0 || hasConfiguredQuota)
-
-        if (!hasActivePolicy && !hasConfiguredQuota) {
-            recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
-            counters.forwardedPackets.incrementAndGet()
-            if (isUpload) {
-                counters.txBytes.addAndGet(meta.length.toLong())
-            } else {
-                counters.rxBytes.addAndGet(meta.length.toLong())
-            }
-            return EvaluationDetail(PacketDecision.ALLOW, policyVersion = currentPolicyVersion)
-        }
+            (policy.isBlocked || policy.bandwidthLimitKbps > 0 || hasConfiguredQuota)
 
         counters.matchedPackets.incrementAndGet()
 
-        // 1a. Non-quota hard block enforcement (manual admin block, time limit, or schedule; evaluated freshly on every packet)
-        if (policy != null && policy.isNonQuotaBlocked) {
-            counters.droppedPackets.incrementAndGet()
-            counters.blockedDropPackets.incrementAndGet()
-            counters.policyVersionBlockedDrops.incrementAndGet()
-            counters.droppedBytes.addAndGet(meta.length.toLong())
-            maybeLogTrafficSample(
-                meta = meta,
-                isUpload = isUpload,
-                matchedMac = matchedMac,
-                decision = PacketDecision.DROP,
-                attributionSource = attributionSource,
-            )
-            maybeLogCountersOnMilestone(counters)
-            return EvaluationDetail(PacketDecision.DROP, policyVersion = currentPolicyVersion)
+        if (bpfNatVpnEnforcementEnabled && (hasActivePolicy || hasConfiguredQuota)) {
+            // 1a. Non-quota hard block enforcement (manual admin block, time limit, or schedule; evaluated freshly on every packet)
+            if (policy != null && policy.isNonQuotaBlocked) {
+                counters.droppedPackets.incrementAndGet()
+                counters.blockedDropPackets.incrementAndGet()
+                counters.policyVersionBlockedDrops.incrementAndGet()
+                counters.droppedBytes.addAndGet(meta.length.toLong())
+                counters.decisionsRecomputed.incrementAndGet()
+                counters.verifiedDroppedAfterBlockPackets.incrementAndGet()
+                counters.verifiedDroppedAfterBlockBytes.addAndGet(pktBytes)
+                if (isPinnedHit) {
+                    counters.pinnedFlowEnforcedPackets.incrementAndGet()
+                    counters.pinnedFlowEnforcedBytes.addAndGet(pktBytes)
+                    pinnedFlowEnforcedDropsInEnforcementMode.incrementAndGet()
+                }
+                maybeLogTrafficSample(
+                    meta = meta,
+                    isUpload = isUpload,
+                    matchedMac = matchedMac,
+                    decision = PacketDecision.DROP,
+                    attributionSource = attributionSource,
+                )
+                maybeLogCountersOnMilestone(counters)
+                return EvaluationDetail(PacketDecision.DROP, policyVersion = currentPolicyVersion)
+            }
+
+            // 1b. Atomic per-client data quota enforcement (usedTotalBytes >= dataLimitBytes)
+            val effectiveLimitBytes = policy?.dataLimitBytes?.takeIf { it > 0L }
+                ?: quotaRecordBefore?.sanitizedLimitBytes
+                ?: 0L
+            val currentUsedBytes = quotaRecordBefore?.usedTotalBytes ?: 0L
+            val crossesQuotaInEnforcementMode = phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT &&
+                effectiveLimitBytes > 0L &&
+                !(quotaRecordBefore?.isQuotaExceeded == true) &&
+                DataQuota.safeAddBytes(currentUsedBytes, pktBytes) >= effectiveLimitBytes
+            if (crossesQuotaInEnforcementMode) {
+                recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
+                counters.staleAllowCacheHitsPrevented.incrementAndGet()
+            }
+            if ((quotaRecordBefore != null && quotaRecordBefore.isQuotaExceeded) ||
+                crossesQuotaInEnforcementMode ||
+                (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT && policy?.isQuotaOnlyBlock == true)
+            ) {
+                counters.droppedPackets.incrementAndGet()
+                counters.blockedDropPackets.incrementAndGet()
+                counters.policyVersionBlockedDrops.incrementAndGet()
+                counters.quotaDropPackets.incrementAndGet()
+                counters.droppedBytes.addAndGet(meta.length.toLong())
+                counters.decisionsRecomputed.incrementAndGet()
+                counters.verifiedDroppedAfterBlockPackets.incrementAndGet()
+                counters.verifiedDroppedAfterBlockBytes.addAndGet(pktBytes)
+                if (isPinnedHit) {
+                    counters.pinnedFlowEnforcedPackets.incrementAndGet()
+                    counters.pinnedFlowEnforcedBytes.addAndGet(pktBytes)
+                    pinnedFlowEnforcedDropsInEnforcementMode.incrementAndGet()
+                }
+                maybeLogTrafficSample(
+                    meta = meta,
+                    isUpload = isUpload,
+                    matchedMac = matchedMac,
+                    decision = PacketDecision.DROP,
+                    attributionSource = attributionSource,
+                )
+                maybeLogCountersOnMilestone(counters)
+                return EvaluationDetail(PacketDecision.DROP, policyVersion = counters.policyVersion.get())
+            }
         }
 
-        // 1b. Atomic per-client data quota enforcement (usedTotalBytes >= dataLimitBytes)
-        if (quotaRecordBefore != null && quotaRecordBefore.isQuotaExceeded) {
-            counters.droppedPackets.incrementAndGet()
-            counters.blockedDropPackets.incrementAndGet()
-            counters.policyVersionBlockedDrops.incrementAndGet()
-            counters.quotaDropPackets.incrementAndGet()
-            counters.droppedBytes.addAndGet(meta.length.toLong())
-            maybeLogTrafficSample(
-                meta = meta,
-                isUpload = isUpload,
+        // 1c. Shared Domain Filtering policy layer (Global + Per-Host DNS/SNI/Host rules; active in both BPF_NAT_VPN and SOFTAP_MAC_BLOCK)
+        var verifiedDomainDecision: DomainPacketDecision? = null
+        if (isUpload && rawPacket != null && rawLength > 0) {
+            verifiedDomainDecision = DomainFilterEngine.evaluateUploadPacket(
+                rawPacket = rawPacket,
+                length = rawLength,
+                srcIp = meta.srcIp,
                 matchedMac = matchedMac,
-                decision = PacketDecision.DROP,
-                attributionSource = attributionSource,
+                ownerVerified = true,
+                fromDedicatedHotspotTun = true,
+                isHostOriginated = false,
             )
-            maybeLogCountersOnMilestone(counters)
-            return EvaluationDetail(PacketDecision.DROP, policyVersion = currentPolicyVersion)
+            if (verifiedDomainDecision.blocked) {
+                counters.droppedPackets.incrementAndGet()
+                counters.droppedBytes.addAndGet(meta.length.toLong())
+                maybeLogTrafficSample(
+                    meta = meta,
+                    isUpload = isUpload,
+                    matchedMac = matchedMac,
+                    decision = PacketDecision.DROP,
+                    attributionSource = attributionSource,
+                )
+                return EvaluationDetail(
+                    decision = PacketDecision.DROP,
+                    policyVersion = currentPolicyVersion,
+                    domainDecision = verifiedDomainDecision,
+                )
+            }
+        }
+
+        if (!bpfNatVpnEnforcementEnabled || (!hasActivePolicy && !hasConfiguredQuota)) {
+            recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
+            counters.forwardedPackets.incrementAndGet()
+            if (isUpload) {
+                counters.uploadForwardedPackets.incrementAndGet()
+                counters.txBytes.addAndGet(meta.length.toLong())
+            } else {
+                counters.downloadForwardedPackets.incrementAndGet()
+                counters.rxBytes.addAndGet(meta.length.toLong())
+            }
+            return EvaluationDetail(
+                decision = PacketDecision.ALLOW,
+                policyVersion = currentPolicyVersion,
+                domainDecision = verifiedDomainDecision,
+            )
         }
 
         // 2. Non-blocking per-client calibrated Token Bucket bandwidth limiting
@@ -2017,11 +3746,19 @@ object TunTrafficEngine {
         }
 
         // Count immediately forwarded packet ONCE toward quota and rx/tx counters
-        recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
+        val updatedQuota = recordQuotaBytes(matchedMac, meta.length, isUpload, policy)
+        if ((quotaRecordBefore?.isQuotaExceeded != true && updatedQuota.isQuotaExceeded) ||
+            policy?.isQuotaOnlyBlock == true
+        ) {
+            counters.verifiedAllowedAfterBlockPackets.incrementAndGet()
+            counters.verifiedAllowedAfterBlockBytes.addAndGet(pktBytes)
+        }
         counters.forwardedPackets.incrementAndGet()
         if (isUpload) {
+            counters.uploadForwardedPackets.incrementAndGet()
             counters.txBytes.addAndGet(meta.length.toLong())
         } else {
+            counters.downloadForwardedPackets.incrementAndGet()
             counters.rxBytes.addAndGet(meta.length.toLong())
         }
         maybeLogCountersOnMilestone(counters)
@@ -2223,6 +3960,14 @@ object TunTrafficEngine {
         lastConntrackReadStatus = primaryStatus
         lastConntrackParsedFlows = totalRelevantFlows
         isConntrackAvailable = anyReadable && totalRelevantFlows > 0
+        if (anyReadable) {
+            conntrackBackoffUntilMs = 0L
+        } else {
+            if (observations.any { it.openReadStatus == "PERMISSION_DENIED" }) {
+                conntrackPermissionDeniedCount.incrementAndGet()
+            }
+            conntrackBackoffUntilMs = conntrackClockMillisProvider() + conntrackUnavailableBackoffMs
+        }
         if (isConntrackAvailable) {
             isMultiClientDegraded = false
         }
@@ -2249,9 +3994,14 @@ object TunTrafficEngine {
 
     /**
      * Reads procfs conntrack directly in-process (never spawns shell subprocesses on packet threads).
+     * Applies a 300s backoff when procfs conntrack is unavailable or permission-denied.
      */
     private fun maybeResolveConntrackFlows() {
-        val now = System.currentTimeMillis()
+        val now = conntrackClockMillisProvider()
+        if (now < conntrackBackoffUntilMs) {
+            conntrackBackoffSkippedCount.incrementAndGet()
+            return
+        }
         if (now - lastConntrackResolveMs < 500L) return
         lastConntrackResolveMs = now
         inspectConntrackPaths(maxBytesPerFile = 32_768)
@@ -2319,12 +4069,16 @@ object TunTrafficEngine {
                 var srcPort = 0
                 var dstPort = 0
                 var isTcpSyn = false
+                var isTcpFinOrRst = false
+                var isTcpAckOnly = false
                 if (!isNonInitialFrag && (proto == 6 || proto == 17) && length >= ihl + 4) {
                     srcPort = ((packet[ihl].toInt() and 0xFF) shl 8) or (packet[ihl + 1].toInt() and 0xFF)
                     dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or (packet[ihl + 3].toInt() and 0xFF)
                     if (proto == 6 && length >= ihl + 14) {
                         val tcpFlags = packet[ihl + 13].toInt() and 0xFF
                         isTcpSyn = (tcpFlags and 0x12) == 0x02 // SYN=1, ACK=0
+                        isTcpFinOrRst = (tcpFlags and 0x05) != 0 // FIN=0x01 or RST=0x04
+                        isTcpAckOnly = (tcpFlags and 0x10) != 0 && !isTcpSyn && !isTcpFinOrRst && length <= ihl + 32
                     }
                 }
                 val isControl = (proto == 6 && length <= ihl + 32) || srcPort == 53 || dstPort == 53 || proto == 1
@@ -2339,6 +4093,8 @@ object TunTrafficEngine {
                     isSmallControlPacket = isControl,
                     isNonInitialFragment = isNonInitialFrag,
                     isTcpSyn = isTcpSyn,
+                    isTcpFinOrRst = isTcpFinOrRst,
+                    isTcpAckOnly = isTcpAckOnly,
                 )
             }
             6 -> {
@@ -2365,12 +4121,16 @@ object TunTrafficEngine {
                 var srcPort = 0
                 var dstPort = 0
                 var isTcpSyn = false
+                var isTcpFinOrRst = false
+                var isTcpAckOnly = false
                 if (!isNonInitialFrag && (effectiveHeader == 6 || effectiveHeader == 17) && length >= transportOffset + 4) {
                     srcPort = ((packet[transportOffset].toInt() and 0xFF) shl 8) or (packet[transportOffset + 1].toInt() and 0xFF)
                     dstPort = ((packet[transportOffset + 2].toInt() and 0xFF) shl 8) or (packet[transportOffset + 3].toInt() and 0xFF)
                     if (effectiveHeader == 6 && length >= transportOffset + 14) {
                         val tcpFlags = packet[transportOffset + 13].toInt() and 0xFF
                         isTcpSyn = (tcpFlags and 0x12) == 0x02
+                        isTcpFinOrRst = (tcpFlags and 0x05) != 0
+                        isTcpAckOnly = (tcpFlags and 0x10) != 0 && !isTcpSyn && !isTcpFinOrRst && length <= transportOffset + 32
                     }
                 }
                 val isControl = (effectiveHeader == 6 && length <= transportOffset + 32) ||
@@ -2386,6 +4146,8 @@ object TunTrafficEngine {
                     isSmallControlPacket = isControl,
                     isNonInitialFragment = isNonInitialFrag,
                     isTcpSyn = isTcpSyn,
+                    isTcpFinOrRst = isTcpFinOrRst,
+                    isTcpAckOnly = isTcpAckOnly,
                 )
             }
             else -> null

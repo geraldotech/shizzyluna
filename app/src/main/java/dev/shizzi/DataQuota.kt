@@ -114,7 +114,14 @@ object DataQuota {
     const val BYTES_PER_GB: Long = 1024L * BYTES_PER_MB // 1,073,741,824 bytes
     const val MAX_QUOTA_MB: Long = Long.MAX_VALUE / BYTES_PER_MB // 8,796,093,022,207 MB
 
-    const val DEFAULT_CHECKPOINT_FILE_PATH = "/data/local/tmp/shizzyluna-quota-state.json"
+    const val STABLE_CHECKPOINT_FILE_PATH = "/data/local/tmp/shizzyluna-quota-state.json"
+    const val DEBUG_CHECKPOINT_FILE_PATH = "/data/local/tmp/shizzyluna-debug-quota-state.json"
+    val DEFAULT_CHECKPOINT_FILE_PATH: String
+        get() = if (BuildConfig.APPLICATION_ID.endsWith(".debug")) {
+            DEBUG_CHECKPOINT_FILE_PATH
+        } else {
+            STABLE_CHECKPOINT_FILE_PATH
+        }
     const val CHECKPOINT_MIN_INTERVAL_MS = 2_000L
     const val CHECKPOINT_BYTE_DELTA_THRESHOLD = 64L * 1024L // 64 KB
 

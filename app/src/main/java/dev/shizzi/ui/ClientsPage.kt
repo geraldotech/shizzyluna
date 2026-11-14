@@ -70,11 +70,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.shizzi.BlockingMode
+import dev.shizzi.BpfAttributionStatusReport
 import dev.shizzi.ClientRule
 import dev.shizzi.ConnectedClient
 import dev.shizzi.DataQuota
@@ -82,6 +85,10 @@ import dev.shizzi.DatapathMode
 import dev.shizzi.EnforcementState
 import dev.shizzi.QuotaResetPeriod
 import dev.shizzi.SessionUiState
+import dev.shizzi.SoftApAppliedState
+import dev.shizzi.SoftApClientBlockReason
+import dev.shizzi.SoftApClientEnforcementRecord
+import dev.shizzi.SoftApEngineState
 import dev.shizzi.Traffic
 import dev.shizzi.UiStatus
 import dev.shizzi.ui.theme.ScreenPadding
@@ -230,6 +237,7 @@ data class ClientActions(
     val onRemoveRule: (mac: String) -> Unit,
     val onRefresh: () -> Unit,
     val onOpenFirewallDiagnostic: () -> Unit = {},
+    val onOpenDomainBlocking: (clientMac: String?) -> Unit = {},
     val onSetExperimentalBpfEnabled: (Boolean) -> Unit = {},
     val onCollectBpfSnapshotNow: () -> Unit = {},
     val onResetClientQuotaUsage: (mac: String) -> Unit = {},
@@ -242,7 +250,9 @@ fun ClientsPage(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     savedRules: List<ClientRule> = emptyList(),
+    domainRules: List<dev.shizzi.DomainRule> = emptyList(),
     sessionState: SessionUiState = SessionUiState(),
+    bpfReport: BpfAttributionStatusReport = BpfAttributionStatusReport(),
     experimentalBpfEnabled: Boolean = false,
     bpfPollIntervalMs: Int = 1000,
 ) {
@@ -250,12 +260,48 @@ fun ClientsPage(
     var selectedClientForEdit by remember { mutableStateOf<ConnectedClient?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
 
+    val softApDiag = bpfReport.softApDiagnostics
+    val isSoftApModeActive = bpfReport.preNatDiagnostics.effectiveModeNullable == BlockingMode.SOFTAP_MAC_BLOCK ||
+        softApDiag.engineState == SoftApEngineState.ACTIVE
+    val softApRecordsByMac = remember(softApDiag.clientRecords) {
+        softApDiag.clientRecords.associateBy { it.mac.uppercase().trim() }
+    }
+
     val connectedMacSet = remember(clients) {
         clients.map { it.cleanMac }.toSet()
     }
 
-    val offlineRules = remember(savedRules, connectedMacSet) {
-        savedRules.filter { it.cleanMac !in connectedMacSet }
+    val offlineRules = remember(savedRules, connectedMacSet, softApDiag.clientRecords, softApDiag.journal.appOwnedMacs) {
+        val baseOffline = savedRules.filter { it.cleanMac !in connectedMacSet }.toMutableList()
+        val existingOfflineMacs = baseOffline.map { it.cleanMac }.toMutableSet()
+        // Ensure any SoftAP-blocked or app-owned MAC that disconnected from Wi-Fi stays visible
+        for (rec in softApDiag.clientRecords) {
+            val clean = rec.mac.uppercase().trim()
+            if (clean !in connectedMacSet && clean !in existingOfflineMacs &&
+                (rec.desiredBlocked || rec.appliedState != SoftApAppliedState.UNBLOCKED)
+            ) {
+                baseOffline.add(
+                    ClientRule(
+                        mac = clean,
+                        isBlocked = SoftApClientBlockReason.MANUAL_BLOCK in rec.activeReasons,
+                    ),
+                )
+                existingOfflineMacs.add(clean)
+            }
+        }
+        for (ownedMac in softApDiag.journal.appOwnedMacs) {
+            val clean = ownedMac.uppercase().trim()
+            if (clean !in connectedMacSet && clean !in existingOfflineMacs) {
+                baseOffline.add(
+                    ClientRule(
+                        mac = clean,
+                        isBlocked = true,
+                    ),
+                )
+                existingOfflineMacs.add(clean)
+            }
+        }
+        baseOffline.toList()
     }
 
     val filteredClients = remember(clients, searchQuery) {
@@ -350,6 +396,14 @@ fun ClientsPage(
                         )
                     }
 
+                    OutlinedButton(
+                        onClick = { actions.onOpenDomainBlocking(null) },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.testTag("open_domain_blocking_button"),
+                    ) {
+                        Text("Domains")
+                    }
+
                     Button(
                         onClick = { showAddDialog = true },
                         colors = ButtonDefaults.buttonColors(
@@ -366,10 +420,51 @@ fun ClientsPage(
                 }
             }
 
+            if (isSoftApModeActive) {
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = ShizziTheme.colors.primary.copy(alpha = 0.12f),
+                    ),
+                    border = BorderStroke(1.dp, ShizziTheme.colors.primary.copy(alpha = 0.4f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp)
+                        .testTag("softap_active_mode_banner"),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Block,
+                            contentDescription = null,
+                            tint = ShizziTheme.colors.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "SoftAP MAC Blocklist Mode Active",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp,
+                                color = ShizziTheme.colors.onSurface,
+                            )
+                            Text(
+                                text = "Blocked clients are disconnected from the Wi-Fi hotspot and remain listed below while offline so you can unblock or reset quota anytime. Per-client bandwidth throttling is disabled in SoftAP mode.",
+                                fontSize = 11.sp,
+                                color = ShizziTheme.colors.onSurfaceMuted,
+                            )
+                        }
+                    }
+                }
+            }
+
             // Prominent warning banner if Direct-TUN fallback is active without kernel netfilter
             if (sessionState.status == UiStatus.CONNECTED &&
                 sessionState.datapathMode == DatapathMode.DIRECT_TUN_FALLBACK &&
-                !sessionState.kernelNetfilterAvailable
+                !sessionState.kernelNetfilterAvailable &&
+                !isSoftApModeActive
             ) {
                 Card(
                     shape = RoundedCornerShape(12.dp),
@@ -475,7 +570,8 @@ fun ClientsPage(
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = ScreenPadding),
+                    .padding(horizontal = ScreenPadding)
+                    .testTag("clients_lazy_column"),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 if (filteredClients.isEmpty()) {
@@ -517,12 +613,25 @@ fun ClientsPage(
                         }
                     }
                 } else {
+                    val globalActiveDomains = domainRules.count {
+                        it.scope == dev.shizzi.DomainRuleScope.GLOBAL && it.enabled
+                    }
                     items(filteredClients, key = { "active_${it.cleanMac}" }) { client ->
+                        val clientActiveDomains = domainRules.count {
+                            it.scope == dev.shizzi.DomainRuleScope.CLIENT &&
+                                it.clientMac.equals(client.cleanMac, ignoreCase = true) &&
+                                it.enabled
+                        }
                         ClientCard(
                             client = client,
                             isCurrentlyConnected = true,
+                            softApRecord = softApRecordsByMac[client.cleanMac],
+                            isSoftApModeActive = isSoftApModeActive,
+                            clientDomainRuleCount = clientActiveDomains,
+                            globalDomainRuleCount = globalActiveDomains,
                             onToggleBlock = { actions.onToggleBlock(client.mac, !client.isBlocked) },
                             onEdit = { selectedClientForEdit = client },
+                            onOpenDomainRules = { actions.onOpenDomainBlocking(client.cleanMac) },
                             onDelete = { actions.onRemoveRule(client.mac) },
                         )
                     }
@@ -540,8 +649,16 @@ fun ClientsPage(
                         }
                     }
 
+                    val globalActiveDomains = domainRules.count {
+                        it.scope == dev.shizzi.DomainRuleScope.GLOBAL && it.enabled
+                    }
                     items(filteredOfflineRules, key = { "offline_${it.cleanMac}" }) { rule ->
                         val evalRule = rule.withEvaluatedQuotaWindow()
+                        val clientActiveDomains = domainRules.count {
+                            it.scope == dev.shizzi.DomainRuleScope.CLIENT &&
+                                it.clientMac.equals(evalRule.cleanMac, ignoreCase = true) &&
+                                it.enabled
+                        }
                         val offlineClientView = ConnectedClient(
                             mac = evalRule.cleanMac,
                             ip = "Offline",
@@ -567,8 +684,13 @@ fun ClientsPage(
                         ClientCard(
                             client = offlineClientView,
                             isCurrentlyConnected = false,
+                            softApRecord = softApRecordsByMac[evalRule.cleanMac],
+                            isSoftApModeActive = isSoftApModeActive,
+                            clientDomainRuleCount = clientActiveDomains,
+                            globalDomainRuleCount = globalActiveDomains,
                             onToggleBlock = { actions.onToggleBlock(rule.cleanMac, !rule.isBlocked) },
                             onEdit = { selectedClientForEdit = offlineClientView },
+                            onOpenDomainRules = { actions.onOpenDomainBlocking(evalRule.cleanMac) },
                             onDelete = { actions.onRemoveRule(rule.cleanMac) },
                         )
                     }
@@ -585,6 +707,7 @@ fun ClientsPage(
     selectedClientForEdit?.let { client ->
         ConfigureClientDialog(
             client = client,
+            isSoftApModeActive = isSoftApModeActive,
             onDismiss = { selectedClientForEdit = null },
             onSave = { rule ->
                 actions.onSaveRule(rule)
@@ -612,8 +735,13 @@ fun ClientsPage(
 private fun ClientCard(
     client: ConnectedClient,
     isCurrentlyConnected: Boolean,
+    softApRecord: SoftApClientEnforcementRecord? = null,
+    isSoftApModeActive: Boolean = false,
+    clientDomainRuleCount: Int = 0,
+    globalDomainRuleCount: Int = 0,
     onToggleBlock: () -> Unit,
     onEdit: () -> Unit,
+    onOpenDomainRules: () -> Unit = {},
     onDelete: () -> Unit,
 ) {
     val (isRestricted, restrictReason) = client.isRestricted()
@@ -708,8 +836,13 @@ private fun ClientCard(
             ) {
                 // Status badge (honest packet-verified vs partial BPF vs configured vs unavailable vs degraded)
                 if (!isCurrentlyConnected) {
+                    val softApLabelSuffix = if (softApRecord != null && softApRecord.appliedState == SoftApAppliedState.BLOCK_CONFIRMED) {
+                        " • SoftAP BLOCK_CONFIRMED"
+                    } else {
+                        ""
+                    }
                     BadgeChip(
-                        label = if (isRestricted) "Offline • ${restrictReason ?: "Blocked"} (saved)" else "Offline • Saved Rule",
+                        label = if (isRestricted) "Offline • ${restrictReason ?: "Blocked"} (saved$softApLabelSuffix)" else "Offline • Saved Rule$softApLabelSuffix",
                         color = if (isRestricted) Color(0xFFFF5252) else ShizziTheme.colors.onSurfaceMuted,
                         icon = if (isRestricted) Icons.Filled.Block else Icons.Filled.Devices,
                     )
@@ -738,15 +871,44 @@ private fun ClientCard(
                     )
                 }
 
-                // Bandwidth badge (honest packet-verified vs policy active vs not enforced)
+                // SoftAP enforcement status badge when SoftAP record is present
+                if (softApRecord != null && (isSoftApModeActive || softApRecord.appliedState != SoftApAppliedState.UNBLOCKED || softApRecord.activeReasons.isNotEmpty())) {
+                    val reasonsText = if (softApRecord.activeReasons.isEmpty()) {
+                        ""
+                    } else {
+                        " (${softApRecord.activeReasons.joinToString(",") { it.name }})"
+                    }
+                    val softApBadgeColor = when (softApRecord.appliedState) {
+                        SoftApAppliedState.BLOCK_CONFIRMED -> Color(0xFFFF5252)
+                        SoftApAppliedState.BLOCK_PENDING,
+                        SoftApAppliedState.UNBLOCK_PENDING -> Color(0xFFFFA000)
+                        SoftApAppliedState.BLOCK_FAILED,
+                        SoftApAppliedState.CONFLICT_ALLOWLIST,
+                        SoftApAppliedState.ROLLBACK_REQUIRED -> Color(0xFFE57373)
+                        SoftApAppliedState.UNBLOCKED -> Color(0xFF4CAF50)
+                    }
+                    BadgeChip(
+                        label = "SoftAP: ${softApRecord.appliedState.name}$reasonsText",
+                        color = softApBadgeColor,
+                        icon = Icons.Filled.Block,
+                        modifier = Modifier.testTag("softap_status_${client.cleanMac}"),
+                    )
+                }
+
+                // Bandwidth badge (honest packet-verified vs policy active vs not enforced vs disabled in SoftAP mode)
                 if (client.bandwidthLimitKbps > 0) {
-                    val capColor = if (isCurrentlyConnected && (state == EnforcementState.ENFORCEMENT_UNAVAILABLE || state == EnforcementState.DEGRADED_MULTI_CLIENT)) {
+                    val capColor = if (isSoftApModeActive || (isCurrentlyConnected && (state == EnforcementState.ENFORCEMENT_UNAVAILABLE || state == EnforcementState.DEGRADED_MULTI_CLIENT))) {
                         Color(0xFFFFA000)
                     } else {
                         ShizziTheme.colors.primary
                     }
+                    val bwLabel = if (isSoftApModeActive) {
+                        "Cap: ${formatKbpsAsMbps(client.bandwidthLimitKbps)} Mbps (disabled in SoftAP mode)"
+                    } else {
+                        formatClientBandwidthBadgeLabel(client, isCurrentlyConnected)
+                    }
                     BadgeChip(
-                        label = formatClientBandwidthBadgeLabel(client, isCurrentlyConnected),
+                        label = bwLabel,
                         color = capColor,
                         icon = Icons.Filled.Speed,
                     )
@@ -791,6 +953,21 @@ private fun ClientCard(
                         icon = Icons.Filled.Schedule,
                     )
                 }
+
+                // Domain Rules badge
+                if (clientDomainRuleCount > 0 || globalDomainRuleCount > 0) {
+                    val domainBadgeLabel = if (clientDomainRuleCount > 0) {
+                        "Domains: $clientDomainRuleCount host (Global rules also apply: $globalDomainRuleCount)"
+                    } else {
+                        "Global domain rules apply ($globalDomainRuleCount)"
+                    }
+                    BadgeChip(
+                        label = domainBadgeLabel,
+                        color = ShizziTheme.colors.primary,
+                        icon = Icons.Filled.Block,
+                        modifier = Modifier.testTag("client_domain_badge_${client.cleanMac}"),
+                    )
+                }
             }
 
             if (client.dataLimitBytes > 0L || client.quotaUsedTotalBytes > 0L || isCurrentlyConnected) {
@@ -824,6 +1001,17 @@ private fun ClientCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 TextButton(
+                    onClick = onOpenDomainRules,
+                    modifier = Modifier.testTag("client_domain_rules_${client.cleanMac}"),
+                ) {
+                    Icon(Icons.Filled.Block, contentDescription = null, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        if (clientDomainRuleCount > 0) "Domains ($clientDomainRuleCount)" else "Domains",
+                    )
+                }
+
+                TextButton(
                     onClick = onEdit,
                     modifier = Modifier.testTag("configure_client_${client.cleanMac}"),
                 ) {
@@ -853,11 +1041,13 @@ private fun BadgeChip(
     label: String,
     color: Color,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
+    modifier: Modifier = Modifier,
 ) {
     Surface(
         shape = RoundedCornerShape(8.dp),
         color = color.copy(alpha = 0.12f),
         border = BorderStroke(0.5.dp, color.copy(alpha = 0.3f)),
+        modifier = modifier.semantics(mergeDescendants = true) {},
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -884,6 +1074,7 @@ private fun BadgeChip(
 @Composable
 internal fun ConfigureClientDialog(
     client: ConnectedClient,
+    isSoftApModeActive: Boolean = false,
     onDismiss: () -> Unit,
     onSave: (ClientRule) -> Unit,
     onResetQuotaUsage: () -> Unit = {},
@@ -974,7 +1165,11 @@ internal fun ConfigureClientDialog(
                             style = ShizziTheme.typography.body,
                         )
                         Text(
-                            text = "Immediately drops all download & upload traffic for this client",
+                            text = if (isSoftApModeActive) {
+                                "Disconnects this client from the Wi-Fi hotspot via SoftAP MAC blocklist"
+                            } else {
+                                "Immediately drops all download & upload traffic for this client"
+                            },
                             fontSize = 12.sp,
                             color = ShizziTheme.colors.onSurfaceMuted,
                         )
@@ -996,13 +1191,20 @@ internal fun ConfigureClientDialog(
                 OutlinedTextField(
                     value = bandwidthMbpsText,
                     onValueChange = { bandwidthMbpsText = it },
+                    enabled = !isSoftApModeActive,
                     label = { Text("Bandwidth Limit (Mbps)") },
                     suffix = { Text("Mbps") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     isError = !bandwidthValidation.isValid,
                     supportingText = {
-                        if (bandwidthValidation.errorMessage != null) {
+                        if (isSoftApModeActive) {
+                            Text(
+                                text = "Bandwidth throttling is unsupported while SoftAP MAC Blocklist mode is active.",
+                                color = Color(0xFFFFA000),
+                                modifier = Modifier.testTag("softap_throttle_disabled_notice"),
+                            )
+                        } else if (bandwidthValidation.errorMessage != null) {
                             Text(
                                 text = bandwidthValidation.errorMessage,
                                 color = Color(0xFFFF5252),

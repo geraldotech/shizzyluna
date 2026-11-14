@@ -1,6 +1,6 @@
 {
-  "name": "shizzy lua",
-  "description": "Rootless hotspot & tethering carrier restriction bypass utility with eBPF NAT flow attribution, per-client token-bucket QoS, and persistent data quota limits (v0.10.2)",
+  "name": "shizzy lua (Debug)",
+  "description": "Rootless hotspot & tethering carrier restriction bypass utility with eBPF NAT flow attribution, per-client token-bucket QoS, data quotas, and v0.10.3-debug BPF/NAT leak diagnostics",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -64,18 +64,52 @@ data class AppActions(
     val onSetBpfPollIntervalMs: (Int) -> Unit = {},
     val onCollectBpfSnapshotNow: () -> Unit = {},
     val onResetClientQuotaUsage: (String) -> Unit = {},
+    val onSetBpfRefreshOnMissEnabled: (Boolean) -> Unit = {},
+    val onSetBpfDeepTupleDiagnosticsEnabled: (Boolean) -> Unit = {},
+    val onSetBpfExportPseudonymousIds: (Boolean) -> Unit = {},
+    val onResetBpfDiagnosticsCounters: () -> Unit = {},
+    val onSetPhaseDEnforcementMode: (PhaseDEnforcementMode) -> Unit = {},
+    val onRecordPhaseDDeliveryTestMarker: (String, String) -> Unit = { _, _ -> },
+    val onSelectBlockingMode: (BlockingMode) -> Unit = {},
+    val onCheckPreNatCapability: () -> Unit = {},
+    val onReviewPreNatScopedProbe: () -> Unit = {},
+    val onRunPreNatScopedProbe: (Boolean) -> Unit = {},
+    val onActivatePreNatMode: () -> Unit = {},
+    val onRestoreBpfMode: () -> Unit = {},
+    val onCheckSoftApCapability: () -> Unit = {},
+    val onRunSoftApLiveProbe: (String, String, Boolean, Int) -> Unit = { _, _, _, _ -> },
+    val onActivateSoftApMode: () -> Unit = {},
+    val onUpsertDomainRule: (
+        existingRuleId: String?,
+        rawDomain: String,
+        scope: DomainRuleScope,
+        clientMac: String?,
+        matchMode: DomainMatchMode,
+        enabled: Boolean,
+    ) -> DomainValidationResult = { _, raw, _, _, _, _ -> DomainNormalizer.validateAndNormalize(raw) },
+    val onToggleDomainRuleEnabled: (String, Boolean) -> Unit = { _, _ -> },
+    val onRemoveDomainRule: (String) -> Unit = {},
+    val onClearGlobalDomainRules: () -> Unit = {},
+    val onClearClientDomainRules: (String) -> Unit = {},
 )
 
 /** Routes the navigator's current screen and hosts the toast overlay. */
 @Composable
 fun HomeScreen(state: AppState, actions: AppActions) {
     val current = rememberNavigator()
+    val domainSelectedClientMac = androidx.compose.runtime.remember {
+        androidx.compose.runtime.mutableStateOf<String?>(null)
+    }
+    val domainPreviousScreen = androidx.compose.runtime.remember {
+        androidx.compose.runtime.mutableStateOf(Screen.HOME)
+    }
     val goHome = { current.value = Screen.HOME }
 
     val goBack = {
         current.value = when (current.value) {
             Screen.LOG -> Screen.SETTINGS
             Screen.FIREWALL_DIAGNOSTIC -> Screen.CLIENTS
+            Screen.DOMAIN_BLOCKING -> domainPreviousScreen.value
             Screen.CLIENTS -> Screen.HOME
             else -> Screen.HOME
         }
@@ -83,7 +117,17 @@ fun HomeScreen(state: AppState, actions: AppActions) {
     HandleBack(current.value, goBack)
 
     val toasts = rememberToastState()
-    val navigation = Navigation(goHome = goHome, goBack = goBack, open = { current.value = it })
+    val navigation = Navigation(
+        goHome = goHome,
+        goBack = goBack,
+        open = { current.value = it },
+        openDomainBlocking = { mac, from ->
+            domainSelectedClientMac.value = mac
+            domainPreviousScreen.value = from
+            current.value = Screen.DOMAIN_BLOCKING
+        },
+        selectedDomainClientMac = domainSelectedClientMac.value,
+    )
 
     SessionToasts(
         state = state.session,
@@ -116,6 +160,8 @@ private data class Navigation(
     val goHome: () -> Unit,
     val goBack: () -> Unit,
     val open: (Screen) -> Unit,
+    val openDomainBlocking: (String?, Screen) -> Unit = { _, _ -> },
+    val selectedDomainClientMac: String? = null,
 )
 
 private data class ScreenContext(
@@ -131,6 +177,7 @@ private fun ScreenBody(screen: Screen, context: ScreenContext) {
         Screen.HOME -> HomeRoute(context)
         Screen.SETTINGS -> SettingsRoute(context)
         Screen.CLIENTS -> ClientsRoute(context)
+        Screen.DOMAIN_BLOCKING -> DomainBlockingRoute(context)
         Screen.LOG -> LogRoute(context)
         Screen.FIREWALL_DIAGNOSTIC -> FirewallDiagnosticRoute(context)
         Screen.EASTER_EGG -> EasterEggPage(onDismiss = context.navigation.goHome)
@@ -149,6 +196,7 @@ private fun HomeRoute(context: ScreenContext) {
             onOpenSettings = { context.navigation.open(Screen.SETTINGS) },
             onOpenClients = { context.navigation.open(Screen.CLIENTS) },
             onOpenEasterEgg = { context.navigation.open(Screen.EASTER_EGG) },
+            onOpenDomainBlocking = { context.navigation.openDomainBlocking(null, Screen.HOME) },
         ),
     )
 }
@@ -157,11 +205,14 @@ private fun HomeRoute(context: ScreenContext) {
 private fun ClientsRoute(context: ScreenContext) {
     val actions = context.actions
     val navigation = context.navigation
+    val bpfReport = context.state.firewallDiag.bpfReport ?: context.state.session.bpfAttribution
 
     dev.shizzi.ui.ClientsPage(
         clients = context.state.clients,
         savedRules = context.state.settings.clientRules,
+        domainRules = context.state.settings.domainRules,
         sessionState = context.state.session,
+        bpfReport = bpfReport,
         experimentalBpfEnabled = context.state.settings.experimentalBpfEnabled,
         bpfPollIntervalMs = context.state.settings.bpfPollIntervalMs,
         actions = dev.shizzi.ui.ClientActions(
@@ -170,9 +221,35 @@ private fun ClientsRoute(context: ScreenContext) {
             onRemoveRule = actions.onRemoveClientRule,
             onRefresh = actions.onRefreshClients,
             onOpenFirewallDiagnostic = { navigation.open(Screen.FIREWALL_DIAGNOSTIC) },
+            onOpenDomainBlocking = { mac -> navigation.openDomainBlocking(mac, Screen.CLIENTS) },
             onSetExperimentalBpfEnabled = actions.onSetExperimentalBpfEnabled,
             onCollectBpfSnapshotNow = actions.onCollectBpfSnapshotNow,
             onResetClientQuotaUsage = actions.onResetClientQuotaUsage,
+        ),
+        onBack = navigation.goBack,
+    )
+}
+
+@Composable
+private fun DomainBlockingRoute(context: ScreenContext) {
+    val actions = context.actions
+    val navigation = context.navigation
+    val bpfReport = context.state.firewallDiag.bpfReport ?: context.state.session.bpfAttribution
+    val initialMac = navigation.selectedDomainClientMac
+
+    dev.shizzi.ui.DomainBlockingPage(
+        domainRules = context.state.settings.domainRules,
+        connectedClients = context.state.clients,
+        savedClientRules = context.state.settings.clientRules,
+        bpfReport = bpfReport,
+        initialScope = if (!initialMac.isNullOrBlank()) DomainRuleScope.CLIENT else DomainRuleScope.GLOBAL,
+        initialClientMac = initialMac,
+        actions = dev.shizzi.ui.DomainBlockingActions(
+            onUpsertRule = actions.onUpsertDomainRule,
+            onToggleRuleEnabled = actions.onToggleDomainRuleEnabled,
+            onRemoveRule = actions.onRemoveDomainRule,
+            onClearGlobalRules = actions.onClearGlobalDomainRules,
+            onClearClientRules = actions.onClearClientDomainRules,
         ),
         onBack = navigation.goBack,
     )
@@ -212,6 +289,7 @@ private fun SettingsRoute(context: ScreenContext) {
 
 private fun settingsState(state: AppState): SettingsState {
     val settings = state.settings
+    val bpfReport = state.firewallDiag.bpfReport ?: state.session.bpfAttribution
 
     return SettingsState(
         shizuku = state.session.shizukuState,
@@ -229,6 +307,16 @@ private fun settingsState(state: AppState): SettingsState {
         ),
         dnsSettings = settings.dnsSettings,
         experimentalBpfEnabled = settings.experimentalBpfEnabled,
+        bpfRefreshOnMissEnabled = settings.bpfRefreshOnMissEnabled,
+        bpfDeepTupleDiagnosticsEnabled = settings.bpfDeepTupleDiagnosticsEnabled,
+        bpfExportPseudonymousIds = settings.bpfExportPseudonymousIds,
+        phaseDEnforcementMode = settings.phaseDEnforcementMode,
+        requestedBlockingMode = settings.requestedBlockingMode,
+        bpfReport = bpfReport,
+        isCollectingBpf = state.firewallDiag.isCollectingBpf,
+        connectedClients = state.clients,
+        clientRules = settings.clientRules,
+        domainRules = settings.domainRules,
     )
 }
 
@@ -245,9 +333,26 @@ private fun settingsActions(context: ScreenContext): SettingsActions {
         onSetDnsPreset = actions.onSetDnsPreset,
         onSetCustomDns = actions.onSetCustomDns,
         onOpenClients = { context.navigation.open(Screen.CLIENTS) },
+        onOpenDomainBlocking = { context.navigation.openDomainBlocking(null, Screen.SETTINGS) },
         onOpenLog = { context.navigation.open(Screen.LOG) },
         onOpenFirewallDiagnostic = { context.navigation.open(Screen.FIREWALL_DIAGNOSTIC) },
         onSetExperimentalBpfEnabled = actions.onSetExperimentalBpfEnabled,
+        onSetBpfRefreshOnMissEnabled = actions.onSetBpfRefreshOnMissEnabled,
+        onSetBpfDeepTupleDiagnosticsEnabled = actions.onSetBpfDeepTupleDiagnosticsEnabled,
+        onSetBpfExportPseudonymousIds = actions.onSetBpfExportPseudonymousIds,
+        onSetPhaseDEnforcementMode = actions.onSetPhaseDEnforcementMode,
+        onRecordPhaseDDeliveryTestMarker = actions.onRecordPhaseDDeliveryTestMarker,
+        onSelectBlockingMode = actions.onSelectBlockingMode,
+        onCheckPreNatCapability = actions.onCheckPreNatCapability,
+        onReviewPreNatScopedProbe = actions.onReviewPreNatScopedProbe,
+        onRunPreNatScopedProbe = actions.onRunPreNatScopedProbe,
+        onActivatePreNatMode = actions.onActivatePreNatMode,
+        onRestoreBpfMode = actions.onRestoreBpfMode,
+        onCheckSoftApCapability = actions.onCheckSoftApCapability,
+        onRunSoftApLiveProbe = actions.onRunSoftApLiveProbe,
+        onActivateSoftApMode = actions.onActivateSoftApMode,
+        onCollectBpfSnapshotNow = actions.onCollectBpfSnapshotNow,
+        onResetBpfDiagnosticsCounters = actions.onResetBpfDiagnosticsCounters,
         onRunProbes = actions.onRunProbes,
         onGrantPermission = actions.onGrantPermission,
         onShizukuAction = actions.onShizukuAction,

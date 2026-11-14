@@ -22,6 +22,8 @@ class TetherService : ITetherService.Stub {
     constructor(context: Context) {
         this.context = context
         liveInstance = this
+        ExclusiveBlockingModeController.softApEngine.platformAdapter =
+            ReflectionSoftApPlatformAdapter { shellContext }
     }
 
     override fun getContractVersion(): Int = CONTRACT_VERSION
@@ -74,6 +76,11 @@ class TetherService : ITetherService.Stub {
             .onFailure { failure -> Log.e(TAG, "updateRules failed: ${failure.message}") }
     }
 
+    override fun updateDomainRules(domainRulesJson: String?) {
+        runCatching { session.updateDomainRules(domainRulesJson.orEmpty()) }
+            .onFailure { failure -> Log.e(TAG, "updateDomainRules failed: ${failure.message}") }
+    }
+
     override fun clearLog() {
         runCatching { SessionLog.clear() }
             .onFailure { failure -> Log.w(TAG, "clearLog: ${failure.message}") }
@@ -124,6 +131,73 @@ class TetherService : ITetherService.Stub {
             .onFailure { failure -> Log.e(TAG, "resetClientQuota failed: ${failure.message}") }
     }
 
+    override fun setBpfRefreshOnMissConfig(enabled: Boolean, cooldownMs: Int): String =
+        runCatching { session.setBpfRefreshOnMissConfig(enabled, cooldownMs) }
+            .getOrElse { failure -> errorReport("setBpfRefreshOnMissConfig", failure) }
+
+    override fun setDeepTupleDiagnosticsEnabled(enabled: Boolean): String =
+        runCatching { session.setDeepTupleDiagnosticsEnabled(enabled) }
+            .getOrElse { failure -> errorReport("setDeepTupleDiagnosticsEnabled", failure) }
+
+    override fun resetBpfDiagnosticsCounters(): String =
+        runCatching { session.resetBpfDiagnosticsCounters() }
+            .getOrElse { failure -> errorReport("resetBpfDiagnosticsCounters", failure) }
+
+    override fun setPhaseDEnforcementMode(mode: String?): String =
+        runCatching { session.setPhaseDEnforcementMode(mode.orEmpty()) }
+            .getOrElse { failure -> errorReport("setPhaseDEnforcementMode", failure) }
+
+    override fun recordPhaseDDeliveryTestMarker(markerType: String?, note: String?): String =
+        runCatching { session.recordPhaseDDeliveryTestMarker(markerType.orEmpty(), note.orEmpty()) }
+            .getOrElse { failure -> errorReport("recordPhaseDDeliveryTestMarker", failure) }
+
+    override fun selectBlockingMode(mode: String?): String =
+        runCatching { session.selectBlockingMode(mode.orEmpty()) }
+            .getOrElse { failure -> errorReport("selectBlockingMode", failure) }
+
+    override fun checkPreNatCapability(): String =
+        runCatching { session.checkPreNatCapability() }
+            .getOrElse { failure -> errorReport("checkPreNatCapability", failure) }
+
+    override fun reviewPreNatScopedProbe(): String =
+        runCatching { session.reviewPreNatScopedProbe() }
+            .getOrElse { failure -> errorReport("reviewPreNatScopedProbe", failure) }
+
+    override fun runPreNatScopedProbe(userConfirmed: Boolean): String =
+        runCatching { session.runPreNatScopedProbe(userConfirmed) }
+            .getOrElse { failure -> errorReport("runPreNatScopedProbe", failure) }
+
+    override fun activatePreNatBlockingMode(): String =
+        runCatching { session.activatePreNatBlockingMode() }
+            .getOrElse { failure -> errorReport("activatePreNatBlockingMode", failure) }
+
+    override fun restoreBpfBlockingMode(): String =
+        runCatching { session.restoreBpfBlockingMode() }
+            .getOrElse { failure -> errorReport("restoreBpfBlockingMode", failure) }
+
+    override fun checkSoftApCapability(): String =
+        runCatching { session.checkSoftApCapability() }
+            .getOrElse { failure -> errorReport("checkSoftApCapability", failure) }
+
+    override fun runSoftApLiveProbe(
+        clientAMac: String?,
+        clientBMac: String?,
+        userConfirmed: Boolean,
+        disconnectTimeoutMs: Int,
+    ): String =
+        runCatching {
+            session.runSoftApLiveProbe(
+                clientAMac = clientAMac.orEmpty(),
+                clientBMac = clientBMac.orEmpty(),
+                userConfirmed = userConfirmed,
+                disconnectTimeoutMs = disconnectTimeoutMs,
+            )
+        }.getOrElse { failure -> errorReport("runSoftApLiveProbe", failure) }
+
+    override fun activateSoftApBlockingMode(): String =
+        runCatching { session.activateSoftApBlockingMode() }
+            .getOrElse { failure -> errorReport("activateSoftApBlockingMode", failure) }
+
     private fun publish(report: String): String {
         runCatching { java.io.File(REPORT_PATH).writeText(report) }
             .onFailure { failure -> Log.w(TAG, "publish: ${failure.message}") }
@@ -169,8 +243,19 @@ class TetherService : ITetherService.Stub {
         private const val TAG = "TetherService"
         private const val STACK_TRACE_CHARS = 4000
 
-        const val REPORT_PATH = "/data/local/tmp/shizzi-probe-report.json"
-        const val FIREWALL_DIAG_REPORT_PATH = "/data/local/tmp/shizzi-firewall-diagnostic.json"
+        val REPORT_PATH: String =
+            if (BuildConfig.APPLICATION_ID.endsWith(".debug")) {
+                "/data/local/tmp/shizzi-debug-probe-report.json"
+            } else {
+                "/data/local/tmp/shizzi-probe-report.json"
+            }
+
+        val FIREWALL_DIAG_REPORT_PATH: String =
+            if (BuildConfig.APPLICATION_ID.endsWith(".debug")) {
+                "/data/local/tmp/shizzi-debug-firewall-diagnostic.json"
+            } else {
+                "/data/local/tmp/shizzi-firewall-diagnostic.json"
+            }
 
         private const val SHELL_PACKAGE = "com.android.shell"
 

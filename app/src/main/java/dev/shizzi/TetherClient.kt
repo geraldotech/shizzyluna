@@ -330,6 +330,123 @@ class TetherClient {
         BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
     }
 
+    suspend fun setBpfRefreshOnMissConfig(
+        enabled: Boolean,
+        cooldownMs: Int = 500,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.setBpfRefreshOnMissConfig(enabled, cooldownMs)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun setDeepTupleDiagnosticsEnabled(
+        enabled: Boolean,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.setDeepTupleDiagnosticsEnabled(enabled)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun resetBpfDiagnosticsCounters(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.resetBpfDiagnosticsCounters()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun setPhaseDEnforcementMode(
+        mode: PhaseDEnforcementMode,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.setPhaseDEnforcementMode(mode.name)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun recordPhaseDDeliveryTestMarker(
+        markerType: String,
+        note: String = "",
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.recordPhaseDDeliveryTestMarker(markerType, note)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun selectBlockingMode(
+        mode: BlockingMode,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.selectBlockingMode(mode.name)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun checkPreNatCapability(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.checkPreNatCapability()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun reviewPreNatScopedProbe(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.reviewPreNatScopedProbe()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun runPreNatScopedProbe(
+        userConfirmed: Boolean,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.runPreNatScopedProbe(userConfirmed)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun activatePreNatBlockingMode(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.activatePreNatBlockingMode()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun restoreBpfBlockingMode(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.restoreBpfBlockingMode()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun checkSoftApCapability(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.checkSoftApCapability()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun runSoftApLiveProbe(
+        clientAMac: String,
+        clientBMac: String,
+        userConfirmed: Boolean,
+        disconnectTimeoutMs: Int = 5_000,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.runSoftApLiveProbe(clientAMac, clientBMac, userConfirmed, disconnectTimeoutMs)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
+    suspend fun activateSoftApBlockingMode(): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.activateSoftApBlockingMode()
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
+    }
+
     suspend fun checkCompatibility(): List<CapabilityResult> = withContext(Dispatchers.IO) {
         val bound = service()
         verifyContract(bound)
@@ -373,6 +490,13 @@ class TetherClient {
         runCatching {
             val bound = service()
             bound.updateRules(rulesJson)
+        }
+    }
+
+    suspend fun updateDomainRules(domainRulesJson: String) = withContext(Dispatchers.IO) {
+        runCatching {
+            val bound = service()
+            bound.updateDomainRules(domainRulesJson)
         }
     }
 
@@ -437,7 +561,8 @@ class TetherClient {
 
     private companion object {
 
-        private const val SERVICE_TAG = "shizzi-session"
+        private val SERVICE_TAG =
+            if (BuildConfig.APPLICATION_ID.endsWith(".debug")) "shizzi-session-debug" else "shizzi-session"
 
         const val BIND_TIMEOUT_MS = 35_000L
 
