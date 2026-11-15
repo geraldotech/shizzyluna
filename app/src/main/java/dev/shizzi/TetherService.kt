@@ -198,6 +198,15 @@ class TetherService : ITetherService.Stub {
         runCatching { session.activateSoftApBlockingMode() }
             .getOrElse { failure -> errorReport("activateSoftApBlockingMode", failure) }
 
+    override fun setStopHotspotOnVpnDisconnect(enabled: Boolean): String =
+        runCatching { session.setStopHotspotOnVpnDisconnect(enabled) }
+            .getOrElse { failure -> sessionError("setStopHotspotOnVpnDisconnect", failure) }
+
+    override fun setDnsAttributionRetryConfig(enabled: Boolean, maxWaitMs: Int): String =
+        runCatching { session.setDnsAttributionRetryConfig(enabled, maxWaitMs) }
+            .getOrElse { failure -> errorReport("setDnsAttributionRetryConfig", failure) }
+
+
     private fun publish(report: String): String {
         runCatching { java.io.File(REPORT_PATH).writeText(report) }
             .onFailure { failure -> Log.w(TAG, "publish: ${failure.message}") }

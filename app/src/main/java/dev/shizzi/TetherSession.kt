@@ -108,6 +108,19 @@ class TetherSession(private val context: Context) {
         return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
     }
 
+    fun setStopHotspotOnVpnDisconnect(enabled: Boolean): String {
+        vpn.updateStopHotspotOnVpnDisconnect(enabled)
+        return status()
+    }
+
+    fun setDnsAttributionRetryConfig(enabled: Boolean, maxWaitMs: Int): String {
+        TunTrafficEngine.configureDnsAttributionRetry(
+            enabled = enabled,
+            maxWaitMs = maxWaitMs.toLong(),
+        )
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
     private fun syncInterfacesIfActive() {
         if (isActive) {
             val snapshot = downstream.inspectSnapshot(forceRefresh = false)
@@ -312,6 +325,7 @@ class TetherSession(private val context: Context) {
 
     private fun followVpn(group: SessionResources) {
         if (vpnMode == VpnMode.NEVER) {
+            vpn.configureForSessionStart(VpnMode.NEVER)
             SessionLog.info("vpn mode never: datapath left unbound")
             return
         }
@@ -319,7 +333,7 @@ class TetherSession(private val context: Context) {
         check(vpnMode != VpnMode.ALWAYS || vpn.isVpnPresent()) {
             "followVpn: vpn mode always requires an active VPN, none is connected"
         }
-        vpn.follow(group)
+        vpn.follow(group, vpnMode)
     }
 
     private fun startWatchdog(name: String) {
@@ -452,12 +466,31 @@ class TetherSession(private val context: Context) {
     }
 
     fun status(): String = JSONObject().apply {
+        val bypassed = isVpnBypassed()
+        val vpnDiag = vpn.buildDiagnostics(isSessionActive = isActive, isVpnBypassed = bypassed)
+        val effectiveDetail = when {
+            isActive && vpnDiag.vpnLifecycleState == VpnLifecycleState.VPN_WAITING_FOR_RECOVERY ->
+                "VPN disconnected — waiting for reconnection"
+            isActive && vpnDiag.vpnLifecycleState == VpnLifecycleState.VPN_REBINDING ->
+                "VPN reconnecting — re-binding datapath"
+            isActive && vpnDiag.vpnLifecycleState == VpnLifecycleState.VPN_RECOVERY_FAILED ->
+                "VPN reconnect failed — retrying (traffic paused)"
+            else -> detail
+        }
         put("state", state.name)
-        put("detail", detail)
+        put("detail", effectiveDetail)
         put("interface", interfaceName ?: JSONObject.NULL)
 
         put("isVpnBound", vpn.isBound)
-        put("isVpnBypassed", isVpnBypassed())
+        put("isVpnBypassed", bypassed)
+        put("vpnLifecycleState", vpnDiag.vpnLifecycleState.name)
+        put("stopHotspotOnVpnDisconnect", vpnDiag.stopHotspotOnVpnDisconnect)
+        put("vpnOutageCount", vpnDiag.vpnOutageCount)
+        put("vpnRecoveryCount", vpnDiag.vpnRecoveryCount)
+        put("vpnWaitingDurationMs", vpnDiag.vpnWaitingDurationMs)
+        put("vpnForwardingGateClosed", vpnDiag.vpnForwardingGateClosed)
+        put("vpnStatusLabel", vpnDiag.vpnStatusLabel)
+        put("vpnRecoveryDiagnostics", vpnDiag.toJson())
 
         val traffic = interfaceName?.let(InterfaceCounters::read) ?: Traffic()
         put("bytesUp", traffic.up)
@@ -520,7 +553,12 @@ class TetherSession(private val context: Context) {
             }
         }
         put("connectedClients", clientsArray)
-        put("bpfAttribution", TunTrafficEngine.getBpfAttributionReport().toJson())
+        put(
+            "bpfAttribution",
+            TunTrafficEngine.getBpfAttributionReport()
+                .copy(vpnRecoveryDiagnostics = vpnDiag)
+                .toJson(),
+        )
     }.toString()
 
     private fun isVpnBypassed(): Boolean {

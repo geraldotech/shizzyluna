@@ -1680,16 +1680,16 @@ class BpfFlowAttributionTest {
     }
 
     @Test
-    fun `21 v0_10_8_debug build identity and file paths isolate debug APK from production baseline`() {
-        assertEquals("dev.shizzyluna.proxy.debug", BuildConfig.APPLICATION_ID)
-        assertEquals("0.10.8-debug", BuildConfig.VERSION_NAME)
-        assertEquals(23, BuildConfig.VERSION_CODE)
-        assertEquals(23, BuildConfig.SERVICE_BUILD_ID)
-        assertTrue(BuildConfig.DEBUG_DIAGNOSTICS_ENABLED)
-        assertFalse("applicationId must not have duplicate .debug.debug suffix", BuildConfig.APPLICATION_ID.endsWith(".debug.debug"))
-        assertEquals("/data/local/tmp/shizzyluna-debug-quota-state.json", DataQuota.DEFAULT_CHECKPOINT_FILE_PATH)
-        assertEquals("/data/local/tmp/shizzi-debug-probe-report.json", TetherService.REPORT_PATH)
-        assertEquals("/data/local/tmp/shizzi-debug-firewall-diagnostic.json", TetherService.FIREWALL_DIAG_REPORT_PATH)
+    fun `21 v0_10_3 release build identity and file paths match production release`() {
+        assertEquals("dev.shizzyluna.proxy", BuildConfig.APPLICATION_ID)
+        assertEquals("0.10.3", BuildConfig.VERSION_NAME)
+        assertEquals(25, BuildConfig.VERSION_CODE)
+        assertEquals(25, BuildConfig.SERVICE_BUILD_ID)
+        assertFalse(BuildConfig.DEBUG_DIAGNOSTICS_ENABLED)
+        assertFalse("applicationId must not have .debug suffix in release build", BuildConfig.APPLICATION_ID.endsWith(".debug"))
+        assertEquals("/data/local/tmp/shizzyluna-quota-state.json", DataQuota.DEFAULT_CHECKPOINT_FILE_PATH)
+        assertEquals("/data/local/tmp/shizzi-probe-report.json", TetherService.REPORT_PATH)
+        assertEquals("/data/local/tmp/shizzi-firewall-diagnostic.json", TetherService.FIREWALL_DIAG_REPORT_PATH)
         assertEquals("/data/local/tmp/shizzyluna-debug-softap-journal.json", SoftApOwnershipJournal.DEFAULT_JOURNAL_PATH)
     }
 
@@ -2206,12 +2206,13 @@ class BpfFlowAttributionTest {
         assertTrue(md.contains("## 9. Explicit Limitations & Enforcement Status"))
         assertTrue(md.contains("## 10. Exclusive Blocking Mode & Legacy Pre-NAT Retirement (`v0.10.8-debug`, Schema v6)"))
         assertTrue(md.contains("## 11. Native SoftAP MAC Blocklist Engine & Ownership Journal (`v0.10.8-debug`, Schema v6)"))
-        assertTrue(md.contains("## 12. Domain Blocking & Shared DNS/Hostname Policy Layer (`v0.10.8-debug`, Schema v6)"))
+        assertTrue(md.contains("## 12. Domain Blocking & Per-Host Attribution Enforcement (`v0.10.9-debug`, Schema v7)"))
+        assertTrue(md.contains("## 13. VPN Loss Recovery & Fail-Closed Lifecycle (`v0.10.9-debug`, Schema v7)"))
         assertTrue(md.contains("PARTIAL_ENFORCEMENT"))
 
-        // Verify schemaVersion = 6 in JSON and roundtrip deserialization
-        assertEquals(6, jsonObj.getInt("schemaVersion"))
-        assertEquals("0.10.8-debug", jsonObj.getString("featureVersion"))
+        // Verify schemaVersion = 7 in JSON and roundtrip deserialization
+        assertEquals(7, jsonObj.getInt("schemaVersion"))
+        assertEquals("0.10.9-debug", jsonObj.getString("featureVersion"))
         val roundTrip = BpfAttributionStatusReport.fromJson(jsonObj)
         assertEquals(RefreshCircuitBreakerState.CLOSED.name, roundTrip.refreshCircuitBreakerState)
         assertEquals(3L, roundTrip.postRefreshFlowKeysResolved)
@@ -2224,7 +2225,9 @@ class BpfFlowAttributionTest {
         assertEquals(BlockingMode.BPF_NAT_VPN, roundTrip.preNatDiagnostics.effectiveMode)
         assertTrue(roundTrip.preNatDiagnostics.exclusiveEngineInvariant)
         assertEquals(SoftApEngineState.PROBE_REQUIRED, roundTrip.softApDiagnostics.engineState)
-        assertEquals(6, roundTrip.domainDiagnostics.schemaVersion)
+        assertEquals(7, roundTrip.domainDiagnostics.schemaVersion)
+        assertEquals(12, roundTrip.domainDiagnostics.d01ToD12Matrix.size)
+        assertEquals(12, roundTrip.vpnRecoveryDiagnostics.v01ToV12Matrix.size)
 
         // Verify zero unredacted PII
         assertFalse(DiagnosticRedactor.containsUnredactedPii(md))
@@ -3824,6 +3827,474 @@ class BpfFlowAttributionTest {
         out[p++] = (hostBytes.size and 0xFF).toByte()
         System.arraycopy(hostBytes, 0, out, p, hostBytes.size)
         return out
+    }
+
+    @Test
+    fun `40 v0_10_9_debug Per-Host Domain Enforcement D01 to D12 BPF_NAT DNS HTTP Host TLS SNI bounded DNS retry queue and atomic rule snapshot`() {
+        val originalClock = TunTrafficEngine.bpfAttributor.monotonicClockMs
+        try {
+            val testClock = AtomicLong(50_000L)
+            TunTrafficEngine.bpfAttributor.monotonicClockMs = { testClock.get() }
+            TunTrafficEngine.clearAll()
+            ExclusiveBlockingModeController.resetForTesting()
+
+            val macA = "E2:15:CD:54:E4:9B"
+            val macB = "F2:FF:8B:3D:B2:A6"
+            val hosts = listOf(
+                DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "ap0"),
+                DiscoveredHost(mac = macB, ip = "192.168.167.17", allIps = listOf("192.168.167.17"), interfaceName = "ap0"),
+            )
+            TunTrafficEngine.configureExperimentalBpf(
+                enabled = true,
+                pollIntervalMs = 1_000L,
+                downstreamIface = "ap0",
+                upstreamIface = "testtun46",
+            )
+            TunTrafficEngine.updatePolicies(
+                mapOf(
+                    macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = false),
+                    macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+                ),
+                hosts,
+            )
+
+            // Configure D01 GLOBAL rule (globalonly.com) and D02 CLIENT rule for macA (hostaonly.com)
+            val rules = listOf(
+                DomainRule(
+                    id = "d01-g",
+                    scope = DomainRuleScope.GLOBAL,
+                    normalizedDomain = "globalonly.com",
+                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                    enabled = true,
+                ),
+                DomainRule(
+                    id = "d02-c",
+                    scope = DomainRuleScope.CLIENT,
+                    clientMac = macA,
+                    normalizedDomain = "hostaonly.com",
+                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                    enabled = true,
+                ),
+            )
+            TunTrafficEngine.updateDomainRules(rules)
+
+            // D02: Ingest BPF NAT dump with UDP/53 flow for Client A (post-NAT port 59053 -> 8.8.8.8:53)
+            // and UDP/53 flow for Client B (post-NAT port 59054 -> 8.8.8.8:53)
+            val dnsBpfDump = """
+                Tethering BPF offload:
+                  IPv4 Upstream:
+                    17 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:53101 -> 33(testtun46) 192.0.2.2:59053 -> 8.8.8.8:53 [bc:00:00:00:00:00] 1500 10ms
+                    17 [f2:ff:8b:3d:b2:a6] 29(ap0) 192.168.167.17:53102 -> 33(testtun46) 192.0.2.2:59054 -> 8.8.8.8:53 [bc:00:00:00:00:00] 1500 10ms
+                    6 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:52101 -> 33(testtun46) 192.0.2.2:59080 -> 93.184.216.34:80 [bc:00:00:00:00:00] 1500 10ms
+                    6 [f2:ff:8b:3d:b2:a6] 29(ap0) 192.168.167.17:52102 -> 33(testtun46) 192.0.2.2:59081 -> 93.184.216.34:80 [bc:00:00:00:00:00] 1500 10ms
+                    6 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:52443 -> 33(testtun46) 192.0.2.2:59443 -> 93.184.216.34:443 [bc:00:00:00:00:00] 1500 10ms
+                    6 [f2:ff:8b:3d:b2:a6] 29(ap0) 192.168.167.17:52444 -> 33(testtun46) 192.0.2.2:59444 -> 93.184.216.34:443 [bc:00:00:00:00:00] 1500 10ms
+            """.trimIndent()
+            val (verifiedBindings, verifiedMacs) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+            assertTrue(
+                TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                    parsed = BpfDumpParser.parse(dnsBpfDump),
+                    collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                    collectionStatus = BpfCollectionStatus.OK,
+                    collectionDurationMs = 4L,
+                    ipToMac = verifiedBindings,
+                    activeConnectedMacs = verifiedMacs,
+                ),
+            )
+
+            // D02: Post-NAT DNS query from Client A (192.0.2.2:59053) for sub.hostaonly.com -> attributed via BPF_NAT -> BLOCKED
+            val pktDnsA = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59053,
+                dstPort = 53,
+                txId = 0x4101,
+                qname = "sub.hostaonly.com",
+            )
+            val metaDnsA = TunTrafficEngine.parsePacketMeta(pktDnsA, pktDnsA.size)!!
+            val attrDnsA = TunTrafficEngine.resolveClientMacWithSource(metaDnsA, isUpload = true)
+            assertEquals(macA, attrDnsA.mac)
+            assertEquals(AttributionSource.BPF_NAT, attrDnsA.source)
+            val evalDnsA = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaDnsA,
+                matchedMac = attrDnsA.mac,
+                isUpload = true,
+                attributionSource = attrDnsA.source,
+                rawPacket = pktDnsA,
+                rawLength = pktDnsA.size,
+            )
+            assertEquals(PacketDecision.DROP, evalDnsA.decision)
+            assertEquals("DOMAIN_BLOCK_CLIENT_DNS", evalDnsA.reason)
+            assertNotNull(evalDnsA.synthesizedDnsResponse)
+
+            // D02: Post-NAT DNS query from Client B (192.0.2.2:59054) for sub.hostaonly.com -> attributed to macB -> ALLOWED (DOMAIN_CLIENT_OWNER_MISMATCH)
+            val pktDnsB = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59054,
+                dstPort = 53,
+                txId = 0x4102,
+                qname = "sub.hostaonly.com",
+            )
+            val metaDnsB = TunTrafficEngine.parsePacketMeta(pktDnsB, pktDnsB.size)!!
+            val attrDnsB = TunTrafficEngine.resolveClientMacWithSource(metaDnsB, isUpload = true)
+            assertEquals(macB, attrDnsB.mac)
+            val evalDnsB = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaDnsB,
+                matchedMac = attrDnsB.mac,
+                isUpload = true,
+                attributionSource = attrDnsB.source,
+                rawPacket = pktDnsB,
+                rawLength = pktDnsB.size,
+            )
+            assertEquals(PacketDecision.ALLOW, evalDnsB.decision)
+
+            // D03: Post-NAT HTTP Host request for Client A (59080) vs Client B (59081)
+            val httpPayload = "GET / HTTP/1.1\r\nHost: web.hostaonly.com\r\n\r\n".toByteArray(Charsets.US_ASCII)
+            val pktHttpA = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59080, 80, httpPayload)
+            val metaHttpA = TunTrafficEngine.parsePacketMeta(pktHttpA, pktHttpA.size)!!
+            val attrHttpA = TunTrafficEngine.resolveClientMacWithSource(metaHttpA, isUpload = true)
+            assertEquals(macA, attrHttpA.mac)
+            val evalHttpA = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaHttpA,
+                matchedMac = attrHttpA.mac,
+                isUpload = true,
+                attributionSource = attrHttpA.source,
+                rawPacket = pktHttpA,
+                rawLength = pktHttpA.size,
+            )
+            assertEquals(PacketDecision.DROP, evalHttpA.decision)
+            assertEquals("DOMAIN_BLOCK_CLIENT_HOSTNAME", evalHttpA.reason)
+
+            val pktHttpB = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59081, 80, httpPayload)
+            val metaHttpB = TunTrafficEngine.parsePacketMeta(pktHttpB, pktHttpB.size)!!
+            val attrHttpB = TunTrafficEngine.resolveClientMacWithSource(metaHttpB, isUpload = true)
+            assertEquals(macB, attrHttpB.mac)
+            val evalHttpB = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaHttpB,
+                matchedMac = attrHttpB.mac,
+                isUpload = true,
+                attributionSource = attrHttpB.source,
+                rawPacket = pktHttpB,
+                rawLength = pktHttpB.size,
+            )
+            assertEquals(PacketDecision.ALLOW, evalHttpB.decision)
+
+            // D04: Post-NAT TLS ClientHello SNI for Client A (59443) vs Client B (59444)
+            val tlsPayload = buildTlsClientHelloWithSni("tls.hostaonly.com")
+            val pktTlsA = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59443, 443, tlsPayload)
+            val metaTlsA = TunTrafficEngine.parsePacketMeta(pktTlsA, pktTlsA.size)!!
+            val attrTlsA = TunTrafficEngine.resolveClientMacWithSource(metaTlsA, isUpload = true)
+            assertEquals(macA, attrTlsA.mac)
+            val evalTlsA = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaTlsA,
+                matchedMac = attrTlsA.mac,
+                isUpload = true,
+                attributionSource = attrTlsA.source,
+                rawPacket = pktTlsA,
+                rawLength = pktTlsA.size,
+            )
+            assertEquals(PacketDecision.DROP, evalTlsA.decision)
+            assertEquals("DOMAIN_BLOCK_CLIENT_HOSTNAME", evalTlsA.reason)
+
+            val pktTlsB = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59444, 443, tlsPayload)
+            val metaTlsB = TunTrafficEngine.parsePacketMeta(pktTlsB, pktTlsB.size)!!
+            val attrTlsB = TunTrafficEngine.resolveClientMacWithSource(metaTlsB, isUpload = true)
+            assertEquals(macB, attrTlsB.mac)
+            val evalTlsB = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaTlsB,
+                matchedMac = attrTlsB.mac,
+                isUpload = true,
+                attributionSource = attrTlsB.source,
+                rawPacket = pktTlsB,
+                rawLength = pktTlsB.size,
+            )
+            assertEquals(PacketDecision.ALLOW, evalTlsB.decision)
+
+            // D07 & D08: Bounded First-Packet DNS Attribution Retry Queue
+            TunTrafficEngine.configureDnsAttributionRetry(enabled = true, maxWaitMs = 200L)
+            assertTrue(TunTrafficEngine.dnsAttributionRetryEnabled)
+            assertEquals(200L, TunTrafficEngine.dnsRetryMaxWaitMs)
+
+            // Send unattributed DNS query on port 59901 for retry.hostaonly.com -> queued for retry (`DNS_RETRY_QUEUED`)
+            val pktRetryResolve = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59901,
+                dstPort = 53,
+                txId = 0x5101,
+                qname = "retry.hostaonly.com",
+            )
+            val metaRetryResolve = TunTrafficEngine.parsePacketMeta(pktRetryResolve, pktRetryResolve.size)!!
+            val evalQueued = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaRetryResolve,
+                matchedMac = null,
+                isUpload = true,
+                attributionSource = AttributionSource.UNMATCHED_UNKNOWN,
+                rawPacket = pktRetryResolve,
+                rawLength = pktRetryResolve.size,
+            )
+            assertTrue(evalQueued.heldForDnsRetry)
+            assertEquals("DNS_RETRY_QUEUED", evalQueued.reason)
+            assertEquals(1, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            // Mutate caller buffer in-place to prove defensive copy inside PendingDnsRetryPacket
+            pktRetryResolve.fill(0)
+
+            // Publish BPF snapshot mapping 59901 -> macA before 200ms deadline
+            testClock.set(50_050L)
+            val retryBpfDump = """
+                Tethering BPF offload:
+                  IPv4 Upstream:
+                    17 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:53901 -> 33(testtun46) 192.0.2.2:59901 -> 8.8.8.8:53 [bc:00:00:00:00:00] 1500 5ms
+            """.trimIndent()
+            assertTrue(
+                TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                    parsed = BpfDumpParser.parse(retryBpfDump),
+                    collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                    collectionStatus = BpfCollectionStatus.OK,
+                    collectionDurationMs = 3L,
+                    ipToMac = verifiedBindings,
+                    activeConnectedMacs = verifiedMacs,
+                ),
+            )
+            TunTrafficEngine.processPendingDnsAttributionRetries(nowMonoMs = testClock.get())
+            assertEquals("Queued DNS packet must resolve and synthesize REFUSED response once BPF maps port 59901 -> macA", 0, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            // Now test D08 timeout fail-open: enqueue unattributed DNS query on port 59902 and advance clock past 200ms without BPF mapping
+            val pktRetryTimeout = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59902,
+                dstPort = 53,
+                txId = 0x5102,
+                qname = "timeout.hostaonly.com",
+            )
+            val metaRetryTimeout = TunTrafficEngine.parsePacketMeta(pktRetryTimeout, pktRetryTimeout.size)!!
+            val evalTimeoutQueued = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaRetryTimeout,
+                matchedMac = null,
+                isUpload = true,
+                attributionSource = AttributionSource.UNMATCHED_UNKNOWN,
+                rawPacket = pktRetryTimeout,
+                rawLength = pktRetryTimeout.size,
+            )
+            assertTrue(evalTimeoutQueued.heldForDnsRetry)
+            assertEquals("DNS_RETRY_QUEUED", evalTimeoutQueued.reason)
+            assertEquals(1, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            testClock.set(50_300L) // Past 50_050 + 200ms deadline
+            TunTrafficEngine.processPendingDnsAttributionRetries(nowMonoMs = testClock.get())
+            assertEquals("Timed-out DNS retry packet must fail-open and be released", 0, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            val domDiag = TunTrafficEngine.getBpfStatusReport().domainDiagnostics
+            assertTrue(domDiag.dnsBpfNat >= 2L)
+            assertTrue(domDiag.clientRuleMatched >= 3L)
+            assertTrue(domDiag.clientRuleOwnerMismatch >= 3L)
+            assertEquals(2L, domDiag.dnsRetryQueued)
+            assertEquals(1L, domDiag.dnsRetryResolved)
+            assertEquals(1L, domDiag.dnsRetryTimeout)
+
+            // D10: Atomic snapshot swap under concurrent rule updates & evaluations
+            val errors = java.util.concurrent.CopyOnWriteArrayList<Throwable>()
+            val writerThread = Thread {
+                try {
+                    for (i in 1..40) {
+                        DomainFilterEngine.replaceAllRules(
+                            listOf(
+                                DomainRule(
+                                    id = "g-$i",
+                                    scope = DomainRuleScope.GLOBAL,
+                                    normalizedDomain = "concurrent$i.com",
+                                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                                    enabled = true,
+                                ),
+                                DomainRule(
+                                    id = "c-$i",
+                                    scope = DomainRuleScope.CLIENT,
+                                    clientMac = macA,
+                                    normalizedDomain = "hostaonly.com",
+                                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                                    enabled = true,
+                                ),
+                            ),
+                        )
+                    }
+                } catch (t: Throwable) {
+                    errors.add(t)
+                }
+            }
+            val readerThread = Thread {
+                try {
+                    for (i in 1..80) {
+                        val dec = DomainFilterEngine.evaluateUploadPacket(
+                            rawPacket = pktDnsA,
+                            length = pktDnsA.size,
+                            srcIp = "192.0.2.2",
+                            matchedMac = macA,
+                            ownerVerified = true,
+                            ownershipSource = "BPF_NAT",
+                        )
+                        assertTrue(dec.blocked)
+                    }
+                } catch (t: Throwable) {
+                    errors.add(t)
+                }
+            }
+            writerThread.start()
+            readerThread.start()
+            writerThread.join(5_000L)
+            readerThread.join(5_000L)
+            assertTrue("Concurrent atomic snapshot updates and packet evaluations must have zero exceptions: $errors", errors.isEmpty())
+        } finally {
+            TunTrafficEngine.bpfAttributor.monotonicClockMs = originalClock
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    @Test
+    fun `41 v0_10_9_debug VpnUpstream and VpnWatchdog V01 to V12 stopOnLoss fail-closed gate new-handle H2 same-handle H1 extended outage and 3x reconnect cycles`() {
+        try {
+            TunTrafficEngine.clearAll()
+
+            var currentVpnHandle = 1001L
+            var bindShouldSucceed = true
+            val boundHandles = mutableListOf<Long>()
+            val lostCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+            val fakeLocator = VpnLocator { currentVpnHandle }
+            val fakeBinder: (Long) -> Unit = { handle ->
+                boundHandles.add(handle)
+                if (!bindShouldSucceed) {
+                    throw IllegalStateException("Simulated setUnderlyingNetworks failure for handle $handle")
+                }
+            }
+
+            // V01: Default stopHotspotOnVpnDisconnect == true tears down session after 3 missed polls
+            val upstreamV01 = VpnUpstream(
+                locatorProvider = { fakeLocator },
+                onLost = { lostCount.incrementAndGet() },
+            )
+            upstreamV01.updateStopHotspotOnVpnDisconnect(true)
+            upstreamV01.followWithBinder(
+                mode = VpnMode.AUTO,
+                startMonitorThread = false,
+                binder = fakeBinder,
+            )
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamV01.lifecycleState)
+            // Disconnect VPN -> 3 consecutive polls trigger SESSION_STOPPED
+            currentVpnHandle = VpnUpstream.UNBOUND
+            upstreamV01.pollOnceForTest()
+            upstreamV01.pollOnceForTest()
+            upstreamV01.pollOnceForTest()
+            assertEquals(1, lostCount.get())
+            assertEquals(VpnLifecycleState.SESSION_STOPPED, upstreamV01.lifecycleState)
+            upstreamV01.stop()
+            assertFalse("Default teardown mode must not leave fail-closed gate closed after session stops", TunTrafficEngine.vpnForwardingGateClosed)
+
+            // V02, V03, V04, V05: stopHotspotOnVpnDisconnect == false keeps hotspot alive, closes fail-closed gate, and recovers on new handle (H2) and same handle (H1)
+            currentVpnHandle = 2001L
+            lostCount.set(0)
+            val upstreamRecovery = VpnUpstream(
+                locatorProvider = { fakeLocator },
+                onLost = { lostCount.incrementAndGet() },
+            )
+            upstreamRecovery.updateStopHotspotOnVpnDisconnect(false)
+            upstreamRecovery.followWithBinder(
+                mode = VpnMode.AUTO,
+                startMonitorThread = false,
+                binder = fakeBinder,
+            )
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+
+            // Transient 1-2 poll dip recovers before 3rd strike without incrementing outageCount
+            currentVpnHandle = VpnUpstream.UNBOUND
+            upstreamRecovery.pollOnceForTest() // strike 1
+            assertTrue(TunTrafficEngine.vpnForwardingGateClosed) // closed immediately on first missing poll!
+            currentVpnHandle = 2001L
+            upstreamRecovery.pollOnceForTest() // recovered before 3rd strike!
+            assertFalse("Gate must reopen when transient strike recovers", TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertEquals(0L, upstreamRecovery.outageCount.get())
+
+            // V02 & V05: Confirmed VPN disconnect (3 strikes) + extended outage (20 additional polls) -> 0 onLost calls, 1 outageCount, gate stays closed
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(0, lostCount.get())
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            assertTrue(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(1L, upstreamRecovery.outageCount.get())
+
+            // Verify V12: while fail-closed gate is closed, client packet is dropped with VPN_FAIL_CLOSED_GATE
+            val testClientPkt = buildIpv4UdpDnsQueryPacket("192.168.43.101", "8.8.8.8", 54000, 53, 0x1111, "example.com")
+            val testClientMeta = TunTrafficEngine.parsePacketMeta(testClientPkt, testClientPkt.size)!!
+            val gatedEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = testClientMeta,
+                matchedMac = "E2:15:CD:54:E4:9B",
+                isUpload = true,
+                attributionSource = AttributionSource.DIRECT_IP,
+                rawPacket = testClientPkt,
+                rawLength = testClientPkt.size,
+            )
+            assertEquals("Client traffic must NEVER bypass disconnected VPN when fail-closed gate is closed", PacketDecision.DROP, gatedEval.decision)
+            assertEquals("VPN_FAIL_CLOSED_GATE", gatedEval.reason)
+            assertTrue(TunTrafficEngine.vpnFailClosedDroppedPackets.get() >= 1L)
+
+            // Extended outage (20 more polls) must not increment outageCount or call onLost
+            repeat(20) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(0, lostCount.get())
+            assertEquals(1L, upstreamRecovery.outageCount.get())
+
+            // V03: Reconnect with NEW handle H2 (2002L) -> rebinds, reopens gate, increments recoveryCount
+            currentVpnHandle = 2002L
+            upstreamRecovery.pollOnceForTest()
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertEquals(2002L, upstreamRecovery.handle)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(1L, upstreamRecovery.recoveryCount.get())
+
+            // V04: Disconnect again (3 strikes) and reconnect with SAME handle (2002L) -> must still emit Adopted and recover!
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            assertTrue(TunTrafficEngine.vpnForwardingGateClosed)
+            currentVpnHandle = 2002L // Same handle as before disconnect!
+            upstreamRecovery.pollOnceForTest()
+            assertEquals("Same-handle VPN reconnect must re-adopt because boundHandle was reset on loss", VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(2L, upstreamRecovery.recoveryCount.get())
+
+            // V10: Rebind failure when VPN handle reappears -> transitions to VPN_RECOVERY_FAILED, keeps fail-closed gate CLOSED, and retries on next poll
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            bindShouldSucceed = false
+            currentVpnHandle = 2003L
+            upstreamRecovery.pollOnceForTest()
+            assertEquals(VpnLifecycleState.VPN_RECOVERY_FAILED, upstreamRecovery.lifecycleState)
+            assertTrue("Fail-closed gate must remain CLOSED when setUnderlyingNetworks fails", TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(1L, upstreamRecovery.failedRebindCount.get())
+
+            // Next poll succeeds -> recovers cleanly to VPN_BOUND (3rd cycle = V11)
+            bindShouldSucceed = true
+            upstreamRecovery.pollOnceForTest()
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(3L, upstreamRecovery.outageCount.get())
+            assertEquals(3L, upstreamRecovery.recoveryCount.get())
+
+            // Live toggle false -> true while waiting for recovery immediately stops session
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            upstreamRecovery.updateStopHotspotOnVpnDisconnect(true)
+            assertEquals(1, lostCount.get())
+            assertEquals(VpnLifecycleState.SESSION_STOPPED, upstreamRecovery.lifecycleState)
+            upstreamRecovery.stop()
+        } finally {
+            TunTrafficEngine.clearAll()
+        }
     }
 }
 

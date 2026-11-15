@@ -203,9 +203,13 @@ object TunTrafficEngine {
         val paceDelayMs: Long = 0L,
         val policyVersion: Long = 1L,
         val domainDecision: DomainPacketDecision? = null,
+        val heldForDnsRetry: Boolean = false,
+        val vpnGateDropped: Boolean = false,
     ) {
         val reason: String
             get() = when {
+                vpnGateDropped -> "VPN_FAIL_CLOSED_GATE"
+                heldForDnsRetry -> DomainDropOrSkipReason.DNS_RETRY_QUEUED.code
                 domainDecision?.blocked == true -> domainDecision.reason.code
                 decision == PacketDecision.DROP -> "BLOCKED_CLIENT_POLICY"
                 decision == PacketDecision.DROP_AQM -> "AQM_SHAPING_DROP"
@@ -579,6 +583,50 @@ object TunTrafficEngine {
     @Volatile
     var bpfNatVpnEnforcementEnabled: Boolean = true
 
+    // v0.10.9-debug Feature A2: Bounded DNS Attribution Retry Queue
+    const val MAX_PENDING_DNS_RETRY_PACKETS = 128
+    const val MAX_PENDING_DNS_RETRY_BYTES = 256 * 1024
+    const val DEFAULT_DNS_RETRY_MAX_WAIT_MS = 200L
+    const val MIN_DNS_RETRY_MAX_WAIT_MS = 150L
+    const val MAX_DNS_RETRY_MAX_WAIT_MS = 300L
+
+    @Volatile
+    var dnsAttributionRetryEnabled: Boolean = false
+        private set
+
+    @Volatile
+    var dnsRetryMaxWaitMs: Long = DEFAULT_DNS_RETRY_MAX_WAIT_MS
+        private set
+
+    internal class PendingDnsRetryPacket(
+        val meta: PacketMeta,
+        val packetBytes: ByteArray,
+        val length: Int,
+        val enqueuedAtMonoMs: Long,
+        val deadlineMonoMs: Long,
+        val sessionGeneration: Long,
+        val bindingGeneration: Long,
+        val tunFd: FileDescriptor? = null,
+        val proxyFd: FileDescriptor? = null,
+        val onResolvedAction: ((PacketDecision, DomainPacketDecision?, String?) -> Unit)? = null,
+    )
+
+    private val pendingDnsRetryLock = Any()
+    private val pendingDnsRetryQueue = ArrayDeque<PendingDnsRetryPacket>()
+    private val pendingDnsRetryBytes = AtomicInteger(0)
+
+    // v0.10.9-debug Feature B2: Fail-Closed VPN Forwarding Gate
+    @Volatile
+    var vpnForwardingGateClosed: Boolean = false
+        private set
+
+    @Volatile
+    var vpnFailClosedReason: String = ""
+        private set
+
+    val vpnFailClosedDroppedPackets = AtomicLong(0L)
+    val vpnFailClosedDroppedBytes = AtomicLong(0L)
+
     init {
         bpfAttributor.onSnapshotPublished = { snap ->
             for ((ipv6Addr, verifiedMac) in snap.ipv6ClientBindings) {
@@ -597,6 +645,10 @@ object TunTrafficEngine {
                     PhaseDInterfaceLifecycleState.ATTRIBUTION_READY,
                     "BPF snapshot seq=${snap.snapshotSequence} ready (downIfIndex=${snap.resolvedDownstreamIfIndex}, upIfIndex=${snap.resolvedUpstreamIfIndex})",
                 )
+            }
+            if (dnsAttributionRetryEnabled) {
+                val nowMono = if (snap.collectedAtMonotonicMs > 0L) snap.collectedAtMonotonicMs else bpfAttributor.monotonicClockMs()
+                processPendingDnsAttributionRetries(nowMono)
             }
         }
     }
@@ -984,6 +1036,273 @@ object TunTrafficEngine {
         if (!enabled) {
             deepTupleTracker.reset()
         }
+    }
+
+    /**
+     * Configures the v0.10.9-debug bounded DNS attribution retry queue (OFF by default).
+     */
+    @Synchronized
+    fun configureDnsAttributionRetry(
+        enabled: Boolean,
+        maxWaitMs: Long = DEFAULT_DNS_RETRY_MAX_WAIT_MS,
+    ) {
+        val clampedWait = maxWaitMs.coerceIn(MIN_DNS_RETRY_MAX_WAIT_MS, MAX_DNS_RETRY_MAX_WAIT_MS)
+        val wasEnabled = dnsAttributionRetryEnabled
+        dnsAttributionRetryEnabled = enabled
+        dnsRetryMaxWaitMs = clampedWait
+        if (wasEnabled && !enabled) {
+            cancelAllPendingDnsRetries("DNS_RETRY_DISABLED")
+        }
+    }
+
+    /**
+     * Sets the fail-closed VPN forwarding gate (`v0.10.9-debug` Feature B2).
+     * While [closed] is true, outbound and inbound client data packets are dropped at the userspace
+     * TUN gate so traffic can never silently bypass a disconnected VPN while the hotspot stays up.
+     */
+    fun setVpnForwardingGate(closed: Boolean, reason: String = "") {
+        val prev = vpnForwardingGateClosed
+        vpnForwardingGateClosed = closed
+        vpnFailClosedReason = if (closed) reason.ifBlank { "VPN_WAITING_FOR_RECOVERY" } else ""
+        if (closed) {
+            clearPacingQueues()
+            cancelAllPendingDnsRetries("VPN_FORWARDING_GATE_CLOSED")
+            if (!prev) {
+                SessionLog.warn(
+                    "Datapath: VPN fail-closed forwarding gate CLOSED (reason=$vpnFailClosedReason) — client traffic blocked from bypassing VPN",
+                )
+            }
+        } else if (prev) {
+            SessionLog.info("Datapath: VPN fail-closed forwarding gate OPEN — forwarding resumed")
+        }
+    }
+
+    /**
+     * Invoked when the VPN upstream is rebound to [newHandle] after recovery (`v0.10.9-debug` Feature B2).
+     * Clears stale NAT flow caches, bumps binding generation, and re-opens the fail-closed forwarding gate.
+     */
+    fun onVpnRebound(newHandle: Long) {
+        clearFlowCache()
+        cancelAllPendingDnsRetries("VPN_REBOUND")
+        bpfAttributor.onClientBindingsUpdated()
+        setVpnForwardingGate(closed = false, reason = "")
+        SessionLog.info("Datapath: VPN rebound to network handle $newHandle; stale flow caches cleared and forwarding gate opened")
+    }
+
+    internal fun enqueuePendingDnsRetryPacket(
+        meta: PacketMeta,
+        rawPacket: ByteArray,
+        rawLength: Int,
+        tunFd: FileDescriptor? = null,
+        proxyFd: FileDescriptor? = null,
+        nowMonoMs: Long = bpfAttributor.monotonicClockMs(),
+        onResolvedAction: ((PacketDecision, DomainPacketDecision?, String?) -> Unit)? = null,
+    ): Boolean {
+        val copy = rawPacket.copyOfRange(0, rawLength)
+        synchronized(pendingDnsRetryLock) {
+            if (pendingDnsRetryQueue.size >= MAX_PENDING_DNS_RETRY_PACKETS ||
+                pendingDnsRetryBytes.get() + rawLength > MAX_PENDING_DNS_RETRY_BYTES
+            ) {
+                return false
+            }
+            val item = PendingDnsRetryPacket(
+                meta = meta.copy(),
+                packetBytes = copy,
+                length = rawLength,
+                enqueuedAtMonoMs = nowMonoMs,
+                deadlineMonoMs = nowMonoMs + dnsRetryMaxWaitMs,
+                sessionGeneration = bpfAttributor.currentSessionGeneration,
+                bindingGeneration = bpfAttributor.currentBindingGeneration,
+                tunFd = tunFd,
+                proxyFd = proxyFd,
+                onResolvedAction = onResolvedAction,
+            )
+            pendingDnsRetryQueue.addLast(item)
+            pendingDnsRetryBytes.addAndGet(rawLength)
+            return true
+        }
+    }
+
+    fun getPendingDnsRetryQueueSize(): Int =
+        synchronized(pendingDnsRetryLock) { pendingDnsRetryQueue.size }
+
+    fun cancelAllPendingDnsRetries(reason: String = "SESSION_STOPPED"): Int {
+        val drained: List<PendingDnsRetryPacket>
+        synchronized(pendingDnsRetryLock) {
+            if (pendingDnsRetryQueue.isEmpty()) return 0
+            drained = pendingDnsRetryQueue.toList()
+            pendingDnsRetryQueue.clear()
+            pendingDnsRetryBytes.set(0)
+        }
+        for (pkt in drained) {
+            DomainFilterEngine.dnsRetryCancelled.incrementAndGet()
+            pkt.onResolvedAction?.invoke(PacketDecision.DROP, null, null)
+        }
+        return drained.size
+    }
+
+    /**
+     * Re-evaluates held DNS queries after a fresh BPF snapshot publish or deadline tick (`D07`, `D08`).
+     * Never blocks the TUN reader thread; each held DNS packet is resolved at most once.
+     */
+    fun processPendingDnsAttributionRetries(
+        nowMonoMs: Long = bpfAttributor.monotonicClockMs(),
+    ): Int {
+        val snapshotToCheck: List<PendingDnsRetryPacket>
+        synchronized(pendingDnsRetryLock) {
+            if (pendingDnsRetryQueue.isEmpty()) return 0
+            snapshotToCheck = pendingDnsRetryQueue.toList()
+        }
+
+        var processedCount = 0
+        val currentSessionGen = bpfAttributor.currentSessionGeneration
+        val currentBindingGen = bpfAttributor.currentBindingGeneration
+
+        for (item in snapshotToCheck) {
+            if (vpnForwardingGateClosed ||
+                item.sessionGeneration != currentSessionGen ||
+                item.bindingGeneration != currentBindingGen
+            ) {
+                val removed = synchronized(pendingDnsRetryLock) {
+                    if (pendingDnsRetryQueue.remove(item)) {
+                        pendingDnsRetryBytes.addAndGet(-item.length)
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (removed) {
+                    DomainFilterEngine.dnsRetryCancelled.incrementAndGet()
+                    if (vpnForwardingGateClosed) {
+                        vpnFailClosedDroppedPackets.incrementAndGet()
+                        vpnFailClosedDroppedBytes.addAndGet(item.length.toLong())
+                    }
+                    item.onResolvedAction?.invoke(PacketDecision.DROP, null, null)
+                    processedCount++
+                }
+                continue
+            }
+
+            val retryAttr = resolveClientMacWithSource(item.meta, isUpload = true)
+            val resolvedMac = retryAttr.mac
+            val expired = nowMonoMs >= item.deadlineMonoMs
+
+            if (resolvedMac == null && !expired) {
+                // Still waiting within the bounded 150-300ms window
+                continue
+            }
+
+            val removed = synchronized(pendingDnsRetryLock) {
+                if (pendingDnsRetryQueue.remove(item)) {
+                    pendingDnsRetryBytes.addAndGet(-item.length)
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!removed) continue
+            processedCount++
+
+            if (resolvedMac != null) {
+                DomainFilterEngine.dnsRetryResolved.incrementAndGet()
+                val counters = countersByMac.getOrPut(resolvedMac) { ClientTrafficCounters(resolvedMac) }
+                counters.lastSeenAt = System.currentTimeMillis()
+                counters.seenPackets.incrementAndGet()
+                counters.matchedPackets.incrementAndGet()
+                when (retryAttr.source) {
+                    AttributionSource.BPF_NAT -> {
+                        bpfAttributedPackets.incrementAndGet()
+                        bpfAttributedBytes.addAndGet(item.length.toLong())
+                        counters.bpfAttributedPackets.incrementAndGet()
+                        postRefreshAttributedPackets.incrementAndGet()
+                        postRefreshAttributedBytes.addAndGet(item.length.toLong())
+                    }
+                    AttributionSource.DIRECT_IP -> {
+                        directAttributedPackets.incrementAndGet()
+                        directAttributedBytes.addAndGet(item.length.toLong())
+                        counters.directAttributedPackets.incrementAndGet()
+                    }
+                    AttributionSource.CONNTRACK_PROCFS -> {
+                        conntrackAttributedPackets.incrementAndGet()
+                        conntrackAttributedBytes.addAndGet(item.length.toLong())
+                        counters.conntrackAttributedPackets.incrementAndGet()
+                    }
+                    else -> {}
+                }
+
+                val policy = policiesByMac[resolvedMac]
+                val quotaRecord = getQuotaRecord(resolvedMac)
+                val wholeClientBlocked = bpfNatVpnEnforcementEnabled && (
+                    policy?.isNonQuotaBlocked == true ||
+                        (quotaRecord != null && quotaRecord.isQuotaExceeded) ||
+                        (phaseDMode == PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT && policy?.isQuotaOnlyBlock == true)
+                    )
+                if (wholeClientBlocked) {
+                    counters.droppedPackets.incrementAndGet()
+                    counters.blockedDropPackets.incrementAndGet()
+                    counters.policyVersionBlockedDrops.incrementAndGet()
+                    counters.droppedBytes.addAndGet(item.length.toLong())
+                    item.onResolvedAction?.invoke(PacketDecision.DROP, null, resolvedMac)
+                    continue
+                }
+
+                val domainDecision = DomainFilterEngine.evaluateUploadPacket(
+                    rawPacket = item.packetBytes,
+                    length = item.length,
+                    srcIp = item.meta.srcIp,
+                    matchedMac = resolvedMac,
+                    ownerVerified = true,
+                    fromDedicatedHotspotTun = true,
+                    isHostOriginated = false,
+                    ownershipSource = retryAttr.source.name,
+                )
+                if (domainDecision.blocked) {
+                    counters.droppedPackets.incrementAndGet()
+                    counters.droppedBytes.addAndGet(item.length.toLong())
+                    val synth = domainDecision.synthesizedDnsResponse
+                    if (synth != null && synth.isNotEmpty() && item.tunFd != null) {
+                        runCatching { writePacket(item.tunFd, synth, synth.size) }
+                    }
+                    item.onResolvedAction?.invoke(PacketDecision.DROP, domainDecision, resolvedMac)
+                } else {
+                    recordQuotaBytes(resolvedMac, item.length, isUpload = true, policy = policy)
+                    counters.forwardedPackets.incrementAndGet()
+                    counters.uploadForwardedPackets.incrementAndGet()
+                    counters.txBytes.addAndGet(item.length.toLong())
+                    if (item.proxyFd != null) {
+                        runCatching { writePacket(item.proxyFd, item.packetBytes, item.length) }
+                    }
+                    item.onResolvedAction?.invoke(PacketDecision.ALLOW, domainDecision, resolvedMac)
+                }
+            } else {
+                // Deadline expired and owner is still unknown/ambiguous -> fail-open for per-host rules (D08)
+                DomainFilterEngine.dnsRetryTimeout.incrementAndGet()
+                val fallbackDecision = DomainFilterEngine.evaluateUploadPacket(
+                    rawPacket = item.packetBytes,
+                    length = item.length,
+                    srcIp = item.meta.srcIp,
+                    matchedMac = null,
+                    ownerVerified = false,
+                    fromDedicatedHotspotTun = true,
+                    isHostOriginated = false,
+                    ownershipSource = "UNKNOWN_OWNER",
+                    deferUnknownOwnerClientSkipForRetry = false,
+                )
+                if (fallbackDecision.blocked) {
+                    val synth = fallbackDecision.synthesizedDnsResponse
+                    if (synth != null && synth.isNotEmpty() && item.tunFd != null) {
+                        runCatching { writePacket(item.tunFd, synth, synth.size) }
+                    }
+                    item.onResolvedAction?.invoke(PacketDecision.DROP, fallbackDecision, null)
+                } else {
+                    if (item.proxyFd != null) {
+                        runCatching { writePacket(item.proxyFd, item.packetBytes, item.length) }
+                    }
+                    item.onResolvedAction?.invoke(PacketDecision.ALLOW, fallbackDecision, null)
+                }
+            }
+        }
+        return processedCount
     }
 
     /**
@@ -1652,6 +1971,7 @@ object TunTrafficEngine {
         bpfReader.stopWorker()
         stopPacingDispatcher()
         clearPacingQueues()
+        cancelAllPendingDnsRetries("STOP_INTERNAL")
         flushQuotaCheckpointNow()
         runCatching { engineEndPfd?.close() }
         runCatching { datapathEndPfd?.close() }
@@ -1667,6 +1987,7 @@ object TunTrafficEngine {
     fun clearAll() {
         bpfReader.stopWorker()
         clearPacingQueues()
+        cancelAllPendingDnsRetries("CLEAR_ALL")
         flushQuotaCheckpointNow()
         activeUpstreamName = ""
         activeDownstreamName = ""
@@ -1689,6 +2010,12 @@ object TunTrafficEngine {
         totalDownloadPackets.set(0L)
         bpfRefreshOnMissEnabled = false
         deepTupleDiagnosticsEnabled = false
+        dnsAttributionRetryEnabled = false
+        dnsRetryMaxWaitMs = DEFAULT_DNS_RETRY_MAX_WAIT_MS
+        vpnForwardingGateClosed = false
+        vpnFailClosedReason = ""
+        vpnFailClosedDroppedPackets.set(0L)
+        vpnFailClosedDroppedBytes.set(0L)
         phaseDMode = PhaseDEnforcementMode.DIAGNOSTIC
         bpfNatVpnEnforcementEnabled = true
         conntrackBackoffUntilMs = 0L
@@ -2648,6 +2975,13 @@ object TunTrafficEngine {
     }
 
     internal fun drainDuePacedPackets(nowNs: Long = System.nanoTime()): Int {
+        if (dnsAttributionRetryEnabled) {
+            processPendingDnsAttributionRetries(nowNs / 1_000_000L)
+        }
+        if (vpnForwardingGateClosed) {
+            clearPacingQueues()
+            return 0
+        }
         var sentCount = 0
         for ((mac, queue) in pacingQueuesByMac) {
             while (true) {
@@ -2727,7 +3061,12 @@ object TunTrafficEngine {
                         attributionSource = attr.source,
                         rawPacket = buf,
                         rawLength = n,
+                        tunFd = tunFd,
+                        proxyFd = proxyFd,
                     )
+                    if (detail.heldForDnsRetry) {
+                        continue
+                    }
                     if (detail.decision == PacketDecision.DROP || detail.decision == PacketDecision.DROP_AQM) {
                         val synthResp = detail.domainDecision?.synthesizedDnsResponse
                         if (synthResp != null && synthResp.isNotEmpty()) {
@@ -3253,6 +3592,9 @@ object TunTrafficEngine {
         attributionSource: AttributionSource = AttributionSource.DIRECT_IP,
         rawPacket: ByteArray? = null,
         rawLength: Int = meta.length,
+        tunFd: FileDescriptor? = null,
+        proxyFd: FileDescriptor? = null,
+        onDnsRetryResolvedAction: ((PacketDecision, DomainPacketDecision?, String?) -> Unit)? = null,
     ): EvaluationDetail {
         val pktBytes = meta.length.coerceAtLeast(0).toLong()
 
@@ -3262,6 +3604,18 @@ object TunTrafficEngine {
             localControlPackets.incrementAndGet()
             localControlBytes.addAndGet(pktBytes)
             return EvaluationDetail(PacketDecision.ALLOW)
+        }
+
+        // v0.10.9-debug Feature B2: Fail-closed VPN forwarding gate.
+        // When a bound VPN disconnects and stopHotspotOnVpnDisconnect == false, drop all client
+        // upstream/downstream data packets so traffic can NEVER silently bypass the VPN.
+        if (vpnForwardingGateClosed) {
+            vpnFailClosedDroppedPackets.incrementAndGet()
+            vpnFailClosedDroppedBytes.addAndGet(pktBytes)
+            return EvaluationDetail(
+                decision = PacketDecision.DROP,
+                vpnGateDropped = true,
+            )
         }
 
         totalEligiblePackets.incrementAndGet()
@@ -3433,6 +3787,14 @@ object TunTrafficEngine {
             }
             var unknownOwnerDomainDecision: DomainPacketDecision? = null
             if (isUpload && rawPacket != null && rawLength > 0) {
+                val canAttemptDnsRetry = isExperimentalBpfEnabled &&
+                    meta.version == 4 &&
+                    (meta.protocol == 17 || meta.protocol == 6) &&
+                    meta.dstPort == 53 &&
+                    (reason == UnattributedReason.TUPLE_NOT_PRESENT ||
+                        reason == UnattributedReason.SNAPSHOT_STALE ||
+                        reason == UnattributedReason.NO_ACTIVE_SNAPSHOT)
+
                 unknownOwnerDomainDecision = DomainFilterEngine.evaluateUploadPacket(
                     rawPacket = rawPacket,
                     length = rawLength,
@@ -3441,6 +3803,8 @@ object TunTrafficEngine {
                     ownerVerified = false,
                     fromDedicatedHotspotTun = true,
                     isHostOriginated = false,
+                    ownershipSource = "UNKNOWN_OWNER",
+                    deferUnknownOwnerClientSkipForRetry = dnsAttributionRetryEnabled && canAttemptDnsRetry,
                 )
                 if (unknownOwnerDomainDecision.blocked) {
                     maybeLogTrafficSample(
@@ -3454,6 +3818,39 @@ object TunTrafficEngine {
                         decision = PacketDecision.DROP,
                         domainDecision = unknownOwnerDomainDecision,
                     )
+                }
+                if (unknownOwnerDomainDecision.clientRuleMatchedDomainOnUnknownOwner && canAttemptDnsRetry) {
+                    // Feature A2 (D07): Targeted async BPF refresh on DNS per-host rule miss
+                    val refreshReason = if (reason == UnattributedReason.SNAPSHOT_STALE) {
+                        UnattributedReason.SNAPSHOT_STALE
+                    } else {
+                        UnattributedReason.TUPLE_NOT_PRESENT
+                    }
+                    bpfReader.requestAsyncRefreshOnMiss(refreshReason)
+
+                    if (dnsAttributionRetryEnabled) {
+                        val enqueued = enqueuePendingDnsRetryPacket(
+                            meta = meta,
+                            rawPacket = rawPacket,
+                            rawLength = rawLength,
+                            tunFd = tunFd,
+                            proxyFd = proxyFd,
+                            onResolvedAction = onDnsRetryResolvedAction,
+                        )
+                        if (enqueued) {
+                            DomainFilterEngine.dnsRetryQueued.incrementAndGet()
+                            return EvaluationDetail(
+                                decision = PacketDecision.ALLOW,
+                                domainDecision = unknownOwnerDomainDecision,
+                                heldForDnsRetry = true,
+                            )
+                        } else {
+                            // Queue overflow -> fail-open immediately and record overflow + unknown owner skip
+                            DomainFilterEngine.dnsRetryOverflow.incrementAndGet()
+                            DomainFilterEngine.unknownOwnerClientRuleSkips.incrementAndGet()
+                            DomainFilterEngine.dnsQueriesAllowed.incrementAndGet()
+                        }
+                    }
                 }
             }
             maybeLogTrafficSample(
@@ -3653,6 +4050,7 @@ object TunTrafficEngine {
                 ownerVerified = true,
                 fromDedicatedHotspotTun = true,
                 isHostOriginated = false,
+                ownershipSource = attributionSource.name,
             )
             if (verifiedDomainDecision.blocked) {
                 counters.droppedPackets.incrementAndGet()

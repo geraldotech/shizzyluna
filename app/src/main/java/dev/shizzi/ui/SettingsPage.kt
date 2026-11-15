@@ -101,6 +101,7 @@ data class SettingsState(
     val customAccents: List<Int>,
     val isLogging: Boolean,
     val vpnMode: VpnMode,
+    val stopHotspotOnVpnDisconnect: Boolean = true,
     val isRunningDiagnostics: Boolean,
     val automation: AutomationState,
     val dnsSettings: dev.shizzi.DnsSettings,
@@ -124,6 +125,7 @@ data class SettingsActions(
     val onAddCustomAccent: (Int) -> Unit,
     val onSetLogging: (Boolean) -> Unit,
     val onSetVpnMode: (VpnMode) -> Unit,
+    val onSetStopHotspotOnVpnDisconnect: (Boolean) -> Unit = {},
     val onSetDnsPreset: (dev.shizzi.DnsPreset) -> Unit,
     val onSetCustomDns: (String, String) -> Unit,
     val onOpenClients: () -> Unit,
@@ -252,14 +254,19 @@ private fun settingsSections(
         SettingsAction(
             label = SettingsText(
                 title = "Domain Blocking (Global & Per-Host)",
-                subtitle = "$globalDomainCount global • $clientDomainCount per-host active rules (DNS + TLS SNI/Host)",
+                subtitle = "$globalDomainCount global • $clientDomainCount per-host active rules",
             ),
             onClick = actions.onOpenDomainBlocking,
         )
     },
 
     SettingsSectionSpec("Advanced") {
-        VpnSection(selected = state.vpnMode, onSelect = actions.onSetVpnMode)
+        VpnSection(
+            selected = state.vpnMode,
+            onSelect = actions.onSetVpnMode,
+            stopHotspotOnVpnDisconnect = state.stopHotspotOnVpnDisconnect,
+            onSetStopHotspotOnVpnDisconnect = actions.onSetStopHotspotOnVpnDisconnect,
+        )
 
         AutomationSection(
             state = state.automation,
@@ -334,47 +341,22 @@ private fun Modifier.inert(isBusy: Boolean): Modifier = when {
 internal fun BlockingModeSection(
     state: SettingsState,
     actions: SettingsActions,
-    toasts: ToastState,
+    @Suppress("UNUSED_PARAMETER") toasts: ToastState,
 ) {
-    val context = LocalContext.current
     val preNat = state.bpfReport.preNatDiagnostics
     val softAp = state.bpfReport.softApDiagnostics
-    val cap = preNat.capability
-    var showProbeApprovalDialog by rememberSaveable { mutableStateOf(false) }
-    var showSoftApProbeDialog by rememberSaveable { mutableStateOf(false) }
 
-    val defaultClientA = state.connectedClients.getOrNull(0)?.cleanMac ?: "AA:BB:CC:DD:EE:01"
-    val defaultClientB = state.connectedClients.getOrNull(1)?.cleanMac ?: "AA:BB:CC:DD:EE:02"
-    var probeClientAMac by rememberSaveable(defaultClientA) { mutableStateOf(defaultClientA) }
-    var probeClientBMac by rememberSaveable(defaultClientB) { mutableStateOf(defaultClientB) }
-
-    val statusColor = when (cap.capabilityStatus) {
-        PreNatCapabilityStatus.VERIFIED_AVAILABLE -> Color(0xFF4CAF50)
-        PreNatCapabilityStatus.NEEDS_USER_APPROVED_PROBE,
-        PreNatCapabilityStatus.CHECKING_READ_ONLY,
-        PreNatCapabilityStatus.PROBING -> Color(0xFFFFA000)
-        PreNatCapabilityStatus.UNCHECKED,
-        PreNatCapabilityStatus.NOT_TESTED_SHIZUKU_UNAVAILABLE -> Color(0xFF90A4AE)
-        else -> Color(0xFFE57373)
+    val activeModeLabel = when (preNat.effectiveModeNullable ?: preNat.requestedMode) {
+        BlockingMode.SOFTAP_MAC_BLOCK -> "SoftAP MAC Block"
+        BlockingMode.BPF_NAT_VPN -> "BPF/NAT + VPN"
     }
 
-    val softApStateColor = when (softAp.engineState) {
-        SoftApEngineState.READY,
-        SoftApEngineState.ACTIVE -> Color(0xFF4CAF50)
-        SoftApEngineState.CAPABILITY_CHECKING,
-        SoftApEngineState.PROBING_2_CLIENT,
-        SoftApEngineState.APPLYING -> Color(0xFFFFA000)
-        SoftApEngineState.UNCHECKED,
-        SoftApEngineState.SHIZUKU_NOT_RUNNING,
-        SoftApEngineState.SHIZUKU_PERMISSION_REQUIRED -> Color(0xFF90A4AE)
-        else -> Color(0xFFE57373)
-    }
-
-    val throttledCount = remember(state.clientRules, state.connectedClients) {
-        val ruleMacs = state.clientRules.filter { it.bandwidthLimitKbps > 0 }.map { it.cleanMac }.toSet()
-        val connMacs = state.connectedClients.filter { it.bandwidthLimitKbps > 0 }.map { it.cleanMac }.toSet()
-        (ruleMacs + connMacs).size
-    }
+    val isSoftApUnavailable = preNat.requestedMode == BlockingMode.SOFTAP_MAC_BLOCK &&
+        (softAp.engineState.isTerminalUnsupported ||
+            softAp.engineState == SoftApEngineState.SHIZUKU_NOT_RUNNING ||
+            softAp.engineState == SoftApEngineState.SHIZUKU_PERMISSION_REQUIRED ||
+            softAp.engineState == SoftApEngineState.BLOCK_FAILED ||
+            softAp.engineState == SoftApEngineState.ROLLBACK_REQUIRED)
 
     Card(
         shape = RoundedCornerShape(14.dp),
@@ -388,30 +370,16 @@ internal fun BlockingModeSection(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Exclusive Blocking Mode (v0.10.8)",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = ShizziTheme.colors.onSurface,
-                )
-                Text(
-                    text = softAp.engineState.name,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 10.sp,
-                    color = softApStateColor,
-                    modifier = Modifier.testTag("blocking_mode_capability_badge"),
-                )
-            }
+            Text(
+                text = "Blocking Mode",
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+                color = ShizziTheme.colors.onSurface,
+            )
 
             Text(
-                text = "Only one whole-client enforcement engine may be active at a time (0 during transitions/recovery). Domain filtering and read-only BPF telemetry remain active in both modes.",
-                fontSize = 10.sp,
+                text = "Choose how blocked devices are restricted on your hotspot.",
+                fontSize = 11.sp,
                 color = ShizziTheme.colors.onSurfaceMuted,
             )
 
@@ -438,14 +406,14 @@ internal fun BlockingModeSection(
                         color = ShizziTheme.colors.onSurface,
                     )
                     Text(
-                        text = "Userspace TUN datapath + BPF NAT attribution (supports blocking, throttling & domain rules)",
+                        text = "Userspace VPN mode with internet blocking, data limits, bandwidth limits, and domain rules.",
                         fontSize = 10.sp,
                         color = ShizziTheme.colors.onSurfaceMuted,
                     )
                 }
             }
 
-            // Radio 2: SoftAP MAC Blocklist (Experimental)
+            // Radio 2: SoftAP MAC Block (Experimental)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -468,7 +436,7 @@ internal fun BlockingModeSection(
                         color = ShizziTheme.colors.onSurface,
                     )
                     Text(
-                        text = "Native Wi-Fi hotspot MAC blocklist via SoftApConfiguration (disconnects blocked clients; no throttling)",
+                        text = "Uses hotspot-level MAC blocking to disconnect blocked clients. Bandwidth throttling is not supported in this mode.",
                         fontSize = 10.sp,
                         color = ShizziTheme.colors.onSurfaceMuted,
                     )
@@ -476,8 +444,6 @@ internal fun BlockingModeSection(
             }
 
             HorizontalDivider(color = ShizziTheme.colors.border.copy(alpha = 0.5f))
-
-            val effectiveModeDisplay = preNat.effectiveModeNullable ?: "NONE (Recovery/Transition)"
 
             Column(
                 modifier = Modifier
@@ -486,337 +452,19 @@ internal fun BlockingModeSection(
                 verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
                 Text(
-                    text = "Requested mode: ${preNat.requestedMode.name} • Active mode: $effectiveModeDisplay • State: ${preNat.runtimeState.name}",
-                    fontFamily = FontFamily.Monospace,
+                    text = "Current mode: $activeModeLabel",
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 10.sp,
+                    fontSize = 11.sp,
                     color = ShizziTheme.colors.primary,
                     modifier = Modifier.testTag("blocking_mode_active_modes"),
                 )
-                Text(
-                    text = "Exclusive engine invariant: ${preNat.exclusiveEngineInvariant} • TransitionId: ${preNat.transitionId} • PolicyGen: ${preNat.policyGeneration}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    color = if (preNat.exclusiveEngineInvariant) ShizziTheme.colors.onSurfaceMuted else Color(0xFFE57373),
-                    modifier = Modifier.testTag("blocking_mode_invariant_status"),
-                )
-                if (preNat.fallbackReason.isNotBlank()) {
+                if (isSoftApUnavailable) {
                     Text(
-                        text = "Mode status / fallback: ${preNat.fallbackReason}",
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 10.sp,
-                        color = ShizziTheme.colors.onSurfaceMuted,
-                        modifier = Modifier.testTag("blocking_mode_capability_detail"),
-                    )
-                }
-                if (preNat.legacyPreNatMigrated || !preNat.legacyPreNatCleanupVerified) {
-                    Text(
-                        text = "Legacy Pre-NAT retirement: migrated=${preNat.legacyPreNatMigrated} • cleanupVerified=${preNat.legacyPreNatCleanupVerified}",
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 10.sp,
-                        color = if (preNat.legacyPreNatCleanupVerified) ShizziTheme.colors.onSurfaceMuted else Color(0xFFE57373),
-                        modifier = Modifier.testTag("legacy_prenat_migration_status"),
-                    )
-                }
-            }
-
-            if (preNat.runtimeState == PreNatRuntimeState.RECOVERY_REQUIRED || softAp.rollbackRequired) {
-                Text(
-                    text = "RECOVERY_REQUIRED: Rollback cleanup could not be verified (preNat=${preNat.rollbackStatus.name}, softApRollback=${softAp.rollbackRequired}). Dual-engine enforcement is blocked until cleanup succeeds.",
-                    fontSize = 10.sp,
-                    color = Color(0xFFE57373),
-                    modifier = Modifier.testTag("blocking_mode_recovery_warning"),
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = actions.onRestoreBpfMode,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("prenat_restore_engine_button"),
-                ) {
-                    Text("Restore BPF/NAT mode", fontSize = 10.sp)
-                }
-
-                OutlinedButton(
-                    onClick = {
-                        exportAndShareBpfDiagnostics(
-                            context = context,
-                            report = state.bpfReport,
-                            includePseudonymousIds = state.bpfExportPseudonymousIds,
-                            toasts = toasts,
-                        )
-                    },
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("prenat_export_diagnostics_button"),
-                ) {
-                    Text("Export diagnostics", fontSize = 10.sp)
-                }
-            }
-
-            HorizontalDivider(color = ShizziTheme.colors.border.copy(alpha = 0.5f))
-
-            // Native SoftAP MAC Blocklist Section (v0.10.7-debug)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "SoftAP MAC Blocklist Engine (Experimental)",
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 12.sp,
-                    color = ShizziTheme.colors.onSurface,
-                )
-                Text(
-                    text = softAp.engineState.name,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 10.sp,
-                    color = softApStateColor,
-                    modifier = Modifier.testTag("softap_engine_state_badge"),
-                )
-            }
-
-            Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = Color(0xFFFFA000).copy(alpha = 0.14f),
-                border = BorderStroke(0.5.dp, Color(0xFFFFA000).copy(alpha = 0.4f)),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("softap_warning_banner"),
-            ) {
-                Text(
-                    text = "Hotspot Disconnection Behavior: Blocked clients are disconnected from the Wi-Fi hotspot via SoftApConfiguration.setBlockedClientList and prevented from reconnecting until all block reasons clear. Per-client bandwidth throttling is unsupported in SoftAP mode.",
-                    fontSize = 10.sp,
-                    color = ShizziTheme.colors.onSurface,
-                    modifier = Modifier.padding(8.dp),
-                )
-            }
-
-            if (throttledCount > 0) {
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = Color(0xFFE57373).copy(alpha = 0.14f),
-                    border = BorderStroke(0.5.dp, Color(0xFFE57373).copy(alpha = 0.45f)),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("softap_throttle_warning_banner"),
-                ) {
-                    Text(
-                        text = "Bandwidth Throttle Warning: $throttledCount client rule(s) have a non-zero Mbps limit. SoftAP MAC Blocklist mode only enforces binary block/unblock; bandwidth limits will not throttle packets while SoftAP mode is active.",
-                        fontSize = 10.sp,
+                        text = "SoftAP MAC Block is unavailable on this device.",
+                        fontSize = 11.sp,
                         color = Color(0xFFE57373),
-                        modifier = Modifier.padding(8.dp),
+                        modifier = Modifier.testTag("softap_unavailable_notice"),
                     )
-                }
-            }
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("softap_capability_summary"),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                val id = softAp.capability.executionIdentity
-                val snap = softAp.capability.configSnapshot
-                Text(
-                    text = "SoftAP API: get=${softAp.capability.getSoftApConfigSupported} • set=${softAp.capability.setSoftApConfigSupported} • builderBlockedList=${softAp.capability.builderSetBlockedListSupported} • forceDisconnect=${softAp.capability.forceDisconnectSupported}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    color = ShizziTheme.colors.onSurfaceMuted,
-                    modifier = Modifier.testTag("softap_api_support_text"),
-                )
-                Text(
-                    text = "Identity: shizuku=${softAp.capability.shizukuState} • uid=${id.uid} (${id.privilegeMode}) • selinux=${id.selinuxContext} • provenance=${id.provenance}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    color = ShizziTheme.colors.onSurfaceMuted,
-                    modifier = Modifier.testTag("softap_identity_text"),
-                )
-                Text(
-                    text = "Config snapshot: clientControlByUser=${snap.clientControlByUser} • priorBlocked=${softAp.journal.priorBlockedMacs.size} • appOwned=${softAp.journal.appOwnedMacs.size} • allowed=${snap.allowedList.size} • hash=${snap.nonSecretFingerprintSha256.take(12).ifBlank { "none" }}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    color = ShizziTheme.colors.onSurfaceMuted,
-                    modifier = Modifier.testTag("softap_journal_summary_text"),
-                )
-                Text(
-                    text = "2-Client Live Probe: verdict=${softAp.lastProbe.verdict} • clientADisc=${softAp.lastProbe.clientADisconnected} (${softAp.lastProbe.disconnectLatencyMs}ms) • clientBConnected=${softAp.lastProbe.clientBRemainedConnected} • restored=${softAp.lastProbe.restoredVerified}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    color = if (softAp.lastProbe.verdict == "READY") Color(0xFF4CAF50) else ShizziTheme.colors.onSurfaceMuted,
-                    modifier = Modifier.testTag("softap_live_probe_summary"),
-                )
-                if (softAp.capability.reason.isNotBlank()) {
-                    Text(
-                        text = "Status detail: ${softAp.capability.reason}",
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 10.sp,
-                        color = softApStateColor,
-                        modifier = Modifier.testTag("softap_status_reason_text"),
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = actions.onCheckSoftApCapability,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("softap_check_capability_button"),
-                ) {
-                    Text("Check SoftAP capability", fontSize = 10.sp)
-                }
-
-                OutlinedButton(
-                    onClick = { showSoftApProbeDialog = true },
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("softap_run_live_probe_button"),
-                ) {
-                    Text("Run 2-client live probe", fontSize = 10.sp)
-                }
-
-                Button(
-                    onClick = actions.onActivateSoftApMode,
-                    enabled = (softAp.engineState == SoftApEngineState.READY || softAp.engineState == SoftApEngineState.ACTIVE) &&
-                        preNat.effectiveModeNullable != BlockingMode.SOFTAP_MAC_BLOCK,
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = ShizziTheme.colors.primary,
-                        contentColor = ShizziTheme.colors.onPrimary,
-                    ),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("softap_activate_mode_button"),
-                ) {
-                    Text("Activate SoftAP", fontSize = 10.sp)
-                }
-            }
-        }
-    }
-
-    if (showProbeApprovalDialog) {
-        Dialog(onDismissRequest = { showProbeApprovalDialog = false }) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .themedSurface(fill = ShizziTheme.colors.surface)
-                    .padding(ShizziTheme.spacing.lg)
-                    .testTag("prenat_probe_confirm_dialog"),
-                verticalArrangement = Arrangement.spacedBy(ShizziTheme.spacing.md),
-            ) {
-                Text(
-                    text = "Approve Scoped Pre-NAT Counter Probe?",
-                    style = ShizziTheme.typography.heading,
-                    color = ShizziTheme.colors.onSurface,
-                )
-                Text(
-                    text = "This temporary probe creates an isolated app-owned RETURN chain scoped to ${cap.downstreamIface.ifBlank { "ap_iface" }} -> ${cap.upstreamIface.ifBlank { "tun_iface" }} and removes it immediately after verification.",
-                    style = ShizziTheme.typography.body,
-                    color = ShizziTheme.colors.onSurfaceMuted,
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    TextButton(
-                        onClick = { showProbeApprovalDialog = false },
-                        modifier = Modifier.testTag("prenat_probe_cancel_button"),
-                    ) {
-                        Text("Cancel", color = ShizziTheme.colors.onSurfaceMuted)
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    Button(
-                        onClick = {
-                            showProbeApprovalDialog = false
-                            actions.onRunPreNatScopedProbe(true)
-                        },
-                        modifier = Modifier.testTag("prenat_probe_confirm_button"),
-                    ) {
-                        Text("Approve & Run Probe")
-                    }
-                }
-            }
-        }
-    }
-
-    if (showSoftApProbeDialog) {
-        Dialog(onDismissRequest = { showSoftApProbeDialog = false }) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .themedSurface(fill = ShizziTheme.colors.surface)
-                    .padding(ShizziTheme.spacing.lg)
-                    .testTag("softap_live_probe_dialog"),
-                verticalArrangement = Arrangement.spacedBy(ShizziTheme.spacing.md),
-            ) {
-                Text(
-                    text = "Run Controlled 2-Client SoftAP Probe?",
-                    style = ShizziTheme.typography.heading,
-                    color = ShizziTheme.colors.onSurface,
-                )
-                Text(
-                    text = "This probe temporarily adds Client A to SoftApConfiguration.blockedClientList, verifies Client A disconnects within 5s while Client B remains connected, and immediately restores the original SoftAP configuration.",
-                    style = ShizziTheme.typography.body,
-                    color = ShizziTheme.colors.onSurfaceMuted,
-                )
-                OutlinedTextField(
-                    value = probeClientAMac,
-                    onValueChange = { probeClientAMac = it.uppercase() },
-                    label = { Text("Client A MAC (temporarily disconnected)") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("softap_probe_client_a_input"),
-                )
-                OutlinedTextField(
-                    value = probeClientBMac,
-                    onValueChange = { probeClientBMac = it.uppercase() },
-                    label = { Text("Client B MAC (must remain connected)") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("softap_probe_client_b_input"),
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    TextButton(
-                        onClick = { showSoftApProbeDialog = false },
-                        modifier = Modifier.testTag("softap_cancel_live_probe_button"),
-                    ) {
-                        Text("Cancel", color = ShizziTheme.colors.onSurfaceMuted)
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    Button(
-                        onClick = {
-                            showSoftApProbeDialog = false
-                            actions.onRunSoftApLiveProbe(
-                                probeClientAMac.trim(),
-                                probeClientBMac.trim(),
-                                true,
-                                5_000,
-                            )
-                        },
-                        modifier = Modifier.testTag("softap_confirm_live_probe_button"),
-                    ) {
-                        Text("Confirm & Run Probe")
-                    }
                 }
             }
         }
@@ -829,6 +477,8 @@ private fun DeveloperSection(
     actions: SettingsActions,
     toasts: ToastState,
 ) {
+    val context = LocalContext.current
+
     SettingsToggle(
         label = SettingsText(title = "Logging"),
         isChecked = state.isLogging,
@@ -838,29 +488,10 @@ private fun DeveloperSection(
     SettingsToggle(
         label = SettingsText(
             title = "Experimental BPF NAT Attribution",
-            subtitle = "Use dumpsys tethering bpf for post-NAT flow attribution (established flows only; first-packet traffic remains unattributed)",
+            subtitle = "Improves per-device traffic and domain attribution on hotspot connections",
         ),
         isChecked = state.experimentalBpfEnabled,
         onCheckedChange = actions.onSetExperimentalBpfEnabled,
-    )
-
-    Spacer(Modifier.height(10.dp))
-
-    BpfAttributionDiagnosticsDebugPanel(
-        report = state.bpfReport,
-        refreshOnMissEnabled = state.bpfRefreshOnMissEnabled,
-        deepTupleDiagnosticsEnabled = state.bpfDeepTupleDiagnosticsEnabled,
-        exportPseudonymousIds = state.bpfExportPseudonymousIds,
-        phaseDEnforcementMode = state.phaseDEnforcementMode,
-        isCollectingBpf = state.isCollectingBpf,
-        onSetRefreshOnMissEnabled = actions.onSetBpfRefreshOnMissEnabled,
-        onSetDeepTupleDiagnosticsEnabled = actions.onSetBpfDeepTupleDiagnosticsEnabled,
-        onSetExportPseudonymousIds = actions.onSetBpfExportPseudonymousIds,
-        onSetPhaseDEnforcementMode = actions.onSetPhaseDEnforcementMode,
-        onRecordPhaseDDeliveryTestMarker = actions.onRecordPhaseDDeliveryTestMarker,
-        onCaptureSnapshot = actions.onCollectBpfSnapshotNow,
-        onResetCounters = actions.onResetBpfDiagnosticsCounters,
-        toasts = toasts,
     )
 
     Spacer(Modifier.height(10.dp))
@@ -871,16 +502,24 @@ private fun DeveloperSection(
     )
 
     SettingsAction(
-        label = SettingsText(
-            title = "Diagnóstico do firewall & BPF NAT",
-            subtitle = "Probes Opção A/B, telemetria BPF NAT e exportação de relatório",
-        ),
-        onClick = actions.onOpenFirewallDiagnostic,
+        label = SettingsText(title = "Run diagnostics"),
+        onClick = actions.onRunProbes,
     )
 
     SettingsAction(
-        label = SettingsText(title = "Run diagnostics"),
-        onClick = actions.onRunProbes,
+        label = SettingsText(
+            title = "Export diagnostics",
+            subtitle = "Share or copy a support report",
+        ),
+        modifier = Modifier.testTag("export_diagnostics_action"),
+        onClick = {
+            exportAndShareBpfDiagnostics(
+                context = context,
+                report = state.bpfReport,
+                includePseudonymousIds = state.bpfExportPseudonymousIds,
+                toasts = toasts,
+            )
+        },
     )
 
     SettingsAction(
@@ -1422,13 +1061,13 @@ private fun exportAndShareBpfDiagnostics(
         val uri = FileProvider.getUriForFile(context, exported.authority, exported.markdownFile)
         val shareIntent = Intent(Intent.ACTION_SEND).apply {
             type = "text/markdown"
-            putExtra(Intent.EXTRA_SUBJECT, "Shizzy Luna v0.10.7-debug BPF Attribution Report")
+            putExtra(Intent.EXTRA_SUBJECT, "Shizzy Luna ${BuildConfig.VERSION_NAME} Diagnostics Report")
             putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_TEXT, exported.markdownFile.readText())
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(shareIntent, "Export BPF Attribution Diagnostics"))
-        toasts.show(copiedToast("BPF Diagnostics Export"))
+        context.startActivity(Intent.createChooser(shareIntent, "Export Diagnostics"))
+        toasts.show(copiedToast("Diagnostics Export"))
     }.onFailure {
         val fallbackMd = report.toMarkdownReport(
             apkVersion = BuildConfig.VERSION_NAME,
@@ -1495,7 +1134,7 @@ internal fun AboutDialog(
             verticalArrangement = Arrangement.spacedBy(ShizziTheme.spacing.md),
         ) {
             Text(
-                text = "shizzy lua",
+                text = "Shizzy Luna",
                 style = ShizziTheme.typography.heading,
                 color = ShizziTheme.colors.onSurface,
                 modifier = Modifier.testTag("about_modal_title"),

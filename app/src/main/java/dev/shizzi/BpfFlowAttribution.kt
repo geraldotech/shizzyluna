@@ -4376,8 +4376,10 @@ data class BpfAttributionStatusReport(
             ),
         ),
     ),
-    // v0.10.8-debug: Domain Blocking Engine & DNS/SNI Filtering Diagnostics (Schema v6)
+    // v0.10.8-debug: Domain Blocking Engine & DNS/SNI Filtering Diagnostics
     val domainDiagnostics: DomainFilterDiagnosticReport = DomainFilterDiagnosticReport(),
+    // v0.10.9-debug: VPN Loss Recovery & Fail-Closed Diagnostics (Schema v7)
+    val vpnRecoveryDiagnostics: VpnRecoveryDiagnostics = VpnRecoveryDiagnostics(),
     val ambiguousOrStaleLookups: Long = 0L,
     val localControlPackets: Long = 0L,
     val localControlBytes: Long = 0L,
@@ -4550,8 +4552,8 @@ data class BpfAttributionStatusReport(
         if (!includeSensitiveEndpoints) {
             DiagnosticRedactor.redactedExportRecordsCount.incrementAndGet()
         }
-        put("schemaVersion", 6)
-        put("featureVersion", "0.10.8-debug")
+        put("schemaVersion", 7)
+        put("featureVersion", "0.10.9-debug")
         put("requestedMode", preNatDiagnostics.requestedMode.name)
         put("effectiveMode", preNatDiagnostics.effectiveModeNullable?.name ?: "NONE")
         put("exclusiveEngineInvariant", preNatDiagnostics.exclusiveEngineInvariant && softApDiagnostics.exclusiveEngineInvariant)
@@ -4976,6 +4978,7 @@ data class BpfAttributionStatusReport(
         put("testMatrix", preNatJson.optJSONArray("testMatrix") ?: JSONArray())
         put("softApDiagnostics", softApDiagnostics.toJson(includeSensitiveEndpoints, includePseudonymousIds))
         put("domainDiagnostics", domainDiagnostics.toJson())
+        put("vpnRecoveryDiagnostics", vpnRecoveryDiagnostics.toJson())
     }
 
     fun toMarkdownReport(
@@ -5014,13 +5017,14 @@ data class BpfAttributionStatusReport(
             BpfDumpParser.maskSensitiveLinePreview(lastAttemptError)
         }
 
-        appendLine("# Shizzy Luna v0.10.8-debug — Simplified Blocking Modes, Domain Filtering, SoftAP MAC Blocklist & BPF Attribution Report")
+        appendLine("# Shizzy Luna v0.10.9-debug — Per-Host Domain Enforcement, VPN Loss Recovery, Blocking Modes & BPF Attribution Report")
         appendLine()
         appendLine("## 1. Build & Session Metadata")
-        appendLine("- **APK Version**: `$apkVersion` (serviceBuildId `$serviceBuildId`, schemaVersion `6`, featureVersion `0.10.8-debug`)")
+        appendLine("- **APK Version**: `$apkVersion` (serviceBuildId `$serviceBuildId`, schemaVersion `7`, featureVersion `0.10.9-debug`)")
         appendLine("- **Base Commit**: `$sourceCommit`")
         appendLine("- **Blocking Mode (Exclusive)**: requested=`${preNatDiagnostics.requestedMode.name}`, effective=`${preNatDiagnostics.effectiveModeNullable?.name ?: "NONE"}`, runtimeState=`${preNatDiagnostics.runtimeState.name}`, softApState=`${softApDiagnostics.engineState.code}`, exclusiveEngineInvariant=`${preNatDiagnostics.exclusiveEngineInvariant && softApDiagnostics.exclusiveEngineInvariant}`")
-        appendLine("- **Domain Filtering Status**: `${domainDiagnostics.capabilityStatus}` (globalRules=`${domainDiagnostics.enabledGlobalRuleCount}/${domainDiagnostics.globalRuleCount}`, perClientRules=`${domainDiagnostics.enabledPerClientRuleCount}/${domainDiagnostics.perClientRuleCount}`, dnsBlockedGlobal=`${domainDiagnostics.dnsQueriesBlockedGlobal}`, dnsBlockedPerClient=`${domainDiagnostics.dnsQueriesBlockedPerClient}`, unknownOwnerSkips=`${domainDiagnostics.unknownOwnerClientRuleSkips}`)")
+        appendLine("- **Domain Filtering Status**: `${domainDiagnostics.capabilityStatus}` (globalRules=`${domainDiagnostics.enabledGlobalRuleCount}/${domainDiagnostics.globalRuleCount}`, perClientRules=`${domainDiagnostics.enabledPerClientRuleCount}/${domainDiagnostics.perClientRuleCount}`, dnsBlockedGlobal=`${domainDiagnostics.dnsQueriesBlockedGlobal}`, dnsBlockedPerClient=`${domainDiagnostics.dnsQueriesBlockedPerClient}`, unknownOwnerSkips=`${domainDiagnostics.unknownOwnerClientRuleSkips}`, dnsRetryEnabled=`${domainDiagnostics.dnsAttributionRetryEnabled}`)")
+        appendLine("- **VPN Recovery Status**: state=`${vpnRecoveryDiagnostics.vpnLifecycleState.name}`, stopHotspotOnDisconnect=`${vpnRecoveryDiagnostics.stopHotspotOnVpnDisconnect}`, failClosedGate=`${vpnRecoveryDiagnostics.vpnForwardingGateClosed}`, outages=`${vpnRecoveryDiagnostics.vpnOutageCount}`, recoveries=`${vpnRecoveryDiagnostics.vpnRecoveryCount}`")
         appendLine("- **Legacy Pre-NAT Retirement Status**: **${preNatDiagnostics.goNoGoVerdict}**")
         appendLine("- **Phase D Mode**: `${phaseD.phaseDMode.name}` (evidenceConfidence `${phaseD.evidenceConfidence.name}`, interfaceLifecycle `${phaseD.interfaceLifecycleState.name}`)")
         appendLine("- **Experimental BPF Enabled**: `$experimentalEnabled`")
@@ -5310,6 +5314,8 @@ data class BpfAttributionStatusReport(
         )
         appendLine()
         append(domainDiagnostics.toMarkdownSection())
+        appendLine()
+        append(vpnRecoveryDiagnostics.toMarkdownSection())
     }
 
     companion object {
@@ -5729,6 +5735,7 @@ data class BpfAttributionStatusReport(
                         ),
                     ),
                 domainDiagnostics = DomainFilterDiagnosticReport.fromJson(json.optJSONObject("domainDiagnostics")),
+                vpnRecoveryDiagnostics = VpnRecoveryDiagnostics.fromJson(json.optJSONObject("vpnRecoveryDiagnostics")),
                 ambiguousOrStaleLookups = json.optLong("ambiguousOrStaleLookups", 0L),
                 localControlPackets = json.optLong("localControlPackets", 0L),
                 localControlBytes = json.optLong("localControlBytes", 0L),

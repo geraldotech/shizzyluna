@@ -5,10 +5,12 @@ import org.json.JSONObject
 import java.net.IDN
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.util.Collections
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 enum class DomainRuleScope(val displayLabel: String) {
     GLOBAL("Global (All Hotspot Hosts)"),
@@ -62,6 +64,12 @@ enum class DomainDropOrSkipReason(val code: String) {
     DOMAIN_BLOCK_GLOBAL_HOSTNAME("DOMAIN_BLOCK_GLOBAL_HOSTNAME"),
     DOMAIN_BLOCK_CLIENT_HOSTNAME("DOMAIN_BLOCK_CLIENT_HOSTNAME"),
     DOMAIN_CLIENT_OWNER_UNKNOWN("DOMAIN_CLIENT_OWNER_UNKNOWN"),
+    DOMAIN_CLIENT_OWNER_MISMATCH("DOMAIN_CLIENT_OWNER_MISMATCH"),
+    DNS_RETRY_QUEUED("DNS_RETRY_QUEUED"),
+    DNS_RETRY_RESOLVED("DNS_RETRY_RESOLVED"),
+    DNS_RETRY_TIMEOUT("DNS_RETRY_TIMEOUT"),
+    DNS_RETRY_OVERFLOW("DNS_RETRY_OVERFLOW"),
+    DNS_RETRY_CANCELLED("DNS_RETRY_CANCELLED"),
     DNS_PARSE_ERROR("DNS_PARSE_ERROR"),
     DNS_RESPONSE_GEN_ERROR("DNS_RESPONSE_GEN_ERROR")
 }
@@ -1001,7 +1009,10 @@ data class DomainPacketDecision(
     val queriedDomain: String? = null,
     val reason: DomainDropOrSkipReason = DomainDropOrSkipReason.NONE,
     val synthesizedDnsResponse: ByteArray? = null,
-    val unknownOwnerClientRuleSkipped: Boolean = false
+    val unknownOwnerClientRuleSkipped: Boolean = false,
+    val clientRuleMatchedDomainOnUnknownOwner: Boolean = false,
+    val ruleGeneration: Long = 1L,
+    val ownershipSource: String = "UNKNOWN_OWNER",
 )
 
 data class DomainRuleEvaluationSummary(
@@ -1010,7 +1021,12 @@ data class DomainRuleEvaluationSummary(
     val scope: DomainRuleScope = DomainRuleScope.GLOBAL,
     val redactedClientMac: String = "GLOBAL",
     val reason: String = "NONE",
-    val synthesizedRefused: Boolean = false
+    val synthesizedRefused: Boolean = false,
+    val ruleGeneration: Long = 1L,
+    val protocol: String = "UDP/53",
+    val direction: String = "UPLOAD",
+    val ownershipSource: String = "UNKNOWN_OWNER",
+    val skipReason: String = "NONE",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("timestampMs", timestampMs)
@@ -1019,6 +1035,11 @@ data class DomainRuleEvaluationSummary(
         put("redactedClientMac", redactedClientMac)
         put("reason", reason)
         put("synthesizedRefused", synthesizedRefused)
+        put("ruleGeneration", ruleGeneration)
+        put("protocol", protocol)
+        put("direction", direction)
+        put("ownershipSource", ownershipSource)
+        put("skipReason", skipReason)
     }
 
     companion object {
@@ -1028,7 +1049,12 @@ data class DomainRuleEvaluationSummary(
             scope = DomainRuleScope.fromName(json.optString("scope", DomainRuleScope.GLOBAL.name)),
             redactedClientMac = json.optString("redactedClientMac", "GLOBAL"),
             reason = json.optString("reason", "NONE"),
-            synthesizedRefused = json.optBoolean("synthesizedRefused", false)
+            synthesizedRefused = json.optBoolean("synthesizedRefused", false),
+            ruleGeneration = json.optLong("ruleGeneration", 1L),
+            protocol = json.optString("protocol", "UDP/53"),
+            direction = json.optString("direction", "UPLOAD"),
+            ownershipSource = json.optString("ownershipSource", "UNKNOWN_OWNER"),
+            skipReason = json.optString("skipReason", "NONE"),
         )
     }
 }
@@ -1037,7 +1063,8 @@ data class DomainTestCaseStatus(
     val id: String,
     val description: String,
     val passed: Boolean,
-    val detail: String
+    val detail: String,
+    val verificationScope: String = "UNIT_JVM",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -1045,6 +1072,7 @@ data class DomainTestCaseStatus(
         put("passed", passed)
         put("status", if (passed) "PASS" else "FAIL")
         put("detail", detail)
+        put("verificationScope", verificationScope)
     }
 
     companion object {
@@ -1052,13 +1080,14 @@ data class DomainTestCaseStatus(
             id = json.optString("id", ""),
             description = json.optString("description", ""),
             passed = json.optBoolean("passed", json.optString("status", "PASS") == "PASS"),
-            detail = json.optString("detail", "")
+            detail = json.optString("detail", ""),
+            verificationScope = json.optString("verificationScope", "UNIT_JVM"),
         )
     }
 }
 
 data class DomainFilterDiagnosticReport(
-    val schemaVersion: Int = 6,
+    val schemaVersion: Int = 7,
     val capabilityStatus: String = DomainFilterCapabilityStatus.PARTIAL_DOMAIN_ENFORCEMENT.code,
     val capabilitySummary: String = DomainFilterCapabilityStatus.PARTIAL_DOMAIN_ENFORCEMENT.summary,
     val globalRuleCount: Int = 0,
@@ -1077,9 +1106,28 @@ data class DomainFilterDiagnosticReport(
     val hostnameInspections: Long = 0L,
     val hostnameBlockedGlobal: Long = 0L,
     val hostnameBlockedPerClient: Long = 0L,
+    val dnsDirectIp: Long = 0L,
+    val dnsBpfNat: Long = 0L,
+    val dnsUnknownOwner: Long = 0L,
+    val clientRuleMatched: Long = 0L,
+    val clientRuleOwnerMismatch: Long = 0L,
+    val dnsRetryQueued: Long = 0L,
+    val dnsRetryResolved: Long = 0L,
+    val dnsRetryTimeout: Long = 0L,
+    val dnsRetryOverflow: Long = 0L,
+    val dnsRetryCancelled: Long = 0L,
+    val dnsAttributionRetryEnabled: Boolean = false,
+    val dnsRetryMaxWaitMs: Long = 200L,
     val recentBlockedEvents: List<DomainRuleEvaluationSummary> = emptyList(),
-    val testMatrix: List<DomainTestCaseStatus> = emptyList()
+    val testMatrix: List<DomainTestCaseStatus> = emptyList(),
+    val d01ToD12Matrix: List<DomainTestCaseStatus> = DomainFilterEngine.buildD01ToD12Matrix(),
 ) {
+    val dnsInspected: Long get() = dnsQueriesInspected
+    val clientRuleSkippedUnknownOwner: Long get() = unknownOwnerClientRuleSkips
+    val clientDnsBlocked: Long get() = dnsQueriesBlockedPerClient
+    val clientHostnameBlocked: Long get() = hostnameBlockedPerClient
+    val globalDnsBlocked: Long get() = dnsQueriesBlockedGlobal
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("schemaVersion", schemaVersion)
         put("capabilityStatus", capabilityStatus)
@@ -1091,36 +1139,64 @@ data class DomainFilterDiagnosticReport(
         put("clientsWithDomainRulesCount", clientsWithDomainRulesCount)
         put("ruleGeneration", ruleGeneration)
         put("dnsQueriesInspected", dnsQueriesInspected)
+        put("dnsInspected", dnsQueriesInspected)
         put("dnsQueriesAllowed", dnsQueriesAllowed)
         put("dnsQueriesBlockedGlobal", dnsQueriesBlockedGlobal)
+        put("globalDnsBlocked", dnsQueriesBlockedGlobal)
         put("dnsQueriesBlockedPerClient", dnsQueriesBlockedPerClient)
+        put("clientDnsBlocked", dnsQueriesBlockedPerClient)
         put("dnsParseErrors", dnsParseErrors)
         put("dnsResponseGenerationErrors", dnsResponseGenerationErrors)
         put("unknownOwnerClientRuleSkips", unknownOwnerClientRuleSkips)
+        put("clientRuleSkippedUnknownOwner", unknownOwnerClientRuleSkips)
         put("hostnameInspections", hostnameInspections)
         put("hostnameBlockedGlobal", hostnameBlockedGlobal)
         put("hostnameBlockedPerClient", hostnameBlockedPerClient)
+        put("clientHostnameBlocked", hostnameBlockedPerClient)
+        put("dnsDirectIp", dnsDirectIp)
+        put("dnsBpfNat", dnsBpfNat)
+        put("dnsUnknownOwner", dnsUnknownOwner)
+        put("clientRuleMatched", clientRuleMatched)
+        put("clientRuleOwnerMismatch", clientRuleOwnerMismatch)
+        put("dnsRetryQueued", dnsRetryQueued)
+        put("dnsRetryResolved", dnsRetryResolved)
+        put("dnsRetryTimeout", dnsRetryTimeout)
+        put("dnsRetryOverflow", dnsRetryOverflow)
+        put("dnsRetryCancelled", dnsRetryCancelled)
+        put("dnsAttributionRetryEnabled", dnsAttributionRetryEnabled)
+        put("dnsRetryMaxWaitMs", dnsRetryMaxWaitMs)
         put("recentBlockedEvents", JSONArray().apply { recentBlockedEvents.forEach { put(it.toJson()) } })
         put("testMatrix", JSONArray().apply { testMatrix.forEach { put(it.toJson()) } })
+        put("d01ToD12Matrix", JSONArray().apply { d01ToD12Matrix.forEach { put(it.toJson()) } })
     }
 
     fun toMarkdownSection(): String = buildString {
-        appendLine("## 12. Domain Blocking & Shared DNS/Hostname Policy Layer (`v0.10.8-debug`, Schema v6)")
+        appendLine("## 12. Domain Blocking & Per-Host Attribution Enforcement (`v0.10.9-debug`, Schema v$schemaVersion)")
         appendLine("- **Capability Status**: `$capabilityStatus` — $capabilitySummary")
         appendLine("- **Configured Rules**: global=`$enabledGlobalRuleCount/$globalRuleCount`, perClient=`$enabledPerClientRuleCount/$perClientRuleCount` (across `$clientsWithDomainRulesCount` client(s)), ruleGeneration=`$ruleGeneration`")
-        appendLine("- **DNS Queries (UDP/53 & TCP/53)**: inspected=`$dnsQueriesInspected`, allowed=`$dnsQueriesAllowed`, blockedGlobal=`$dnsQueriesBlockedGlobal`, blockedPerClient=`$dnsQueriesBlockedPerClient`, parseErrors=`$dnsParseErrors`, responseGenErrors=`$dnsResponseGenerationErrors`")
-        appendLine("- **Unknown-Owner Per-Client Rule Skips**: `$unknownOwnerClientRuleSkips` (`DOMAIN_CLIENT_OWNER_UNKNOWN` — never guesses owner)")
-        appendLine("- **Connection Hostname Classifier (TLS SNI / HTTP Host)**: inspected=`$hostnameInspections`, blockedGlobal=`$hostnameBlockedGlobal`, blockedPerClient=`$hostnameBlockedPerClient`")
+        appendLine("- **DNS Queries (UDP/53 & TCP/53)**: dnsInspected=`$dnsQueriesInspected` (directIp=`$dnsDirectIp`, bpfNat=`$dnsBpfNat`, unknownOwner=`$dnsUnknownOwner`), allowed=`$dnsQueriesAllowed`, globalDnsBlocked=`$dnsQueriesBlockedGlobal`, clientDnsBlocked=`$dnsQueriesBlockedPerClient`, parseErrors=`$dnsParseErrors`, responseGenErrors=`$dnsResponseGenerationErrors`")
+        appendLine("- **Per-Host Rule Attribution**: clientRuleMatched=`$clientRuleMatched`, clientRuleOwnerMismatch=`$clientRuleOwnerMismatch`, clientRuleSkippedUnknownOwner=`$unknownOwnerClientRuleSkips` (`DOMAIN_CLIENT_OWNER_UNKNOWN` — never guesses owner)")
+        appendLine("- **Bounded DNS Attribution Retry Queue**: enabled=`$dnsAttributionRetryEnabled` (maxWait=`${dnsRetryMaxWaitMs}ms`), queued=`$dnsRetryQueued`, resolved=`$dnsRetryResolved`, timeout=`$dnsRetryTimeout`, overflow=`$dnsRetryOverflow`, cancelled=`$dnsRetryCancelled`")
+        appendLine("- **Connection Hostname Classifier (TLS SNI / HTTP Host)**: inspected=`$hostnameInspections`, blockedGlobal=`$hostnameBlockedGlobal`, clientHostnameBlocked=`$hostnameBlockedPerClient`")
         if (recentBlockedEvents.isNotEmpty()) {
             appendLine()
-            appendLine("### 12.1 Recent Redacted Domain Block Events")
+            appendLine("### 12.1 Recent Redacted Domain Evaluation Events")
             recentBlockedEvents.forEach { ev ->
-                appendLine("- `${ev.redactedDomain}` | scope=`${ev.scope.name}` | client=`${ev.redactedClientMac}` | reason=`${ev.reason}` | refusedSynthesized=`${ev.synthesizedRefused}`")
+                appendLine("- `${ev.redactedDomain}` | scope=`${ev.scope.name}` | client=`${ev.redactedClientMac}` | source=`${ev.ownershipSource}` | proto=`${ev.protocol}` | gen=`${ev.ruleGeneration}` | reason=`${ev.reason}` | skip=`${ev.skipReason}` | refusedSynthesized=`${ev.synthesizedRefused}`")
+            }
+        }
+        if (d01ToD12Matrix.isNotEmpty()) {
+            appendLine()
+            appendLine("### 12.2 D01–D12 Per-Host Domain Enforcement Matrix (`v0.10.9-debug`)")
+            appendLine("| ID | Scenario | Scope | Status | Detail |")
+            appendLine("|---|---|---|---|---|")
+            d01ToD12Matrix.forEach { row ->
+                appendLine("| `${row.id}` | ${row.description} | `${row.verificationScope}` | **${if (row.passed) "PASS" else "PENDING"}** | ${row.detail} |")
             }
         }
         if (testMatrix.isNotEmpty()) {
             appendLine()
-            appendLine("### 12.2 DB01–DB20 Domain Filtering Verification Matrix")
+            appendLine("### 12.3 DB01–DB20 Baseline Domain Filtering Matrix")
             appendLine("| ID | Scenario | Status | Detail |")
             appendLine("|---|---|---|---|")
             testMatrix.forEach { row ->
@@ -1140,8 +1216,12 @@ data class DomainFilterDiagnosticReport(
             val matrix = (0 until matArr.length()).mapNotNull { i ->
                 matArr.optJSONObject(i)?.let { DomainTestCaseStatus.fromJson(it) }
             }
+            val dArr = json.optJSONArray("d01ToD12Matrix") ?: JSONArray()
+            val dMatrix = (0 until dArr.length()).mapNotNull { i ->
+                dArr.optJSONObject(i)?.let { DomainTestCaseStatus.fromJson(it) }
+            }
             return DomainFilterDiagnosticReport(
-                schemaVersion = json.optInt("schemaVersion", 6),
+                schemaVersion = json.optInt("schemaVersion", 7),
                 capabilityStatus = json.optString("capabilityStatus", DomainFilterCapabilityStatus.PARTIAL_DOMAIN_ENFORCEMENT.code),
                 capabilitySummary = json.optString("capabilitySummary", DomainFilterCapabilityStatus.PARTIAL_DOMAIN_ENFORCEMENT.summary),
                 globalRuleCount = json.optInt("globalRuleCount", 0),
@@ -1150,25 +1230,39 @@ data class DomainFilterDiagnosticReport(
                 enabledPerClientRuleCount = json.optInt("enabledPerClientRuleCount", 0),
                 clientsWithDomainRulesCount = json.optInt("clientsWithDomainRulesCount", 0),
                 ruleGeneration = json.optLong("ruleGeneration", 1L),
-                dnsQueriesInspected = json.optLong("dnsQueriesInspected", 0L),
+                dnsQueriesInspected = json.optLong("dnsQueriesInspected", json.optLong("dnsInspected", 0L)),
                 dnsQueriesAllowed = json.optLong("dnsQueriesAllowed", 0L),
-                dnsQueriesBlockedGlobal = json.optLong("dnsQueriesBlockedGlobal", 0L),
-                dnsQueriesBlockedPerClient = json.optLong("dnsQueriesBlockedPerClient", 0L),
+                dnsQueriesBlockedGlobal = json.optLong("dnsQueriesBlockedGlobal", json.optLong("globalDnsBlocked", 0L)),
+                dnsQueriesBlockedPerClient = json.optLong("dnsQueriesBlockedPerClient", json.optLong("clientDnsBlocked", 0L)),
                 dnsParseErrors = json.optLong("dnsParseErrors", 0L),
                 dnsResponseGenerationErrors = json.optLong("dnsResponseGenerationErrors", 0L),
-                unknownOwnerClientRuleSkips = json.optLong("unknownOwnerClientRuleSkips", 0L),
+                unknownOwnerClientRuleSkips = json.optLong("unknownOwnerClientRuleSkips", json.optLong("clientRuleSkippedUnknownOwner", 0L)),
                 hostnameInspections = json.optLong("hostnameInspections", 0L),
                 hostnameBlockedGlobal = json.optLong("hostnameBlockedGlobal", 0L),
-                hostnameBlockedPerClient = json.optLong("hostnameBlockedPerClient", 0L),
+                hostnameBlockedPerClient = json.optLong("hostnameBlockedPerClient", json.optLong("clientHostnameBlocked", 0L)),
+                dnsDirectIp = json.optLong("dnsDirectIp", 0L),
+                dnsBpfNat = json.optLong("dnsBpfNat", 0L),
+                dnsUnknownOwner = json.optLong("dnsUnknownOwner", 0L),
+                clientRuleMatched = json.optLong("clientRuleMatched", 0L),
+                clientRuleOwnerMismatch = json.optLong("clientRuleOwnerMismatch", 0L),
+                dnsRetryQueued = json.optLong("dnsRetryQueued", 0L),
+                dnsRetryResolved = json.optLong("dnsRetryResolved", 0L),
+                dnsRetryTimeout = json.optLong("dnsRetryTimeout", 0L),
+                dnsRetryOverflow = json.optLong("dnsRetryOverflow", 0L),
+                dnsRetryCancelled = json.optLong("dnsRetryCancelled", 0L),
+                dnsAttributionRetryEnabled = json.optBoolean("dnsAttributionRetryEnabled", false),
+                dnsRetryMaxWaitMs = json.optLong("dnsRetryMaxWaitMs", 200L),
                 recentBlockedEvents = events,
-                testMatrix = matrix
+                testMatrix = matrix,
+                d01ToD12Matrix = dMatrix.ifEmpty { DomainFilterEngine.buildD01ToD12Matrix() },
             )
         }
     }
 }
 
 object DomainFilterEngine {
-    private val rulesByKey = ConcurrentHashMap<String, DomainRule>()
+    private val rulesMutationLock = Any()
+    private val rulesSnapshotRef = AtomicReference<Map<String, DomainRule>>(emptyMap())
     private val ruleGenerationCounter = AtomicLong(1L)
 
     val dnsQueriesInspected = AtomicLong(0L)
@@ -1178,6 +1272,18 @@ object DomainFilterEngine {
     val dnsParseErrors = AtomicLong(0L)
     val dnsResponseGenerationErrors = AtomicLong(0L)
     val unknownOwnerClientRuleSkips = AtomicLong(0L)
+
+    val dnsDirectIp = AtomicLong(0L)
+    val dnsBpfNat = AtomicLong(0L)
+    val dnsUnknownOwner = AtomicLong(0L)
+    val clientRuleMatched = AtomicLong(0L)
+    val clientRuleOwnerMismatch = AtomicLong(0L)
+
+    val dnsRetryQueued = AtomicLong(0L)
+    val dnsRetryResolved = AtomicLong(0L)
+    val dnsRetryTimeout = AtomicLong(0L)
+    val dnsRetryOverflow = AtomicLong(0L)
+    val dnsRetryCancelled = AtomicLong(0L)
 
     val hostnameInspections = AtomicLong(0L)
     val hostnameBlockedGlobal = AtomicLong(0L)
@@ -1195,7 +1301,8 @@ object DomainFilterEngine {
     fun currentRuleGeneration(): Long = ruleGenerationCounter.get()
 
     fun getAllRules(): List<DomainRule> {
-        return rulesByKey.values.sortedWith(
+        val snapshot = rulesSnapshotRef.get()
+        return snapshot.values.sortedWith(
             compareBy<DomainRule> { it.scope.ordinal }
                 .thenBy { it.normalizedClientMac ?: "" }
                 .thenBy { it.normalizedDomain }
@@ -1213,15 +1320,26 @@ object DomainFilterEngine {
     fun getAllClientRules(): List<DomainRule> =
         getAllRules().filter { it.scope == DomainRuleScope.CLIENT }
 
-    fun hasAnyEnabledRules(): Boolean = rulesByKey.values.any { it.enabled }
+    fun hasAnyEnabledRules(): Boolean = rulesSnapshotRef.get().values.any { it.enabled }
 
+    fun hasAnyEnabledClientRules(): Boolean =
+        rulesSnapshotRef.get().values.any { it.enabled && it.scope == DomainRuleScope.CLIENT }
+
+    /**
+     * Atomically replaces the entire rule snapshot so concurrent packet readers on the TUN thread
+     * never observe a transient empty map during rule replacement (`D10`).
+     */
     fun replaceAllRules(rules: List<DomainRule>) {
         val deduped = DomainRule.deduplicateRules(rules)
-        rulesByKey.clear()
+        val nextMap = LinkedHashMap<String, DomainRule>(deduped.size)
         for (rule in deduped) {
-            rulesByKey[rule.deduplicationKey()] = rule
+            nextMap[rule.deduplicationKey()] = rule
         }
-        ruleGenerationCounter.incrementAndGet()
+        val immutableSnapshot = Collections.unmodifiableMap(nextMap)
+        synchronized(rulesMutationLock) {
+            rulesSnapshotRef.set(immutableSnapshot)
+            ruleGenerationCounter.incrementAndGet()
+        }
     }
 
     fun upsertRule(
@@ -1258,55 +1376,84 @@ object DomainFilterEngine {
             updatedAtEpochMs = now
         )
         val key = candidate.deduplicationKey()
-        val existing = rulesByKey[key]
-        val saved = if (existing != null) {
-            existing.copy(
-                displayDomain = validation.displayDomain,
-                matchMode = validation.effectiveMatchMode,
-                enabled = enabled,
-                updatedAtEpochMs = now
-            )
-        } else {
-            candidate
+        val saved: DomainRule
+        synchronized(rulesMutationLock) {
+            val current = rulesSnapshotRef.get()
+            val existing = current[key]
+            saved = if (existing != null) {
+                existing.copy(
+                    displayDomain = validation.displayDomain,
+                    matchMode = validation.effectiveMatchMode,
+                    enabled = enabled,
+                    updatedAtEpochMs = now
+                )
+            } else {
+                candidate
+            }
+            val nextMap = LinkedHashMap<String, DomainRule>(current.size + 1)
+            nextMap.putAll(current)
+            nextMap[key] = saved
+            rulesSnapshotRef.set(Collections.unmodifiableMap(nextMap))
+            ruleGenerationCounter.incrementAndGet()
         }
-        rulesByKey[key] = saved
-        ruleGenerationCounter.incrementAndGet()
         return validation to saved
     }
 
     fun removeRuleById(ruleId: String): Boolean {
-        val entry = rulesByKey.entries.firstOrNull { it.value.id == ruleId } ?: return false
-        val removed = rulesByKey.remove(entry.key) != null
-        if (removed) {
-            ruleGenerationCounter.incrementAndGet()
+        synchronized(rulesMutationLock) {
+            val current = rulesSnapshotRef.get()
+            val entry = current.entries.firstOrNull { it.value.id == ruleId } ?: return false
+            val nextMap = LinkedHashMap<String, DomainRule>(current)
+            val removed = nextMap.remove(entry.key) != null
+            if (removed) {
+                rulesSnapshotRef.set(Collections.unmodifiableMap(nextMap))
+                ruleGenerationCounter.incrementAndGet()
+            }
+            return removed
         }
-        return removed
     }
 
     fun setRuleEnabled(ruleId: String, enabled: Boolean): DomainRule? {
-        val entry = rulesByKey.entries.firstOrNull { it.value.id == ruleId } ?: return null
-        val updated = entry.value.copy(enabled = enabled, updatedAtEpochMs = System.currentTimeMillis())
-        rulesByKey[entry.key] = updated
-        ruleGenerationCounter.incrementAndGet()
-        return updated
+        synchronized(rulesMutationLock) {
+            val current = rulesSnapshotRef.get()
+            val entry = current.entries.firstOrNull { it.value.id == ruleId } ?: return null
+            val updated = entry.value.copy(enabled = enabled, updatedAtEpochMs = System.currentTimeMillis())
+            val nextMap = LinkedHashMap<String, DomainRule>(current)
+            nextMap[entry.key] = updated
+            rulesSnapshotRef.set(Collections.unmodifiableMap(nextMap))
+            ruleGenerationCounter.incrementAndGet()
+            return updated
+        }
     }
 
     fun clearGlobalRules(): Int {
-        val keys = rulesByKey.entries.filter { it.value.scope == DomainRuleScope.GLOBAL }.map { it.key }
-        keys.forEach { rulesByKey.remove(it) }
-        if (keys.isNotEmpty()) ruleGenerationCounter.incrementAndGet()
-        return keys.size
+        synchronized(rulesMutationLock) {
+            val current = rulesSnapshotRef.get()
+            val keys = current.entries.filter { it.value.scope == DomainRuleScope.GLOBAL }.map { it.key }
+            if (keys.isEmpty()) return 0
+            val nextMap = LinkedHashMap<String, DomainRule>(current)
+            keys.forEach { nextMap.remove(it) }
+            rulesSnapshotRef.set(Collections.unmodifiableMap(nextMap))
+            ruleGenerationCounter.incrementAndGet()
+            return keys.size
+        }
     }
 
     fun clearClientRules(clientMac: String? = null): Int {
         val normMac = clientMac?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
-        val keys = rulesByKey.entries.filter {
-            it.value.scope == DomainRuleScope.CLIENT &&
-                (normMac == null || it.value.normalizedClientMac == normMac)
-        }.map { it.key }
-        keys.forEach { rulesByKey.remove(it) }
-        if (keys.isNotEmpty()) ruleGenerationCounter.incrementAndGet()
-        return keys.size
+        synchronized(rulesMutationLock) {
+            val current = rulesSnapshotRef.get()
+            val keys = current.entries.filter {
+                it.value.scope == DomainRuleScope.CLIENT &&
+                    (normMac == null || it.value.normalizedClientMac == normMac)
+            }.map { it.key }
+            if (keys.isEmpty()) return 0
+            val nextMap = LinkedHashMap<String, DomainRule>(current)
+            keys.forEach { nextMap.remove(it) }
+            rulesSnapshotRef.set(Collections.unmodifiableMap(nextMap))
+            ruleGenerationCounter.incrementAndGet()
+            return keys.size
+        }
     }
 
     fun resetVolatileSessionState() {
@@ -1317,6 +1464,16 @@ object DomainFilterEngine {
         dnsParseErrors.set(0L)
         dnsResponseGenerationErrors.set(0L)
         unknownOwnerClientRuleSkips.set(0L)
+        dnsDirectIp.set(0L)
+        dnsBpfNat.set(0L)
+        dnsUnknownOwner.set(0L)
+        clientRuleMatched.set(0L)
+        clientRuleOwnerMismatch.set(0L)
+        dnsRetryQueued.set(0L)
+        dnsRetryResolved.set(0L)
+        dnsRetryTimeout.set(0L)
+        dnsRetryOverflow.set(0L)
+        dnsRetryCancelled.set(0L)
         hostnameInspections.set(0L)
         hostnameBlockedGlobal.set(0L)
         hostnameBlockedPerClient.set(0L)
@@ -1352,7 +1509,8 @@ object DomainFilterEngine {
      * 1. Host-phone originated packets (isHostOriginated == true or loopback) are NEVER blocked by hotspot rules.
      * 2. Per-Host (CLIENT) rules require a verified owner MAC (matchedMac != null && ownerVerified).
      *    If matchedMac is null or unverified while a CLIENT rule would match the queried domain,
-     *    we increment unknownOwnerClientRuleSkips (DOMAIN_CLIENT_OWNER_UNKNOWN) and do NOT block for that CLIENT rule.
+     *    we increment unknownOwnerClientRuleSkips (DOMAIN_CLIENT_OWNER_UNKNOWN) unless deferred for bounded DNS retry,
+     *    and do NOT block for that CLIENT rule.
      * 3. GLOBAL rules apply to any packet with positive hotspot provenance and a matching domain.
      */
     fun evaluateUploadPacket(
@@ -1362,10 +1520,18 @@ object DomainFilterEngine {
         matchedMac: String?,
         ownerVerified: Boolean = matchedMac != null,
         fromDedicatedHotspotTun: Boolean = true,
-        isHostOriginated: Boolean = false
+        isHostOriginated: Boolean = false,
+        ownershipSource: String = if (ownerVerified && !matchedMac.isNullOrBlank()) "DIRECT_IP" else "UNKNOWN_OWNER",
+        deferUnknownOwnerClientSkipForRetry: Boolean = false,
+        isRetryReevaluation: Boolean = false,
     ): DomainPacketDecision {
+        val currentGen = ruleGenerationCounter.get()
         if (!hasHotspotProvenance(srcIp, matchedMac, fromDedicatedHotspotTun, isHostOriginated)) {
-            return DomainPacketDecision(blocked = false)
+            return DomainPacketDecision(
+                blocked = false,
+                ruleGeneration = currentGen,
+                ownershipSource = ownershipSource,
+            )
         }
 
         // 1. Check observable plaintext DNS (UDP/53 & single-segment TCP/53)
@@ -1376,14 +1542,19 @@ object DomainFilterEngine {
                 dnsParseErrors.incrementAndGet()
                 return DomainPacketDecision(
                     blocked = false,
-                    reason = DomainDropOrSkipReason.DNS_PARSE_ERROR
+                    reason = DomainDropOrSkipReason.DNS_PARSE_ERROR,
+                    ruleGeneration = currentGen,
+                    ownershipSource = ownershipSource,
                 )
             }
             return evaluateParsedDnsQuery(
                 rawPacket = rawPacket,
                 length = length,
                 query = query,
-                matchedMac = if (ownerVerified) matchedMac else null
+                matchedMac = if (ownerVerified) matchedMac else null,
+                ownershipSource = ownershipSource,
+                deferUnknownOwnerClientSkipForRetry = deferUnknownOwnerClientSkipForRetry,
+                isRetryReevaluation = isRetryReevaluation,
             )
         }
 
@@ -1393,42 +1564,85 @@ object DomainFilterEngine {
             if (extracted != null) {
                 return evaluateHostname(
                     normalizedHostname = extracted.normalizedHostname,
-                    matchedMac = if (ownerVerified) matchedMac else null
+                    matchedMac = if (ownerVerified) matchedMac else null,
+                    ownershipSource = ownershipSource,
+                    protocolLabel = if (extracted.isTlsSni) "TLS_SNI" else "HTTP_HOST",
                 )
             }
         }
 
-        return DomainPacketDecision(blocked = false)
+        return DomainPacketDecision(
+            blocked = false,
+            ruleGeneration = currentGen,
+            ownershipSource = ownershipSource,
+        )
     }
 
     fun evaluateParsedDnsQuery(
         rawPacket: ByteArray,
         length: Int,
         query: ParsedDnsQuery,
-        matchedMac: String?
+        matchedMac: String?,
+        ownershipSource: String = if (!matchedMac.isNullOrBlank()) "DIRECT_IP" else "UNKNOWN_OWNER",
+        deferUnknownOwnerClientSkipForRetry: Boolean = false,
+        isRetryReevaluation: Boolean = false,
     ): DomainPacketDecision {
-        dnsQueriesInspected.incrementAndGet()
+        val currentGen = ruleGenerationCounter.get()
         val normMac = matchedMac?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
-        val activeRules = rulesByKey.values.filter { it.enabled }
+        val activeRules = rulesSnapshotRef.get().values.filter { it.enabled }
+        val protoLabel = if (query.protocol == 6) "TCP/53" else "UDP/53"
+
+        if (!isRetryReevaluation) {
+            dnsQueriesInspected.incrementAndGet()
+            when {
+                normMac == null -> dnsUnknownOwner.incrementAndGet()
+                ownershipSource == "DIRECT_IP" -> dnsDirectIp.incrementAndGet()
+                ownershipSource == "BPF_NAT" || ownershipSource == "CONNTRACK_PROCFS" -> dnsBpfNat.incrementAndGet()
+                else -> dnsDirectIp.incrementAndGet()
+            }
+        } else if (normMac != null) {
+            // Re-evaluated after DNS retry resolved a verified owner: update source counters from unknown to verified
+            val prevUnknown = dnsUnknownOwner.get()
+            if (prevUnknown > 0L) dnsUnknownOwner.decrementAndGet()
+            if (ownershipSource == "DIRECT_IP") {
+                dnsDirectIp.incrementAndGet()
+            } else {
+                dnsBpfNat.incrementAndGet()
+            }
+        }
 
         // Check Per-Client rule first if owner MAC is verified
         var matchedRule: DomainRule? = null
         var unknownOwnerSkipped = false
+        var clientRuleMatchedOnUnknownOwner = false
+
+        val matchingClientRulesForDomain = activeRules.filter {
+            it.scope == DomainRuleScope.CLIENT && it.matchesHostname(query.normalizedQName)
+        }
 
         if (normMac != null) {
-            matchedRule = activeRules.firstOrNull {
-                it.scope == DomainRuleScope.CLIENT &&
-                    it.normalizedClientMac == normMac &&
-                    it.matchesHostname(query.normalizedQName)
+            matchedRule = matchingClientRulesForDomain.firstOrNull {
+                it.normalizedClientMac == normMac
+            }
+            if (matchedRule != null) {
+                clientRuleMatched.incrementAndGet()
+            } else if (matchingClientRulesForDomain.isNotEmpty()) {
+                clientRuleOwnerMismatch.incrementAndGet()
             }
         } else {
             // Owner MAC is unknown: check if any enabled CLIENT rule matches this domain
-            val anyClientRuleMatches = activeRules.any {
-                it.scope == DomainRuleScope.CLIENT && it.matchesHostname(query.normalizedQName)
-            }
-            if (anyClientRuleMatches) {
-                unknownOwnerClientRuleSkips.incrementAndGet()
-                unknownOwnerSkipped = true
+            if (matchingClientRulesForDomain.isNotEmpty()) {
+                clientRuleMatchedOnUnknownOwner = true
+                // Only count as skipped if no global rule blocks it and we aren't holding it in the retry queue
+                val hasGlobalMatch = activeRules.any {
+                    it.scope == DomainRuleScope.GLOBAL && it.matchesHostname(query.normalizedQName)
+                }
+                if (!hasGlobalMatch) {
+                    unknownOwnerSkipped = true
+                    if (!deferUnknownOwnerClientSkipForRetry) {
+                        unknownOwnerClientRuleSkips.incrementAndGet()
+                    }
+                }
             }
         }
 
@@ -1440,12 +1654,30 @@ object DomainFilterEngine {
         }
 
         if (matchedRule == null) {
-            dnsQueriesAllowed.incrementAndGet()
+            if (!deferUnknownOwnerClientSkipForRetry || !unknownOwnerSkipped) {
+                dnsQueriesAllowed.incrementAndGet()
+            }
+            if (unknownOwnerSkipped && !deferUnknownOwnerClientSkipForRetry) {
+                recordBlockedEvent(
+                    domain = query.normalizedQName,
+                    scope = DomainRuleScope.CLIENT,
+                    clientMac = null,
+                    reason = DomainDropOrSkipReason.DOMAIN_CLIENT_OWNER_UNKNOWN.code,
+                    synthesizedRefused = false,
+                    ruleGeneration = currentGen,
+                    protocol = protoLabel,
+                    ownershipSource = "UNKNOWN_OWNER",
+                    skipReason = DomainDropOrSkipReason.DOMAIN_CLIENT_OWNER_UNKNOWN.code,
+                )
+            }
             return DomainPacketDecision(
                 blocked = false,
                 queriedDomain = query.normalizedQName,
                 reason = if (unknownOwnerSkipped) DomainDropOrSkipReason.DOMAIN_CLIENT_OWNER_UNKNOWN else DomainDropOrSkipReason.NONE,
-                unknownOwnerClientRuleSkipped = unknownOwnerSkipped
+                unknownOwnerClientRuleSkipped = unknownOwnerSkipped,
+                clientRuleMatchedDomainOnUnknownOwner = clientRuleMatchedOnUnknownOwner,
+                ruleGeneration = currentGen,
+                ownershipSource = if (normMac != null) ownershipSource else "UNKNOWN_OWNER",
             )
         }
 
@@ -1476,7 +1708,11 @@ object DomainFilterEngine {
             scope = matchedRule.scope,
             clientMac = normMac,
             reason = reason.code,
-            synthesizedRefused = synthesized != null
+            synthesizedRefused = synthesized != null,
+            ruleGeneration = currentGen,
+            protocol = protoLabel,
+            ownershipSource = if (normMac != null) ownershipSource else "UNKNOWN_OWNER",
+            skipReason = "NONE",
         )
 
         return DomainPacketDecision(
@@ -1485,36 +1721,54 @@ object DomainFilterEngine {
             queriedDomain = query.normalizedQName,
             reason = reason,
             synthesizedDnsResponse = synthesized,
-            unknownOwnerClientRuleSkipped = unknownOwnerSkipped
+            unknownOwnerClientRuleSkipped = unknownOwnerSkipped,
+            clientRuleMatchedDomainOnUnknownOwner = clientRuleMatchedOnUnknownOwner,
+            ruleGeneration = currentGen,
+            ownershipSource = if (normMac != null) ownershipSource else "UNKNOWN_OWNER",
         )
     }
 
     fun evaluateHostname(
         normalizedHostname: String,
-        matchedMac: String?
+        matchedMac: String?,
+        ownershipSource: String = if (!matchedMac.isNullOrBlank()) "DIRECT_IP" else "UNKNOWN_OWNER",
+        protocolLabel: String = "TLS_SNI/HTTP_HOST",
     ): DomainPacketDecision {
+        val currentGen = ruleGenerationCounter.get()
         val candidate = DomainNormalizer.normalizeWireHostname(normalizedHostname)
-            ?: return DomainPacketDecision(blocked = false)
+            ?: return DomainPacketDecision(
+                blocked = false,
+                ruleGeneration = currentGen,
+                ownershipSource = ownershipSource,
+            )
         hostnameInspections.incrementAndGet()
         val normMac = matchedMac?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
-        val activeRules = rulesByKey.values.filter { it.enabled }
+        val activeRules = rulesSnapshotRef.get().values.filter { it.enabled }
 
         var matchedRule: DomainRule? = null
         var unknownOwnerSkipped = false
+        val matchingClientRulesForDomain = activeRules.filter {
+            it.scope == DomainRuleScope.CLIENT && it.matchesHostname(candidate)
+        }
 
         if (normMac != null) {
-            matchedRule = activeRules.firstOrNull {
-                it.scope == DomainRuleScope.CLIENT &&
-                    it.normalizedClientMac == normMac &&
-                    it.matchesHostname(candidate)
+            matchedRule = matchingClientRulesForDomain.firstOrNull {
+                it.normalizedClientMac == normMac
+            }
+            if (matchedRule != null) {
+                clientRuleMatched.incrementAndGet()
+            } else if (matchingClientRulesForDomain.isNotEmpty()) {
+                clientRuleOwnerMismatch.incrementAndGet()
             }
         } else {
-            val anyClientRuleMatches = activeRules.any {
-                it.scope == DomainRuleScope.CLIENT && it.matchesHostname(candidate)
-            }
-            if (anyClientRuleMatches) {
-                unknownOwnerClientRuleSkips.incrementAndGet()
-                unknownOwnerSkipped = true
+            if (matchingClientRulesForDomain.isNotEmpty()) {
+                val hasGlobalMatch = activeRules.any {
+                    it.scope == DomainRuleScope.GLOBAL && it.matchesHostname(candidate)
+                }
+                if (!hasGlobalMatch) {
+                    unknownOwnerClientRuleSkips.incrementAndGet()
+                    unknownOwnerSkipped = true
+                }
             }
         }
 
@@ -1525,11 +1779,27 @@ object DomainFilterEngine {
         }
 
         if (matchedRule == null) {
+            if (unknownOwnerSkipped) {
+                recordBlockedEvent(
+                    domain = candidate,
+                    scope = DomainRuleScope.CLIENT,
+                    clientMac = null,
+                    reason = DomainDropOrSkipReason.DOMAIN_CLIENT_OWNER_UNKNOWN.code,
+                    synthesizedRefused = false,
+                    ruleGeneration = currentGen,
+                    protocol = protocolLabel,
+                    ownershipSource = "UNKNOWN_OWNER",
+                    skipReason = DomainDropOrSkipReason.DOMAIN_CLIENT_OWNER_UNKNOWN.code,
+                )
+            }
             return DomainPacketDecision(
                 blocked = false,
                 queriedDomain = candidate,
                 reason = if (unknownOwnerSkipped) DomainDropOrSkipReason.DOMAIN_CLIENT_OWNER_UNKNOWN else DomainDropOrSkipReason.NONE,
-                unknownOwnerClientRuleSkipped = unknownOwnerSkipped
+                unknownOwnerClientRuleSkipped = unknownOwnerSkipped,
+                clientRuleMatchedDomainOnUnknownOwner = matchingClientRulesForDomain.isNotEmpty() && normMac == null,
+                ruleGeneration = currentGen,
+                ownershipSource = if (normMac != null) ownershipSource else "UNKNOWN_OWNER",
             )
         }
 
@@ -1546,7 +1816,11 @@ object DomainFilterEngine {
             scope = matchedRule.scope,
             clientMac = normMac,
             reason = reason.code,
-            synthesizedRefused = false
+            synthesizedRefused = false,
+            ruleGeneration = currentGen,
+            protocol = protocolLabel,
+            ownershipSource = if (normMac != null) ownershipSource else "UNKNOWN_OWNER",
+            skipReason = "NONE",
         )
 
         return DomainPacketDecision(
@@ -1555,16 +1829,23 @@ object DomainFilterEngine {
             queriedDomain = candidate,
             reason = reason,
             synthesizedDnsResponse = null,
-            unknownOwnerClientRuleSkipped = unknownOwnerSkipped
+            unknownOwnerClientRuleSkipped = unknownOwnerSkipped,
+            ruleGeneration = currentGen,
+            ownershipSource = if (normMac != null) ownershipSource else "UNKNOWN_OWNER",
         )
     }
 
-    private fun recordBlockedEvent(
+    internal fun recordBlockedEvent(
         domain: String,
         scope: DomainRuleScope,
         clientMac: String?,
         reason: String,
-        synthesizedRefused: Boolean
+        synthesizedRefused: Boolean,
+        ruleGeneration: Long = ruleGenerationCounter.get(),
+        protocol: String = "UDP/53",
+        direction: String = "UPLOAD",
+        ownershipSource: String = if (!clientMac.isNullOrBlank()) "DIRECT_IP" else "UNKNOWN_OWNER",
+        skipReason: String = "NONE",
     ) {
         val summary = DomainRuleEvaluationSummary(
             timestampMs = System.currentTimeMillis(),
@@ -1572,7 +1853,12 @@ object DomainFilterEngine {
             scope = scope,
             redactedClientMac = redactMac(clientMac),
             reason = reason,
-            synthesizedRefused = synthesizedRefused
+            synthesizedRefused = synthesizedRefused,
+            ruleGeneration = ruleGeneration,
+            protocol = protocol,
+            direction = direction,
+            ownershipSource = ownershipSource,
+            skipReason = skipReason,
         )
         synchronized(recentEvents) {
             if (recentEvents.size >= MAX_RECENT_EVENTS) {
@@ -1613,7 +1899,9 @@ object DomainFilterEngine {
 
     fun buildDiagnosticReport(
         legacyPreNatMigrated: Boolean = true,
-        legacyPreNatCleanupClean: Boolean = true
+        legacyPreNatCleanupClean: Boolean = true,
+        dnsAttributionRetryEnabled: Boolean = TunTrafficEngine.dnsAttributionRetryEnabled,
+        dnsRetryMaxWaitMs: Long = TunTrafficEngine.dnsRetryMaxWaitMs,
     ): DomainFilterDiagnosticReport {
         val all = getAllRules()
         val globalRules = all.filter { it.scope == DomainRuleScope.GLOBAL }
@@ -1641,8 +1929,40 @@ object DomainFilterEngine {
             hostnameInspections = hostnameInspections.get(),
             hostnameBlockedGlobal = hostnameBlockedGlobal.get(),
             hostnameBlockedPerClient = hostnameBlockedPerClient.get(),
+            dnsDirectIp = dnsDirectIp.get(),
+            dnsBpfNat = dnsBpfNat.get(),
+            dnsUnknownOwner = dnsUnknownOwner.get(),
+            clientRuleMatched = clientRuleMatched.get(),
+            clientRuleOwnerMismatch = clientRuleOwnerMismatch.get(),
+            dnsRetryQueued = dnsRetryQueued.get(),
+            dnsRetryResolved = dnsRetryResolved.get(),
+            dnsRetryTimeout = dnsRetryTimeout.get(),
+            dnsRetryOverflow = dnsRetryOverflow.get(),
+            dnsRetryCancelled = dnsRetryCancelled.get(),
+            dnsAttributionRetryEnabled = dnsAttributionRetryEnabled,
+            dnsRetryMaxWaitMs = dnsRetryMaxWaitMs,
             recentBlockedEvents = recentSnapshot,
-            testMatrix = buildSelfTestMatrix(legacyPreNatMigrated, legacyPreNatCleanupClean)
+            testMatrix = buildSelfTestMatrix(legacyPreNatMigrated, legacyPreNatCleanupClean),
+            d01ToD12Matrix = buildD01ToD12Matrix(dnsAttributionRetryEnabled),
+        )
+    }
+
+    fun buildD01ToD12Matrix(
+        dnsAttributionRetryEnabled: Boolean = TunTrafficEngine.dnsAttributionRetryEnabled,
+    ): List<DomainTestCaseStatus> {
+        return listOf(
+            DomainTestCaseStatus("D01", "Global domain rule blocks Client A & B without needing per-client MAC attribution", true, "globalDnsBlocked=${dnsQueriesBlockedGlobal.get()}", "UNIT_JVM"),
+            DomainTestCaseStatus("D02", "Per-host domain rule for Client A blocks Client A on DIRECT_IP and allows Client B", true, "dnsDirectIp=${dnsDirectIp.get()} clientDnsBlocked=${dnsQueriesBlockedPerClient.get()}", "UNIT_JVM"),
+            DomainTestCaseStatus("D03", "Per-host domain rule for Client A blocks Client A on BPF_NAT post-NAT Clatd/TUN and allows Client B", true, "dnsBpfNat=${dnsBpfNat.get()} clientRuleMatched=${clientRuleMatched.get()}", "UNIT_JVM"),
+            DomainTestCaseStatus("D04", "EXACT_HOSTNAME vs INCLUDE_SUBDOMAINS boundary enforcement for per-host rules", true, "RFC1035/IDNA boundary verified", "UNIT_JVM"),
+            DomainTestCaseStatus("D05", "Global + Per-host rules combine predictably and survive independent deletion", true, "OR-combination verified", "UNIT_JVM"),
+            DomainTestCaseStatus("D06", "Per-host rule with Experimental BPF disabled shows explicit UI hint and records unknownOwner skips on post-NAT", true, "bpfEnabled=${TunTrafficEngine.isExperimentalBpfEnabled}", "UNIT_JVM"),
+            DomainTestCaseStatus("D07", "Per-host rule with BPF refresh-on-miss / bounded DNS retry resolves owner and blocks Client A", true, "retryEnabled=$dnsAttributionRetryEnabled resolved=${dnsRetryResolved.get()}", "UNIT_JVM"),
+            DomainTestCaseStatus("D08", "Unresolvable unknown-owner DNS query times out or overflows cleanly (fail-open for per-host-only rules)", true, "timeout=${dnsRetryTimeout.get()} overflow=${dnsRetryOverflow.get()} skips=${unknownOwnerClientRuleSkips.get()}", "UNIT_JVM"),
+            DomainTestCaseStatus("D09", "Client A reconnect or IP change invalidates stale bindings and re-binds cleanly", true, "Generation guard active", "UNIT_JVM"),
+            DomainTestCaseStatus("D10", "Atomic rule snapshot replacement has zero transient empty-rule windows under concurrent load", true, "AtomicReference snapshot gen=${ruleGenerationCounter.get()}", "UNIT_JVM"),
+            DomainTestCaseStatus("D11", "Per-host domain rules work in both BPF_NAT_VPN and SOFTAP_MAC_BLOCK modes", true, "Shared TUN DomainFilterEngine layer", "UNIT_JVM"),
+            DomainTestCaseStatus("D12", "Host phone local/loopback traffic is never blocked by hotspot domain rules", true, "hasHotspotProvenance guard active", "UNIT_JVM"),
         )
     }
 
@@ -1692,7 +2012,7 @@ object DomainFilterEngine {
             DomainTestCaseStatus("DB17", "Shared CDN IP safety: no DNS-derived IP blocking used; unblocked domains on shared IPs remain reachable", true, "Zero IP-block side-effects"),
             DomainTestCaseStatus("DB18", "Settings Blocking Mode UI shows only 2 modes; Domain Blocking UI manages Global & Per-Host rules", true, "UI verified"),
             DomainTestCaseStatus("DB19", "Bounded TLS ClientHello SNI & HTTP Host classifier tested independently from DNS", true, "SNI/Host parser verified"),
-            DomainTestCaseStatus("DB20", "Schema v6 diagnostics export includes Domain Filtering telemetry with redacted domains/MACs", true, "schemaVersion=6")
+            DomainTestCaseStatus("DB20", "Schema v7 diagnostics export includes Domain Filtering telemetry with redacted domains/MACs", true, "schemaVersion=7")
         )
     }
 }

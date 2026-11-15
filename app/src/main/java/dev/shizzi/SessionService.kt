@@ -88,6 +88,9 @@ class SessionService : Service() {
 
             val outcome = sessionLock.withLock {
                 if (attempt != generation) return@launch
+                runCatching {
+                    controller.setStopHotspotOnVpnDisconnect(settings.stopHotspotOnVpnDisconnect)
+                }
                 runCatching { controller.start(settings.isLogging, settings.vpnMode, dnsServers) }
             }
             if (attempt != generation) return@launch
@@ -105,6 +108,9 @@ class SessionService : Service() {
 
             if (internalState.value.status == UiStatus.CONNECTED) {
                 runCatching {
+                    controller.setStopHotspotOnVpnDisconnect(settings.stopHotspotOnVpnDisconnect)
+                }
+                runCatching {
                     controller.setExperimentalBpfConfig(
                         settings.experimentalBpfEnabled,
                         settings.bpfPollIntervalMs,
@@ -118,6 +124,16 @@ class SessionService : Service() {
                 }
                 runCatching {
                     controller.setDeepTupleDiagnosticsEnabled(settings.bpfDeepTupleDiagnosticsEnabled)
+                }
+                runCatching {
+                    TunTrafficEngine.configureDnsAttributionRetry(
+                        settings.dnsAttributionRetryEnabled,
+                        settings.dnsRetryMaxWaitMs.toLong(),
+                    )
+                    controller.setDnsAttributionRetryConfig(
+                        settings.dnsAttributionRetryEnabled,
+                        settings.dnsRetryMaxWaitMs,
+                    )
                 }
                 runCatching {
                     controller.setPhaseDEnforcementMode(settings.phaseDEnforcementMode)
@@ -234,6 +250,29 @@ class SessionService : Service() {
             sessionLock.withLock {
                 runCatching {
                     val report = controller.selectBlockingMode(mode)
+                    internalState.update { it.copy(bpfAttribution = report) }
+                }
+            }
+        }
+    }
+
+    fun applyStopHotspotOnVpnDisconnect(enabled: Boolean) {
+        scope.launch {
+            val outcome = sessionLock.withLock {
+                runCatching { controller.setStopHotspotOnVpnDisconnect(enabled) }
+            }
+            if (outcome.isSuccess) {
+                internalState.update { current -> current.applyOutcome(outcome) }
+                publishState()
+            }
+        }
+    }
+
+    fun applyDnsAttributionRetryConfig(enabled: Boolean, maxWaitMs: Int = 200) {
+        scope.launch {
+            sessionLock.withLock {
+                runCatching {
+                    val report = controller.setDnsAttributionRetryConfig(enabled, maxWaitMs)
                     internalState.update { it.copy(bpfAttribution = report) }
                 }
             }
@@ -420,6 +459,15 @@ class SessionService : Service() {
 
         fun updateBlockingMode(mode: BlockingMode) {
             liveService?.applySelectBlockingMode(mode)
+        }
+
+        fun updateStopHotspotOnVpnDisconnect(enabled: Boolean) {
+            liveService?.applyStopHotspotOnVpnDisconnect(enabled)
+        }
+
+        fun updateDnsAttributionRetryConfig(enabled: Boolean, maxWaitMs: Int = 200) {
+            TunTrafficEngine.configureDnsAttributionRetry(enabled, maxWaitMs.toLong())
+            liveService?.applyDnsAttributionRetryConfig(enabled, maxWaitMs)
         }
 
         private fun Intent.reporting(command: AutomationCommand?): Intent = when (command) {

@@ -92,6 +92,8 @@ data class DomainBlockingActions(
     val onRemoveRule: (ruleId: String) -> Unit = {},
     val onClearGlobalRules: () -> Unit = {},
     val onClearClientRules: (clientMac: String) -> Unit = {},
+    val onSetExperimentalBpfEnabled: (Boolean) -> Unit = {},
+    val onSetDnsAttributionRetryEnabled: (Boolean) -> Unit = {},
 )
 
 private data class SelectableClientTarget(
@@ -106,6 +108,8 @@ fun DomainBlockingPage(
     connectedClients: List<ConnectedClient> = emptyList(),
     savedClientRules: List<ClientRule> = emptyList(),
     bpfReport: BpfAttributionStatusReport? = null,
+    experimentalBpfEnabled: Boolean = bpfReport?.experimentalEnabled ?: true,
+    dnsAttributionRetryEnabled: Boolean = bpfReport?.domainDiagnostics?.dnsAttributionRetryEnabled ?: false,
     initialScope: DomainRuleScope = DomainRuleScope.GLOBAL,
     initialClientMac: String? = null,
     actions: DomainBlockingActions = DomainBlockingActions(),
@@ -220,16 +224,28 @@ fun DomainBlockingPage(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                DomainCapabilityBanner(
-                    capabilityStatus = capStatus,
-                    globalEnabledCount = globalRules.count { it.enabled },
-                    clientEnabledCount = domainRules.count { it.scope == DomainRuleScope.CLIENT && it.enabled },
-                    dnsInspected = domainDiag?.dnsQueriesInspected ?: 0L,
-                    dnsBlockedGlobal = domainDiag?.dnsQueriesBlockedGlobal ?: 0L,
-                    dnsBlockedClient = domainDiag?.dnsQueriesBlockedPerClient ?: 0L,
-                    sniHostBlocked = (domainDiag?.hostnameBlockedGlobal ?: 0L) + (domainDiag?.hostnameBlockedPerClient ?: 0L),
-                    unknownOwnerSkips = domainDiag?.unknownOwnerClientRuleSkips ?: 0L,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(ShizziTheme.colors.surfaceVariant)
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Info,
+                        contentDescription = null,
+                        tint = ShizziTheme.colors.primary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Text(
+                        text = "Global rules work best with standard DNS. Per-host rules may be limited by traffic attribution.",
+                        fontSize = 11.sp,
+                        color = ShizziTheme.colors.onSurfaceMuted,
+                        modifier = Modifier.testTag("domain_info_note"),
+                    )
+                }
             }
 
             item {
@@ -295,13 +311,13 @@ fun DomainBlockingPage(
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
                             Text(
-                                text = "Global Domain Rules (All Hotspot Clients)",
+                                text = "Global Domain Rules",
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 13.sp,
                                 color = ShizziTheme.colors.onSurface,
                             )
                             Text(
-                                text = "Blocks matching domains for all hotspot clients regardless of client MAC attribution. Host-phone local traffic is never affected.",
+                                text = "Blocks matching domains for all connected hotspot devices.",
                                 fontSize = 11.sp,
                                 color = ShizziTheme.colors.onSurfaceMuted,
                             )
@@ -353,7 +369,7 @@ fun DomainBlockingPage(
                     item {
                         EmptyDomainRulesCard(
                             title = "No global domain rules configured",
-                            subtitle = "Tap \"Add Global Domain\" to block domains (e.g., tiktok.com, doubleclick.net) for every tethered client.",
+                            subtitle = "Tap \"Add Global Domain\" to block domains (e.g., tiktok.com, doubleclick.net) for every hotspot device.",
                         )
                     }
                 } else {
@@ -400,7 +416,7 @@ fun DomainBlockingPage(
                                     modifier = Modifier.size(18.dp),
                                 )
                                 Text(
-                                    text = "Global rules also apply (${globalRules.count { it.enabled }} active). Whole-client blocks take priority over domain rules.",
+                                    text = "Global rules also apply (${globalRules.count { it.enabled }} active). Whole-device blocks take priority over domain rules.",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Medium,
                                     color = ShizziTheme.colors.onSurface,
@@ -408,15 +424,66 @@ fun DomainBlockingPage(
                                 )
                             }
 
+                            if (!experimentalBpfEnabled) {
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = Color(0xFFFFB300).copy(alpha = 0.14f),
+                                    ),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, Color(0xFFFFB300).copy(alpha = 0.45f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("domain_bpf_disabled_warning_card"),
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Warning,
+                                                contentDescription = null,
+                                                tint = Color(0xFFFFB300),
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                            Text(
+                                                text = "Per-host attribution is turned off",
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 11.sp,
+                                                color = Color(0xFFFFB300),
+                                            )
+                                        }
+                                        Text(
+                                            text = "Enable Experimental BPF NAT Attribution so per-host domain rules can identify devices on hotspot connections.",
+                                            fontSize = 10.sp,
+                                            color = ShizziTheme.colors.onSurface,
+                                        )
+                                        Button(
+                                            onClick = { actions.onSetExperimentalBpfEnabled(true) },
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = ShizziTheme.colors.primary,
+                                                contentColor = ShizziTheme.colors.onPrimary,
+                                            ),
+                                            modifier = Modifier.testTag("domain_enable_bpf_button"),
+                                        ) {
+                                            Text("Enable BPF Attribution", fontSize = 11.sp)
+                                        }
+                                    }
+                                }
+                            }
+
                             Text(
-                                text = "Select Hotspot Client (MAC):",
+                                text = "Select Host:",
                                 fontSize = 11.sp,
                                 color = ShizziTheme.colors.onSurfaceMuted,
                             )
 
                             if (selectableClients.isEmpty()) {
                                 Text(
-                                    text = "No connected or saved hotspot clients yet. Connect a client device or add a client rule from Connected Devices.",
+                                    text = "No connected or saved hotspot devices yet. Connect a device or add a host rule from Connected Devices.",
                                     fontSize = 11.sp,
                                     color = ShizziTheme.colors.onSurfaceMuted,
                                     modifier = Modifier.testTag("domain_no_clients_message"),
@@ -480,7 +547,7 @@ fun DomainBlockingPage(
                                         modifier = Modifier.size(18.dp),
                                     )
                                     Spacer(Modifier.width(6.dp))
-                                    Text("Add Host Domain")
+                                    Text("Add Host Rule")
                                 }
                                 if (clientRules.isNotEmpty() && !selectedClientMac.isNullOrBlank()) {
                                     OutlinedButton(
@@ -636,6 +703,14 @@ private fun DomainCapabilityBanner(
     dnsBlockedClient: Long,
     sniHostBlocked: Long,
     unknownOwnerSkips: Long,
+    dnsDirectIp: Long = 0L,
+    dnsBpfNat: Long = 0L,
+    dnsUnknownOwner: Long = 0L,
+    clientRuleMatched: Long = 0L,
+    clientRuleOwnerMismatch: Long = 0L,
+    dnsRetryQueued: Long = 0L,
+    dnsRetryResolved: Long = 0L,
+    dnsRetryTimeout: Long = 0L,
 ) {
     val isPartialOrUnavailable = capabilityStatus == DomainFilterCapabilityStatus.PARTIAL_DOMAIN_ENFORCEMENT.name ||
         capabilityStatus == DomainFilterCapabilityStatus.DNS_FILTER_UNAVAILABLE.name
@@ -704,6 +779,24 @@ private fun DomainCapabilityBanner(
                     fontSize = 11.sp,
                     fontFamily = FontFamily.Monospace,
                     color = ShizziTheme.colors.onSurface,
+                )
+            }
+
+            Text(
+                text = "DNS Owner: Direct=$dnsDirectIp • BPF=$dnsBpfNat • Unk=$dnsUnknownOwner | HostMatch=$clientRuleMatched • Mismatch=$clientRuleOwnerMismatch",
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = ShizziTheme.colors.onSurfaceMuted,
+                modifier = Modifier.testTag("domain_dns_attribution_breakdown_text"),
+            )
+
+            if (dnsRetryQueued > 0L || dnsRetryResolved > 0L || dnsRetryTimeout > 0L) {
+                Text(
+                    text = "DNS Retry Queue: queued=$dnsRetryQueued • resolved=$dnsRetryResolved • timeout=$dnsRetryTimeout",
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = ShizziTheme.colors.primary,
+                    modifier = Modifier.testTag("domain_dns_retry_stats_text"),
                 )
             }
 

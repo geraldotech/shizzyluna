@@ -73,6 +73,10 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             settings.collect { current ->
                 if (current != null) {
                     DomainFilterEngine.replaceAllRules(current.domainRules)
+                    TunTrafficEngine.configureDnsAttributionRetry(
+                        enabled = current.dnsAttributionRetryEnabled,
+                        maxWaitMs = current.dnsRetryMaxWaitMs.toLong(),
+                    )
                 }
                 refreshClients()
             }
@@ -157,6 +161,38 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     fun setVpnMode(mode: VpnMode) {
         viewModelScope.launch { settingsStore.setVpnMode(mode) }
+    }
+
+    fun setStopHotspotOnVpnDisconnect(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.setStopHotspotOnVpnDisconnect(enabled)
+            SessionService.updateStopHotspotOnVpnDisconnect(enabled)
+            runCatching {
+                val statusJson = diagnostics.setStopHotspotOnVpnDisconnect(enabled)
+                localState.update { current -> current.applyOutcome(Result.success(statusJson)) }
+            }
+            SessionLog.info("Stop hotspot when VPN disconnects set to $enabled")
+        }
+    }
+
+    fun setDnsAttributionRetryEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            val maxWaitMs = settings.value?.dnsRetryMaxWaitMs ?: 200
+            settingsStore.setDnsAttributionRetryEnabled(enabled)
+            TunTrafficEngine.configureDnsAttributionRetry(enabled = enabled, maxWaitMs = maxWaitMs.toLong())
+            SessionService.updateDnsAttributionRetryConfig(enabled, maxWaitMs)
+            runCatching {
+                val report = diagnostics.setDnsAttributionRetryConfig(enabled, maxWaitMs)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("Bounded DNS Attribution Retry Queue (v0.10.9-debug) ${if (enabled) "ENABLED" else "DISABLED"}")
+            refreshClients()
+        }
     }
 
     fun setTheme(choice: ThemeChoice) {

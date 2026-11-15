@@ -25,6 +25,14 @@ data class SessionUiState(
     val lastError: String = "",
     val isVpnBound: Boolean = false,
     val isVpnBypassed: Boolean = false,
+    val vpnLifecycleState: VpnLifecycleState = VpnLifecycleState.VPN_UNBOUND_ALLOWED,
+    val stopHotspotOnVpnDisconnect: Boolean = true,
+    val vpnOutageCount: Long = 0L,
+    val vpnRecoveryCount: Long = 0L,
+    val vpnWaitingDurationMs: Long = 0L,
+    val vpnForwardingGateClosed: Boolean = false,
+    val vpnStatusLabel: String = "No VPN",
+    val vpnRecoveryDiagnostics: VpnRecoveryDiagnostics = VpnRecoveryDiagnostics(),
 
     val clientCount: Int = 0,
     val connectedClients: List<DiscoveredHost> = emptyList(),
@@ -48,6 +56,11 @@ fun SessionUiState.asStopped(): SessionUiState = copy(
     interfaceName = "",
     isVpnBound = false,
     isVpnBypassed = false,
+    vpnLifecycleState = VpnLifecycleState.SESSION_STOPPED,
+    vpnWaitingDurationMs = 0L,
+    vpnForwardingGateClosed = false,
+    vpnStatusLabel = "No VPN",
+    vpnRecoveryDiagnostics = VpnRecoveryDiagnostics(),
     clientCount = 0,
     connectedClients = emptyList(),
     datapathMode = DatapathMode.INACTIVE,
@@ -140,6 +153,12 @@ fun SessionUiState.applyOutcome(outcome: Result<String>): SessionUiState {
     }.getOrDefault(FirewallBackend.NONE)
 
     val bpfReport = BpfAttributionStatusReport.fromJson(parsed?.optJSONObject("bpfAttribution"))
+    val vpnDiag = VpnRecoveryDiagnostics.fromJson(parsed?.optJSONObject("vpnRecoveryDiagnostics"))
+    val vpnLifecycle = runCatching {
+        VpnLifecycleState.valueOf(
+            parsed?.optString("vpnLifecycleState", vpnDiag.vpnLifecycleState.name).orEmpty(),
+        )
+    }.getOrDefault(vpnDiag.vpnLifecycleState)
 
     return copy(
         isBusy = false,
@@ -150,6 +169,22 @@ fun SessionUiState.applyOutcome(outcome: Result<String>): SessionUiState {
 
         isVpnBound = parsed?.optBoolean("isVpnBound") == true,
         isVpnBypassed = parsed?.optBoolean("isVpnBypassed") == true,
+        vpnLifecycleState = vpnLifecycle,
+        stopHotspotOnVpnDisconnect = parsed?.optBoolean(
+            "stopHotspotOnVpnDisconnect",
+            vpnDiag.stopHotspotOnVpnDisconnect,
+        ) ?: true,
+        vpnOutageCount = parsed?.optLong("vpnOutageCount", vpnDiag.vpnOutageCount) ?: 0L,
+        vpnRecoveryCount = parsed?.optLong("vpnRecoveryCount", vpnDiag.vpnRecoveryCount) ?: 0L,
+        vpnWaitingDurationMs = parsed?.optLong("vpnWaitingDurationMs", vpnDiag.vpnWaitingDurationMs) ?: 0L,
+        vpnForwardingGateClosed = parsed?.optBoolean(
+            "vpnForwardingGateClosed",
+            vpnDiag.vpnForwardingGateClosed,
+        ) ?: false,
+        vpnStatusLabel = parsed?.optString("vpnStatusLabel", vpnDiag.vpnStatusLabel)
+            ?.ifBlank { vpnDiag.vpnStatusLabel }
+            ?: "No VPN",
+        vpnRecoveryDiagnostics = vpnDiag,
         clientCount = parsed?.optInt("clientCount") ?: 0,
         connectedClients = clientsList,
         datapathMode = dpMode,
@@ -505,6 +540,22 @@ class TetherClient {
             val bound = service()
             bound.resetClientQuota(mac)
         }
+    }
+
+    suspend fun setStopHotspotOnVpnDisconnect(enabled: Boolean): String = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        bound.setStopHotspotOnVpnDisconnect(enabled)
+    }
+
+    suspend fun setDnsAttributionRetryConfig(
+        enabled: Boolean,
+        maxWaitMs: Int = 200,
+    ): BpfAttributionStatusReport = withContext(Dispatchers.IO) {
+        val bound = service()
+        verifyContract(bound)
+        val raw = bound.setDnsAttributionRetryConfig(enabled, maxWaitMs)
+        BpfAttributionStatusReport.fromJson(runCatching { JSONObject(raw) }.getOrNull())
     }
 
     suspend fun stop(): String = withContext(Dispatchers.IO) {

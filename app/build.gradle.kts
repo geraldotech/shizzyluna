@@ -16,11 +16,11 @@ android {
     applicationId = "dev.shizzyluna.proxy"
     minSdk = 24
     targetSdk = 36
-    versionCode = 23
-    versionName = "0.10.8-debug"
-    buildConfigField("int", "SERVICE_BUILD_ID", "23")
-    buildConfigField("String", "SOURCE_COMMIT", "\"ab2e16dcef1590fe09358fc462cf3a3561439602+v0.10.8-debug\"")
-    buildConfigField("boolean", "DEBUG_DIAGNOSTICS_ENABLED", "true")
+    versionCode = 25
+    versionName = "0.10.3"
+    buildConfigField("int", "SERVICE_BUILD_ID", "25")
+    buildConfigField("String", "SOURCE_COMMIT", "\"7fb3b1b94b9ae35c447fc617e63483f5ed0cb810+v0.10.3\"")
+    buildConfigField("boolean", "DEBUG_DIAGNOSTICS_ENABLED", "false")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     ndk {
@@ -56,7 +56,6 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      applicationIdSuffix = ".debug"
       // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
       // AI Studio.
       signingConfig = signingConfigs.getByName("debugConfig")

@@ -45,6 +45,7 @@ data class AppActions(
     val onAddCustomAccent: (Int) -> Unit,
     val onSetLogging: (Boolean) -> Unit,
     val onSetVpnMode: (VpnMode) -> Unit,
+    val onSetStopHotspotOnVpnDisconnect: (Boolean) -> Unit = {},
     val onRunProbes: () -> Unit,
     val onDismissDiagnostics: () -> Unit,
     val onClearLog: (onCleared: (String?) -> Unit) -> Unit,
@@ -91,6 +92,7 @@ data class AppActions(
     val onRemoveDomainRule: (String) -> Unit = {},
     val onClearGlobalDomainRules: () -> Unit = {},
     val onClearClientDomainRules: (String) -> Unit = {},
+    val onSetDnsAttributionRetryEnabled: (Boolean) -> Unit = {},
 )
 
 /** Routes the navigator's current screen and hosts the toast overlay. */
@@ -242,6 +244,8 @@ private fun DomainBlockingRoute(context: ScreenContext) {
         connectedClients = context.state.clients,
         savedClientRules = context.state.settings.clientRules,
         bpfReport = bpfReport,
+        experimentalBpfEnabled = context.state.settings.experimentalBpfEnabled,
+        dnsAttributionRetryEnabled = context.state.settings.dnsAttributionRetryEnabled,
         initialScope = if (!initialMac.isNullOrBlank()) DomainRuleScope.CLIENT else DomainRuleScope.GLOBAL,
         initialClientMac = initialMac,
         actions = dev.shizzi.ui.DomainBlockingActions(
@@ -250,6 +254,8 @@ private fun DomainBlockingRoute(context: ScreenContext) {
             onRemoveRule = actions.onRemoveDomainRule,
             onClearGlobalRules = actions.onClearGlobalDomainRules,
             onClearClientRules = actions.onClearClientDomainRules,
+            onSetExperimentalBpfEnabled = actions.onSetExperimentalBpfEnabled,
+            onSetDnsAttributionRetryEnabled = actions.onSetDnsAttributionRetryEnabled,
         ),
         onBack = navigation.goBack,
     )
@@ -300,6 +306,7 @@ private fun settingsState(state: AppState): SettingsState {
         customAccents = settings.customAccents,
         isLogging = settings.isLogging,
         vpnMode = settings.vpnMode,
+        stopHotspotOnVpnDisconnect = settings.stopHotspotOnVpnDisconnect,
         isRunningDiagnostics = state.diagnostics is DiagnosticsState.Running,
         automation = AutomationState(
             isEnabled = settings.isAutomationEnabled,
@@ -330,6 +337,7 @@ private fun settingsActions(context: ScreenContext): SettingsActions {
         onAddCustomAccent = actions.onAddCustomAccent,
         onSetLogging = actions.onSetLogging,
         onSetVpnMode = actions.onSetVpnMode,
+        onSetStopHotspotOnVpnDisconnect = actions.onSetStopHotspotOnVpnDisconnect,
         onSetDnsPreset = actions.onSetDnsPreset,
         onSetCustomDns = actions.onSetCustomDns,
         onOpenClients = { context.navigation.open(Screen.CLIENTS) },

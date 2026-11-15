@@ -69,4 +69,9 @@ interface ITetherService {
     String activateSoftApBlockingMode();
 
     void updateDomainRules(String domainRulesJson);
+
+    String setStopHotspotOnVpnDisconnect(boolean enabled);
+
+    String setDnsAttributionRetryConfig(boolean enabled, int maxWaitMs);
 }
+

@@ -27,6 +27,7 @@ data class Settings(
     val isLogging: Boolean = true,
 
     val vpnMode: VpnMode = VpnMode.AUTO,
+    val stopHotspotOnVpnDisconnect: Boolean = true,
 
     val hasCompletedOnboarding: Boolean = false,
 
@@ -44,6 +45,8 @@ data class Settings(
     val requestedBlockingMode: BlockingMode = BlockingMode.BPF_NAT_VPN,
     val legacyPreNatMigrated: Boolean = false,
     val domainRules: List<DomainRule> = emptyList(),
+    val dnsAttributionRetryEnabled: Boolean = false,
+    val dnsRetryMaxWaitMs: Int = 200,
 )
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
@@ -90,6 +93,10 @@ class SettingsStore(private val context: Context) {
 
     suspend fun setVpnMode(mode: VpnMode) {
         context.dataStore.edit { it[VPN_MODE] = mode.name }
+    }
+
+    suspend fun setStopHotspotOnVpnDisconnect(enabled: Boolean) {
+        context.dataStore.edit { it[STOP_HOTSPOT_ON_VPN_DISCONNECT] = enabled }
     }
 
     suspend fun setOnboardingComplete(hasCompleted: Boolean) {
@@ -281,6 +288,14 @@ class SettingsStore(private val context: Context) {
         }
     }
 
+    suspend fun setDnsAttributionRetryEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[DNS_ATTRIBUTION_RETRY_ENABLED] = enabled }
+    }
+
+    suspend fun setDnsRetryMaxWaitMs(maxWaitMs: Int) {
+        context.dataStore.edit { it[DNS_RETRY_MAX_WAIT_MS] = maxWaitMs.coerceIn(150, 300) }
+    }
+
     private fun MutablePreferences.mintTokenIfAbsent() {
         if (!this[AUTOMATION_TOKEN].isNullOrEmpty()) return
 
@@ -311,6 +326,9 @@ internal val PHASE_D_ENFORCEMENT_MODE = stringPreferencesKey("phase_d_enforcemen
 internal val REQUESTED_BLOCKING_MODE = stringPreferencesKey("requested_blocking_mode")
 internal val LEGACY_PRENAT_MIGRATED = booleanPreferencesKey("legacy_prenat_migrated")
 internal val DOMAIN_RULES = stringPreferencesKey("domain_rules")
+internal val STOP_HOTSPOT_ON_VPN_DISCONNECT = booleanPreferencesKey("stop_hotspot_on_vpn_disconnect")
+internal val DNS_ATTRIBUTION_RETRY_ENABLED = booleanPreferencesKey("dns_attribution_retry_enabled")
+internal val DNS_RETRY_MAX_WAIT_MS = intPreferencesKey("dns_retry_max_wait_ms")
 
 internal fun toSettings(preferences: Preferences): Settings {
     val (parsedMode, wasLegacyPreNat) = BlockingMode.parseWithMigration(preferences[REQUESTED_BLOCKING_MODE])
@@ -323,6 +341,7 @@ internal fun toSettings(preferences: Preferences): Settings {
         customAccents = parseAccents(preferences[CUSTOM_ACCENTS]),
         isLogging = preferences[LOGGING] ?: true,
         vpnMode = parseVpnMode(preferences[VPN_MODE]),
+        stopHotspotOnVpnDisconnect = preferences[STOP_HOTSPOT_ON_VPN_DISCONNECT] ?: true,
         hasCompletedOnboarding = preferences[ONBOARDED] ?: false,
         isAutomationEnabled = preferences[AUTOMATION] ?: false,
         automationToken = preferences[AUTOMATION_TOKEN].orEmpty(),
@@ -343,5 +362,7 @@ internal fun toSettings(preferences: Preferences): Settings {
         requestedBlockingMode = parsedMode,
         legacyPreNatMigrated = wasLegacyPreNat || (preferences[LEGACY_PRENAT_MIGRATED] ?: false),
         domainRules = DomainRule.deserializeList(preferences[DOMAIN_RULES]),
+        dnsAttributionRetryEnabled = preferences[DNS_ATTRIBUTION_RETRY_ENABLED] ?: false,
+        dnsRetryMaxWaitMs = (preferences[DNS_RETRY_MAX_WAIT_MS] ?: 200).coerceIn(150, 300),
     )
 }

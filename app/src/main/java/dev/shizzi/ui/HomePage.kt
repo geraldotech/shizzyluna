@@ -26,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.shizzi.SessionUiState
 import dev.shizzi.UiStatus
+import dev.shizzi.VpnLifecycleState
 import dev.shizzi.ui.theme.HeaderHeight
 import dev.shizzi.ui.theme.ScreenPadding
 import dev.shizzi.ui.theme.ShizziTheme
@@ -71,7 +72,11 @@ fun HomePage(
                 contentAlignment = Alignment.BottomCenter,
             ) {
                 RiseIn(isVisible = isShowingVpn(state)) {
-                    VpnChip(isBypassed = state.isVpnBypassed)
+                    VpnChip(
+                        isBypassed = state.isVpnBypassed,
+                        vpnLifecycleState = state.vpnLifecycleState,
+                        vpnRecoveryCount = state.vpnRecoveryCount,
+                    )
                 }
             }
 
@@ -140,7 +145,11 @@ private fun HomeHeader(
 }
 
 private fun isShowingVpn(state: SessionUiState): Boolean {
-    val hasVpn = state.isVpnBound || state.isVpnBypassed
+    val hasVpn = state.isVpnBound ||
+        state.isVpnBypassed ||
+        state.vpnLifecycleState == VpnLifecycleState.VPN_WAITING_FOR_RECOVERY ||
+        state.vpnLifecycleState == VpnLifecycleState.VPN_REBINDING ||
+        state.vpnLifecycleState == VpnLifecycleState.VPN_RECOVERY_FAILED
 
     return hasVpn && state.status == UiStatus.CONNECTED
 }

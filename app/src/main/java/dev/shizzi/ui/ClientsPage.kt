@@ -212,23 +212,7 @@ internal fun formatClientBandwidthBadgeLabel(
     } else {
         "${formatKbpsAsMbps(client.bandwidthLimitKbps)} Mbps"
     }
-    if (!isCurrentlyConnected) return "Cap: $cap (saved)"
-    return when (client.enforcementState) {
-        EnforcementState.THROTTLING_OBSERVED ->
-            "Cap: $cap (shaped • ${Traffic.format(client.shapedBytes)})"
-        EnforcementState.PARTIAL_BPF_ENFORCEMENT ->
-            "Cap: $cap (partial BPF • ${Traffic.format(client.shapedBytes)} shaped)"
-        EnforcementState.PACKETS_MATCHED ->
-            "Cap: $cap (matched • ${client.matchedPackets} pkts)"
-        EnforcementState.POLICY_INSTALLED,
-        EnforcementState.DATAPATH_ACTIVE,
-        -> "Cap: $cap (requested • policy active)"
-        EnforcementState.DEGRADED_MULTI_CLIENT ->
-            "Cap: $cap — degraded (post-NAT unattributed)"
-        EnforcementState.ENFORCEMENT_UNAVAILABLE ->
-            "Cap: $cap — not enforced"
-        else -> "Cap: $cap (configured)"
-    }
+    return if (isCurrentlyConnected) "Limit: $cap" else "Limit: $cap (saved)"
 }
 
 data class ClientActions(
@@ -374,14 +358,6 @@ fun ClientsPage(
                         style = ShizziTheme.typography.caption,
                         color = ShizziTheme.colors.onSurfaceMuted,
                     )
-                    if (sessionState.status == UiStatus.CONNECTED) {
-                        Text(
-                            text = "Datapath: ${sessionState.datapathMode.name} • Backend: ${sessionState.firewallBackend.name}",
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.sp,
-                            color = ShizziTheme.colors.onSurfaceMuted,
-                        )
-                    }
                 }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -451,52 +427,7 @@ fun ClientsPage(
                                 color = ShizziTheme.colors.onSurface,
                             )
                             Text(
-                                text = "Blocked clients are disconnected from the Wi-Fi hotspot and remain listed below while offline so you can unblock or reset quota anytime. Per-client bandwidth throttling is disabled in SoftAP mode.",
-                                fontSize = 11.sp,
-                                color = ShizziTheme.colors.onSurfaceMuted,
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Prominent warning banner if Direct-TUN fallback is active without kernel netfilter
-            if (sessionState.status == UiStatus.CONNECTED &&
-                sessionState.datapathMode == DatapathMode.DIRECT_TUN_FALLBACK &&
-                !sessionState.kernelNetfilterAvailable &&
-                !isSoftApModeActive
-            ) {
-                Card(
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFFFFA000).copy(alpha = 0.16f),
-                    ),
-                    border = BorderStroke(1.dp, Color(0xFFFFA000).copy(alpha = 0.45f)),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 12.dp)
-                        .testTag("enforcement_unavailable_banner"),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Warning,
-                            contentDescription = null,
-                            tint = Color(0xFFFFA000),
-                            modifier = Modifier.size(20.dp),
-                        )
-                        Spacer(Modifier.width(10.dp))
-                        Column {
-                            Text(
-                                text = "Enforcement Unavailable (Direct-TUN Fallback)",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp,
-                                color = ShizziTheme.colors.onSurface,
-                            )
-                            Text(
-                                text = "Userspace proxy did not attach (${sessionState.fallbackReason.ifBlank { "fallback active" }}) and kernel netfilter is unavailable. Rules are saved but cannot filter live packets.",
+                                text = "Blocked clients are disconnected from the Wi-Fi hotspot and remain listed below while offline so you can unblock them anytime. Bandwidth throttling is not supported in this mode.",
                                 fontSize = 11.sp,
                                 color = ShizziTheme.colors.onSurfaceMuted,
                             )
@@ -801,16 +732,6 @@ private fun ClientCard(
                         fontSize = 11.sp,
                         color = ShizziTheme.colors.onSurfaceMuted,
                     )
-                    if (isCurrentlyConnected && client.seenPackets > 0L) {
-                        val dropSummary = if (isRestricted) " • ${client.effectivePolicyVersionDrops} blockDrop" else ""
-                        val shapeSummary = if (client.shapingDropPackets > 0L) " • ${client.shapingDropPackets} shapeDrop" else ""
-                        Text(
-                            text = "v${client.policyVersion} • seen=${client.seenPackets} (bpf=${client.bpfAttributedPackets}, direct=${client.directAttributedPackets})$dropSummary$shapeSummary",
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.sp,
-                            color = ShizziTheme.colors.onSurfaceMuted,
-                        )
-                    }
                 }
 
                 Switch(
@@ -834,15 +755,10 @@ private fun ClientCard(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                // Status badge (honest packet-verified vs partial BPF vs configured vs unavailable vs degraded)
+                // Status badge
                 if (!isCurrentlyConnected) {
-                    val softApLabelSuffix = if (softApRecord != null && softApRecord.appliedState == SoftApAppliedState.BLOCK_CONFIRMED) {
-                        " • SoftAP BLOCK_CONFIRMED"
-                    } else {
-                        ""
-                    }
                     BadgeChip(
-                        label = if (isRestricted) "Offline • ${restrictReason ?: "Blocked"} (saved$softApLabelSuffix)" else "Offline • Saved Rule$softApLabelSuffix",
+                        label = if (isRestricted) "Offline • ${restrictReason ?: "Blocked"}" else "Offline • Saved Rule",
                         color = if (isRestricted) Color(0xFFFF5252) else ShizziTheme.colors.onSurfaceMuted,
                         icon = if (isRestricted) Icons.Filled.Block else Icons.Filled.Devices,
                     )
@@ -855,7 +771,7 @@ private fun ClientCard(
                         else -> Color(0xFFFF7043)
                     }
                     BadgeChip(
-                        label = client.formattedBlockStatusLabel(),
+                        label = restrictReason ?: "Blocked",
                         color = badgeColor,
                         icon = if (state == EnforcementState.ENFORCEMENT_UNAVAILABLE || state == EnforcementState.DEGRADED_MULTI_CLIENT) {
                             Icons.Filled.Warning
@@ -873,10 +789,12 @@ private fun ClientCard(
 
                 // SoftAP enforcement status badge when SoftAP record is present
                 if (softApRecord != null && (isSoftApModeActive || softApRecord.appliedState != SoftApAppliedState.UNBLOCKED || softApRecord.activeReasons.isNotEmpty())) {
-                    val reasonsText = if (softApRecord.activeReasons.isEmpty()) {
-                        ""
-                    } else {
-                        " (${softApRecord.activeReasons.joinToString(",") { it.name }})"
+                    val softApLabel = when (softApRecord.appliedState) {
+                        SoftApAppliedState.BLOCK_CONFIRMED -> "Disconnected from hotspot"
+                        SoftApAppliedState.BLOCK_PENDING,
+                        SoftApAppliedState.UNBLOCK_PENDING -> "Updating hotspot access"
+                        SoftApAppliedState.UNBLOCKED -> "Allowed on hotspot"
+                        else -> "Hotspot block unavailable"
                     }
                     val softApBadgeColor = when (softApRecord.appliedState) {
                         SoftApAppliedState.BLOCK_CONFIRMED -> Color(0xFFFF5252)
@@ -888,14 +806,14 @@ private fun ClientCard(
                         SoftApAppliedState.UNBLOCKED -> Color(0xFF4CAF50)
                     }
                     BadgeChip(
-                        label = "SoftAP: ${softApRecord.appliedState.name}$reasonsText",
+                        label = softApLabel,
                         color = softApBadgeColor,
                         icon = Icons.Filled.Block,
                         modifier = Modifier.testTag("softap_status_${client.cleanMac}"),
                     )
                 }
 
-                // Bandwidth badge (honest packet-verified vs policy active vs not enforced vs disabled in SoftAP mode)
+                // Bandwidth badge
                 if (client.bandwidthLimitKbps > 0) {
                     val capColor = if (isSoftApModeActive || (isCurrentlyConnected && (state == EnforcementState.ENFORCEMENT_UNAVAILABLE || state == EnforcementState.DEGRADED_MULTI_CLIENT))) {
                         Color(0xFFFFA000)
@@ -903,7 +821,7 @@ private fun ClientCard(
                         ShizziTheme.colors.primary
                     }
                     val bwLabel = if (isSoftApModeActive) {
-                        "Cap: ${formatKbpsAsMbps(client.bandwidthLimitKbps)} Mbps (disabled in SoftAP mode)"
+                        "Limit: ${formatKbpsAsMbps(client.bandwidthLimitKbps)} Mbps (not supported in SoftAP mode)"
                     } else {
                         formatClientBandwidthBadgeLabel(client, isCurrentlyConnected)
                     }
@@ -921,8 +839,13 @@ private fun ClientCard(
                     client.dataLimitBytes > 0L -> Color(0xFF00BFA5)
                     else -> ShizziTheme.colors.onSurfaceMuted
                 }
+                val quotaLabel = when {
+                    client.dataLimitBytes <= 0L -> "Unlimited"
+                    client.isQuotaExceeded -> "Data limit reached"
+                    else -> "${DataQuota.formatUsageSummary(client.quotaUsedTotalBytes, client.dataLimitBytes)} (${client.effectiveQuotaRecord().usagePercent}%)"
+                }
                 BadgeChip(
-                    label = client.formattedQuotaBadgeLabel(isCurrentlyConnected),
+                    label = quotaLabel,
                     color = quotaColor,
                     icon = Icons.Filled.DataUsage,
                 )
@@ -974,13 +897,9 @@ private fun ClientCard(
                 Spacer(Modifier.height(6.dp))
                 val isIncompleteAttribution = client.unattributedPostNatObserved ||
                     (isCurrentlyConnected && client.datapathMode == DatapathMode.DIRECT_TUN_FALLBACK && !client.kernelNetfilterAvailable)
-                val attributionNote = if (isIncompleteAttribution) {
-                    "Usage may be incomplete (unattributed post-NAT / fallback traffic observed)"
-                } else {
-                    "Attributed traffic (${client.quotaResetPeriod.displayName})"
-                }
+                val incompleteSuffix = if (isIncompleteAttribution) " • Usage may be incomplete" else ""
                 Text(
-                    text = "$attributionNote • ↓ ${DataQuota.formatBytes(client.quotaUsedRxBytes)} · ↑ ${DataQuota.formatBytes(client.quotaUsedTxBytes)} (Total: ${DataQuota.formatBytes(client.quotaUsedTotalBytes)})",
+                    text = "↓ ${DataQuota.formatBytes(client.quotaUsedRxBytes)} · ↑ ${DataQuota.formatBytes(client.quotaUsedTxBytes)} • Total: ${DataQuota.formatBytes(client.quotaUsedTotalBytes)}$incompleteSuffix",
                     fontSize = 10.sp,
                     color = if (isIncompleteAttribution) Color(0xFFFFA000) else ShizziTheme.colors.onSurfaceMuted,
                     modifier = Modifier.testTag("client_quota_attribution_${client.cleanMac}"),

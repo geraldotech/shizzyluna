@@ -106,6 +106,7 @@ class MainActivity : ComponentActivity() {
                             onAddCustomAccent = viewModel::addCustomAccent,
                             onSetLogging = viewModel::setLogging,
                             onSetVpnMode = viewModel::setVpnMode,
+                            onSetStopHotspotOnVpnDisconnect = viewModel::setStopHotspotOnVpnDisconnect,
                             onRunProbes = viewModel::runProbes,
                             onDismissDiagnostics = viewModel::dismissDiagnostics,
                             onClearLog = viewModel::clearLog,
@@ -146,6 +147,7 @@ class MainActivity : ComponentActivity() {
                             onRemoveDomainRule = viewModel::removeDomainRule,
                             onClearGlobalDomainRules = viewModel::clearGlobalDomainRules,
                             onClearClientDomainRules = viewModel::clearClientDomainRules,
+                            onSetDnsAttributionRetryEnabled = viewModel::setDnsAttributionRetryEnabled,
                         ),
                     )
                 }
