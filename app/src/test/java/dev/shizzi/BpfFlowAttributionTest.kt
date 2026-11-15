@@ -44,6 +44,7 @@ class BpfFlowAttributionTest {
     @Before
     fun setUp() {
         TunTrafficEngine.stop()
+        TunTrafficEngine.resetAllQuotaStatesForTest(deleteCheckpointFile = false)
         TunTrafficEngine.configureExperimentalBpf(enabled = false, pollIntervalMs = 1_000L)
     }
 
@@ -704,6 +705,7 @@ class BpfFlowAttributionTest {
 
     @Test
     fun `10 non-blocking per-client shaping never sleeps on shared thread and drops queued packets on policy block`() {
+        TunTrafficEngine.clearAll()
         val macA = "E2:15:CD:54:E4:9B"
         val macB = "F2:FF:8B:3D:B2:A6"
         val hosts = listOf(
@@ -1239,4 +1241,3062 @@ class BpfFlowAttributionTest {
         assertEquals(clientMac, boundIps["192.168.50.145"])
         HostFirewall.clearAll()
     }
+
+    @Test
+    fun `17 v0_10_3_debug classifies all structured UnattributedReason values accurately`() {
+        val clock = AtomicLong(1_000L)
+        val attributor = NatFlowAttributor(monotonicClockMs = { clock.get() }, maxFreshnessMs = 4_500L)
+
+        // 1. Cold cache before any snapshot -> NO_ACTIVE_SNAPSHOT
+        val coldDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+        )
+        assertEquals(UnattributedReason.NO_ACTIVE_SNAPSHOT, coldDetail.failureReason)
+
+        // 2. Failed collection when no prior snapshot exists -> SNAPSHOT_INVALID_OR_COLLECTION_FAILED
+        attributor.ingestParsedDump(
+            parsed = BpfParsedDump(
+                recognizedFormat = false,
+                ipv4UpstreamEntries = emptyList(),
+                ipv4DownstreamEntries = emptyList(),
+                ipv6Entries = emptyList(),
+                rejectedLines = emptyList(),
+            ),
+            collectionSessionGeneration = attributor.currentSessionGeneration,
+            collectionStatus = BpfCollectionStatus.COMMAND_FAILED,
+            collectionDurationMs = 15L,
+            collectionError = "dumpsys failed",
+            ipToMac = ipBindings,
+            activeConnectedMacs = activeMacs,
+        )
+        val failedSnapDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+        )
+        assertEquals(UnattributedReason.SNAPSHOT_INVALID_OR_COLLECTION_FAILED, failedSnapDetail.failureReason)
+
+        // 3. Unsupported protocol (GRE=47), invalid ports (0), and IPv6 on IPv4-only BPF map
+        assertEquals(
+            UnattributedReason.IPV6_NOT_SUPPORTED_BY_BPF_MAP,
+            attributor.resolveTranslatedPacketDetailed(
+                6, 6, "2001:db8::2", 51006, "2607:f8b0:4005:80a::200e", 443, true, false, ipBindings, activeMacs,
+            ).failureReason,
+        )
+        assertEquals(
+            UnattributedReason.UNSUPPORTED_PROTOCOL,
+            attributor.resolveTranslatedPacketDetailed(
+                4, 47, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+            ).failureReason,
+        )
+        assertEquals(
+            UnattributedReason.INVALID_OR_MISSING_PORTS,
+            attributor.resolveTranslatedPacketDetailed(
+                4, 6, "192.0.2.2", 0, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+            ).failureReason,
+        )
+
+        // Publish valid snapshot at t = 1_000L
+        assertTrue(
+            attributor.ingestParsedDump(
+                parsed = BpfDumpParser.parse(realDeviceExcerpt),
+                collectionSessionGeneration = attributor.currentSessionGeneration,
+                collectionStatus = BpfCollectionStatus.OK,
+                collectionDurationMs = 9L,
+                ipToMac = ipBindings,
+                activeConnectedMacs = activeMacs,
+            ),
+        )
+
+        // 4. Missing tuple in valid snapshot -> TUPLE_NOT_PRESENT
+        val missingTupleDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 64999, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+        )
+        assertEquals(UnattributedReason.TUPLE_NOT_PRESENT, missingTupleDetail.failureReason)
+
+        // 5. Upload TCP SYN on already-mapped tuple -> TCP_TUPLE_REUSE_AWAITING_REFRESH
+        val synReuseDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, true, ipBindings, activeMacs,
+        )
+        assertEquals(UnattributedReason.TCP_TUPLE_REUSE_AWAITING_REFRESH, synReuseDetail.failureReason)
+
+        // 6. Disconnected client -> CLIENT_DISCONNECTED
+        val disconnectedDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, ipBindings, setOf("F2:FF:8B:3D:B2:A6"),
+        )
+        assertEquals(UnattributedReason.CLIENT_DISCONNECTED, disconnectedDetail.failureReason)
+
+        // 7. Reassigned client IP -> CLIENT_IP_REASSIGNED
+        val reassignedBindings = mapOf(
+            "192.168.167.151" to "AA:BB:CC:DD:EE:FF",
+            "192.168.167.17" to "F2:FF:8B:3D:B2:A6",
+        )
+        val reassignedDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, reassignedBindings, activeMacs + "AA:BB:CC:DD:EE:FF",
+        )
+        assertEquals(UnattributedReason.CLIENT_IP_REASSIGNED, reassignedDetail.failureReason)
+
+        // 8. Stale snapshot -> SNAPSHOT_STALE
+        clock.set(7_000L)
+        val staleDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+        )
+        assertEquals(UnattributedReason.SNAPSHOT_STALE, staleDetail.failureReason)
+
+        // 9. Ambiguous tuple -> TUPLE_AMBIGUOUS
+        clock.set(8_000L)
+        val ambiguousRaw = """
+            IPv4 Upstream:
+              269 (testtun46) -> 269 (testtun46)
+              270 (ap0) -> 270 (ap0)
+              tcp [b6:f6:6c:df:e6:02] 270(ap0) 192.168.167.151:60000 -> 269(testtun46) 192.0.2.2:60000 -> 93.184.216.34:443 [00:00:00:00:00:00] 1500 50ms
+              tcp [b6:f6:6c:df:e6:02] 270(ap0) 192.168.167.17:60000 -> 269(testtun46) 192.0.2.2:60000 -> 93.184.216.34:443 [00:00:00:00:00:00] 1500 50ms
+            IPv4 Downstream:
+              269 (testtun46) -> 269 (testtun46)
+              270 (ap0) -> 270 (ap0)
+              tcp [00:00:00:00:00:00] 269(testtun46) 93.184.216.34:443 -> 270(ap0) 192.0.2.2:60000 -> 192.168.167.151:60000 [e2:15:cd:54:e4:9b] 1500 55ms
+              tcp [00:00:00:00:00:00] 269(testtun46) 93.184.216.34:443 -> 270(ap0) 192.0.2.2:60000 -> 192.168.167.17:60000 [f2:ff:8b:3d:b2:a6] 1500 55ms
+        """.trimIndent()
+        attributor.ingestParsedDump(
+            parsed = BpfDumpParser.parse(ambiguousRaw),
+            collectionSessionGeneration = attributor.currentSessionGeneration,
+            collectionStatus = BpfCollectionStatus.OK,
+            collectionDurationMs = 8L,
+            ipToMac = ipBindings,
+            activeConnectedMacs = activeMacs,
+        )
+        val ambigDetail = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 60000, "93.184.216.34", 443, true, false, ipBindings, activeMacs,
+        )
+        assertEquals(UnattributedReason.TUPLE_AMBIGUOUS, ambigDetail.failureReason)
+
+        // 10. Non-initial fragment in TunTrafficEngine -> NON_INITIAL_FRAGMENT
+        TunTrafficEngine.clearAll()
+        val fragMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 6, srcIp = "192.0.2.2", dstIp = "108.158.147.26",
+            srcPort = 0, dstPort = 0, length = 800, isSmallControlPacket = false,
+            isNonInitialFragment = true,
+        )
+        val fragAttr = TunTrafficEngine.resolveClientMacWithSource(fragMeta, isUpload = true)
+        assertEquals(AttributionSource.UNMATCHED_UNSUPPORTED_OR_FRAGMENT, fragAttr.source)
+        assertEquals(UnattributedReason.NON_INITIAL_FRAGMENT, fragAttr.unattributedReason)
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `18 v0_10_3_debug packet and byte denominators reconcile and reset preserves policies and quotas`() {
+        val clientMac = "E2:15:CD:54:E4:9B"
+        val clientIp = "192.168.167.151"
+        val host = DiscoveredHost(
+            mac = clientMac,
+            ip = clientIp,
+            allIps = listOf(clientIp),
+            interfaceName = "ap0",
+        )
+        TunTrafficEngine.clearAll()
+        TunTrafficEngine.configureExperimentalBpf(enabled = true, pollIntervalMs = 1_000L, downstreamIface = "ap0", upstreamIface = "testtun46")
+
+        // Verify zero-denominator safety before any packets arrive
+        val initialReport = TunTrafficEngine.getBpfAttributionReport()
+        assertEquals(0L, initialReport.totalEligiblePackets)
+        assertEquals(0L, initialReport.totalEligibleBytes)
+        assertEquals("N/A", initialReport.formattedPacketCoverage())
+        assertEquals("N/A", initialReport.formattedByteCoverage())
+
+        // Install a blocked + quota rule for clientMac
+        val quotaRules = listOf(
+            ClientRule(
+                mac = clientMac,
+                isBlocked = true,
+                bandwidthLimitKbps = 1000,
+                dataLimitBytes = 500L * DataQuota.BYTES_PER_MB,
+                quotaResetPeriod = QuotaResetPeriod.DAILY,
+                quotaUsedRxBytes = 100L * DataQuota.BYTES_PER_MB,
+                quotaUsedTxBytes = 50L * DataQuota.BYTES_PER_MB,
+            ),
+        )
+        TunTrafficEngine.syncQuotaRules(quotaRules)
+        TunTrafficEngine.updatePolicies(
+            mapOf(
+                clientMac to TunTrafficEngine.EnforcedClientPolicy(
+                    mac = clientMac,
+                    isBlocked = true,
+                    bandwidthLimitKbps = 1000,
+                    dataLimitBytes = 500L * DataQuota.BYTES_PER_MB,
+                    quotaResetPeriod = QuotaResetPeriod.DAILY,
+                ),
+            ),
+            listOf(host),
+        )
+        TunTrafficEngine.bpfAttributor.ingestParsedDump(
+            parsed = BpfDumpParser.parse(realDeviceExcerpt),
+            collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+            collectionStatus = BpfCollectionStatus.OK,
+            collectionDurationMs = 7L,
+            ipToMac = ipBindings,
+            activeConnectedMacs = activeMacs,
+        )
+
+        // 1. Link-local multicast packet (excluded from eligible denominator, counted in localControl)
+        val localCtrlMeta = TunTrafficEngine.PacketMeta(
+            version = 6, protocol = 58, srcIp = "fe80::1", dstIp = "ff02::2",
+            srcPort = 0, dstPort = 0, length = 72, isSmallControlPacket = true,
+        )
+        val localAttr = TunTrafficEngine.resolveClientMacWithSource(localCtrlMeta, isUpload = true)
+        assertEquals(AttributionSource.UNMATCHED_UNKNOWN, localAttr.source)
+        localCtrlMeta.resolvedAttribution = localAttr
+        TunTrafficEngine.evaluateAndShapeDetailed(localCtrlMeta, localAttr.mac, isUpload = true, attributionSource = localAttr.source)
+
+        // 2. Direct IP packet (1000 bytes)
+        val directMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 6, srcIp = clientIp, dstIp = "1.1.1.1",
+            srcPort = 55000, dstPort = 443, length = 1000, isSmallControlPacket = false,
+        )
+        val directAttr = TunTrafficEngine.resolveClientMacWithSource(directMeta, isUpload = true)
+        assertEquals(AttributionSource.DIRECT_IP, directAttr.source)
+        directMeta.resolvedAttribution = directAttr
+        TunTrafficEngine.evaluateAndShapeDetailed(directMeta, directAttr.mac, isUpload = true, attributionSource = directAttr.source)
+
+        // 3. BPF NAT attributed packet (1400 bytes)
+        val bpfMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 6, srcIp = "192.0.2.2", dstIp = "108.158.147.26",
+            srcPort = 51006, dstPort = 443, length = 1400, isSmallControlPacket = false,
+        )
+        val bpfAttr = TunTrafficEngine.resolveClientMacWithSource(bpfMeta, isUpload = true)
+        assertEquals(AttributionSource.BPF_NAT, bpfAttr.source)
+        bpfMeta.resolvedAttribution = bpfAttr
+        TunTrafficEngine.evaluateAndShapeDetailed(bpfMeta, bpfAttr.mac, isUpload = true, attributionSource = bpfAttr.source)
+
+        // 4. Unattributed post-NAT packet (600 bytes, TUPLE_NOT_PRESENT) -> MUST still return PacketDecision.ALLOW
+        val unknownMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 17, srcIp = "192.0.2.2", dstIp = "8.8.8.8",
+            srcPort = 63111, dstPort = 53, length = 600, isSmallControlPacket = false,
+        )
+        val unknownAttr = TunTrafficEngine.resolveClientMacWithSource(unknownMeta, isUpload = true)
+        assertNull(unknownAttr.mac)
+        assertEquals(AttributionSource.UNMATCHED_UNKNOWN, unknownAttr.source)
+        assertEquals(UnattributedReason.TUPLE_NOT_PRESENT, unknownAttr.unattributedReason)
+        unknownMeta.resolvedAttribution = unknownAttr
+        val unknownEval = TunTrafficEngine.evaluateAndShapeDetailed(unknownMeta, unknownAttr.mac, isUpload = true, attributionSource = unknownAttr.source)
+        assertEquals(PacketDecision.ALLOW, unknownEval.decision)
+
+        val rep = TunTrafficEngine.getBpfAttributionReport()
+        // Denominator reconciliation
+        assertEquals(1L, rep.localControlPackets)
+        assertEquals(72L, rep.localControlBytes)
+        assertEquals(3L, rep.totalEligiblePackets)
+        assertEquals(3000L, rep.totalEligibleBytes)
+        assertEquals(2L, rep.totalAttributedPackets)
+        assertEquals(2400L, rep.totalAttributedBytes)
+        assertEquals(1L, rep.directAttributedPackets)
+        assertEquals(1000L, rep.directAttributedBytes)
+        assertEquals(1L, rep.bpfAttributedPackets)
+        assertEquals(1400L, rep.bpfAttributedBytes)
+        assertEquals(0L, rep.conntrackAttributedPackets)
+        assertEquals(1L, rep.unknownForwardedPackets)
+        assertEquals(600L, rep.unknownForwardedBytes)
+        assertEquals(1L, rep.unattributedPacketsByReason[UnattributedReason.TUPLE_NOT_PRESENT.name])
+        assertEquals(600L, rep.unattributedBytesByReason[UnattributedReason.TUPLE_NOT_PRESENT.name])
+        assertEquals("80.00%", rep.formattedByteCoverage())
+
+        // Reset diagnostic counters -> zeroes counters while preserving blocked policy and quota record
+        TunTrafficEngine.resetAttributionDiagnosticsCounters()
+        val afterReset = TunTrafficEngine.getBpfAttributionReport()
+        assertEquals(0L, afterReset.totalEligiblePackets)
+        assertEquals(0L, afterReset.totalEligibleBytes)
+        assertEquals(0L, afterReset.totalAttributedPackets)
+        assertEquals(0L, afterReset.unknownForwardedPackets)
+        assertEquals("N/A", afterReset.formattedPacketCoverage())
+        assertEquals(1, afterReset.blockedClientsCount)
+
+        // Blocked policy is still enforced immediately after counter reset
+        bpfMeta.resolvedAttribution = bpfAttr
+        val postResetEval = TunTrafficEngine.evaluateAndShapeDetailed(bpfMeta, bpfAttr.mac, isUpload = true, attributionSource = bpfAttr.source)
+        assertEquals(PacketDecision.DROP, postResetEval.decision)
+        val quotaSnap = TunTrafficEngine.getCounterSnapshot(clientMac)
+        assertEquals(100L * DataQuota.BYTES_PER_MB, quotaSnap.quotaUsedRxBytes)
+        assertEquals(50L * DataQuota.BYTES_PER_MB, quotaSnap.quotaUsedTxBytes)
+
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `19 v0_10_3_debug Phase B async refresh-on-miss coalesces respects cooldown attributes subsequent packet and auto-disables on repeated failures`() {
+        val clock = AtomicLong(10_000L)
+        val attributor = NatFlowAttributor(monotonicClockMs = { clock.get() }, maxFreshnessMs = 4_500L)
+        val readerCalls = AtomicLong(0L)
+        var shouldFailCollection = false
+
+        val mapReader = BpfMapReader(
+            attributor = attributor,
+            commandRunner = { _, _ ->
+                readerCalls.incrementAndGet()
+                if (shouldFailCollection) {
+                    BpfRawCollectionResult(
+                        status = BpfCollectionStatus.COMMAND_FAILED,
+                        exitCode = 1,
+                        durationMs = 5L,
+                        stdout = "",
+                        stderr = "Simulated failure",
+                        timedOut = false,
+                        wasTruncated = false,
+                        errorSummary = "Simulated failure",
+                    )
+                } else {
+                    BpfRawCollectionResult(
+                        status = BpfCollectionStatus.OK,
+                        exitCode = 0,
+                        durationMs = 6L,
+                        stdout = realDeviceExcerpt,
+                        stderr = "",
+                        timedOut = false,
+                        wasTruncated = false,
+                    )
+                }
+            },
+            clientBindingsProvider = { ipBindings to activeMacs },
+            monotonicClockMs = { clock.get() },
+        )
+        mapReader.synchronousRefreshOnMissForTesting = true
+        mapReader.refreshOnMissCooldownMs = 500L
+        mapReader.maxConsecutiveFailuresForAutoDisable = 3
+
+        // Initially snapshot is empty -> miss on 192.0.2.2:51006 triggers refresh #1 at t = 10_000L
+        assertTrue(mapReader.requestAsyncRefreshOnMiss(UnattributedReason.TUPLE_NOT_PRESENT))
+        assertEquals(1L, mapReader.refreshOnMissTriggeredCount.get())
+        assertEquals(1L, mapReader.refreshOnMissCompletedCount.get())
+        assertEquals(10_000L, mapReader.lastRefreshOnMissPublishedSnapshotMonoMs.get())
+
+        // Subsequent miss within 500ms cooldown (t = 10_200L) is suppressed by cooldown
+        clock.set(10_200L)
+        assertFalse(mapReader.requestAsyncRefreshOnMiss(UnattributedReason.TUPLE_NOT_PRESENT))
+        assertEquals(1L, mapReader.refreshOnMissSuppressedCooldownCount.get())
+
+        // Subsequent packet on 192.0.2.2:51006 now matches the refreshed snapshot
+        val resolvedAfterRefresh = attributor.resolveTranslatedPacketDetailed(
+            4, 6, "192.0.2.2", 51006, "108.158.147.26", 443, true, false, ipBindings, activeMacs,
+        )
+        assertTrue(resolvedAfterRefresh.outcome is AttributionOutcome.Matched)
+
+        // Simulate 3 consecutive collection failures -> circuit breaker transitions CLOSED -> OPEN
+        shouldFailCollection = true
+        for (i in 1..3) {
+            clock.addAndGet(35_000L)
+            mapReader.requestAsyncRefreshOnMiss(UnattributedReason.TUPLE_NOT_PRESENT)
+        }
+        assertTrue("Expected circuit breaker to open after 3 consecutive failures", mapReader.refreshOnMissAutoDisabled)
+        assertEquals(RefreshCircuitBreakerState.OPEN, mapReader.circuitBreakerState)
+        assertEquals(3L, mapReader.missRefreshFailedCount.get())
+
+        // Within 30_000ms breaker cooldown (e.g., +15_000ms), new triggers are suppressed by breaker
+        clock.addAndGet(15_000L)
+        assertFalse("OPEN circuit breaker must reject triggers within 30s cooldown", mapReader.requestAsyncRefreshOnMiss(UnattributedReason.TUPLE_NOT_PRESENT))
+        assertEquals(1L, mapReader.missRefreshSuppressedBreakerCount.get())
+
+        // After 30_000ms breaker cooldown (+20_000ms -> +35_000ms total), breaker transitions OPEN -> HALF_OPEN for a single probe.
+        // If that probe succeeds, breaker transitions HALF_OPEN -> CLOSED!
+        shouldFailCollection = false
+        clock.addAndGet(20_000L)
+        assertTrue("HALF_OPEN probe after 30s cooldown should execute and recover to CLOSED", mapReader.requestAsyncRefreshOnMiss(UnattributedReason.TUPLE_NOT_PRESENT))
+        assertEquals(RefreshCircuitBreakerState.CLOSED, mapReader.circuitBreakerState)
+        assertFalse(mapReader.refreshOnMissAutoDisabled)
+
+        val lat = mapReader.getRefreshLatencyPercentiles()
+        assertTrue(lat.sampleCount >= 2)
+        assertTrue(lat.maxMs >= lat.p50Ms)
+    }
+
+    @Test
+    fun `20 v0_10_3_debug diagnostic report redacts PII by default and supports salted SHA-256 pseudonymous IDs`() {
+        val report = BpfAttributionStatusReport(
+            experimentalEnabled = true,
+            state = ExperimentalBpfState.MAPPINGS_AVAILABLE,
+            collectionStatus = BpfCollectionStatus.OK,
+            snapshotHealth = BpfSnapshotHealth.OK,
+            totalEligiblePackets = 100L,
+            totalEligibleBytes = 120_000L,
+            totalAttributedPackets = 95L,
+            totalAttributedBytes = 114_000L,
+            directAttributedPackets = 20L,
+            directAttributedBytes = 24_000L,
+            bpfAttributedPackets = 75L,
+            bpfAttributedBytes = 90_000L,
+            unknownForwardedPackets = 5L,
+            unknownForwardedBytes = 6_000L,
+            unattributedPacketsByReason = mapOf(UnattributedReason.TUPLE_NOT_PRESENT.name to 5L),
+            unattributedBytesByReason = mapOf(UnattributedReason.TUPLE_NOT_PRESENT.name to 6_000L),
+            perClientCounts = listOf(
+                ClientProtocolFlowCounts(
+                    mac = "E2:15:CD:54:E4:9B",
+                    originalIpv4 = "192.168.167.151",
+                    tcpFlows = 4,
+                    udpFlows = 2,
+                ),
+            ),
+            lastAttemptRejectedLineCount = 1,
+            lastAttemptRejectedLines = listOf(
+                BpfRejectedLine(
+                    lineNumber = 12,
+                    section = "IPv4 Upstream",
+                    reason = BpfRejectionReason.INVALID_IP,
+                    linePreview = "tcp [e2:15:cd:54:e4:9b] 270(ap0) 192.168.167.151:51006 -> 269(testtun46) 192.0.2.2:51006 -> 108.158.147.26:443",
+                ),
+            ),
+        )
+
+        // Default export (redacted)
+        val defaultMd = report.toMarkdownReport(
+            apkVersion = "0.10.4-debug",
+            sourceCommit = "test-commit",
+            serviceBuildId = 19,
+            includeSensitiveEndpoints = false,
+            includePseudonymousIds = false,
+        )
+        val defaultJson = report.toJson(
+            includeSensitiveEndpoints = false,
+            includePseudonymousIds = false,
+        ).toString()
+
+        assertFalse("Default Markdown report must not contain raw MAC/IP PII", DiagnosticRedactor.containsUnredactedPii(defaultMd))
+        assertFalse("Default JSON report must not contain raw MAC/IP PII", DiagnosticRedactor.containsUnredactedPii(defaultJson))
+        assertFalse(defaultMd.contains("E2:15:CD:54:E4:9B", ignoreCase = true))
+        assertFalse(defaultMd.contains("192.168.167.151"))
+
+        // Opt-in pseudonymous export (salted SHA-256 hashes Client#xxxxxx / IP#xxxxxx)
+        val pseudoMd = report.toMarkdownReport(
+            apkVersion = "0.10.4-debug",
+            sourceCommit = "test-commit",
+            serviceBuildId = 19,
+            includeSensitiveEndpoints = false,
+            includePseudonymousIds = true,
+        )
+        val pseudoJson = report.toJson(
+            includeSensitiveEndpoints = false,
+            includePseudonymousIds = true,
+        ).toString()
+
+        assertTrue(pseudoMd.contains("Client#"))
+        assertTrue(pseudoMd.contains("IP#"))
+        assertFalse("Pseudonymous Markdown report must not contain raw MAC/IP PII", DiagnosticRedactor.containsUnredactedPii(pseudoMd))
+        assertFalse("Pseudonymous JSON report must not contain raw MAC/IP PII", DiagnosticRedactor.containsUnredactedPii(pseudoJson))
+    }
+
+    @Test
+    fun `21 v0_10_3 release build identity and file paths match production release`() {
+        assertEquals("dev.shizzyluna.proxy", BuildConfig.APPLICATION_ID)
+        assertEquals("0.10.3", BuildConfig.VERSION_NAME)
+        assertEquals(25, BuildConfig.VERSION_CODE)
+        assertEquals(25, BuildConfig.SERVICE_BUILD_ID)
+        assertFalse(BuildConfig.DEBUG_DIAGNOSTICS_ENABLED)
+        assertFalse("applicationId must not have .debug suffix in release build", BuildConfig.APPLICATION_ID.endsWith(".debug"))
+        assertEquals("/data/local/tmp/shizzyluna-quota-state.json", DataQuota.DEFAULT_CHECKPOINT_FILE_PATH)
+        assertEquals("/data/local/tmp/shizzi-probe-report.json", TetherService.REPORT_PATH)
+        assertEquals("/data/local/tmp/shizzi-firewall-diagnostic.json", TetherService.FIREWALL_DIAG_REPORT_PATH)
+        assertEquals("/data/local/tmp/shizzyluna-debug-softap-journal.json", SoftApOwnershipJournal.DEFAULT_JOURNAL_PATH)
+    }
+
+    private fun buildIpv4TcpPacket(
+        srcIp: String,
+        dstIp: String,
+        srcPort: Int,
+        dstPort: Int,
+        syn: Boolean = false,
+        ack: Boolean = true,
+        payloadBytes: Int = 64,
+    ): ByteArray {
+        val totalLen = 20 + 20 + payloadBytes
+        val pkt = ByteArray(totalLen)
+        pkt[0] = 0x45.toByte() // IPv4, IHL = 5 (20 bytes)
+        pkt[2] = ((totalLen ushr 8) and 0xFF).toByte()
+        pkt[3] = (totalLen and 0xFF).toByte()
+        pkt[8] = 64.toByte() // TTL
+        pkt[9] = 6.toByte() // TCP
+        val srcIpBytes = CanonicalFlowTuple.ipv4ToNetworkOrderBytes(srcIp)
+        val dstIpBytes = CanonicalFlowTuple.ipv4ToNetworkOrderBytes(dstIp)
+        System.arraycopy(srcIpBytes, 0, pkt, 12, 4)
+        System.arraycopy(dstIpBytes, 0, pkt, 16, 4)
+        // TCP header at offset 20
+        pkt[20] = ((srcPort ushr 8) and 0xFF).toByte()
+        pkt[21] = (srcPort and 0xFF).toByte()
+        pkt[22] = ((dstPort ushr 8) and 0xFF).toByte()
+        pkt[23] = (dstPort and 0xFF).toByte()
+        pkt[32] = 0x50.toByte() // Data offset = 5 (20 bytes)
+        var flags = 0
+        if (syn) flags = flags or 0x02
+        if (ack) flags = flags or 0x10
+        pkt[33] = flags.toByte()
+        return pkt
+    }
+
+    @Test
+    fun `22 v0_10_4_debug CanonicalFlowTuple network-order IPv4 packet bytes match BpfDumpParser upstream entry`() {
+        val parsed = BpfDumpParser.parse(realDeviceExcerpt)
+        val bpfEntry = parsed.ipv4UpstreamEntries.first { it.translatedPort == 51006 }
+
+        val fromBpf = CanonicalFlowTuple.fromBpfUpstreamEntry(bpfEntry)
+        val rawUploadPacket = buildIpv4TcpPacket(
+            srcIp = "192.0.2.2",
+            dstIp = "108.158.147.26",
+            srcPort = 51006,
+            dstPort = 443,
+            syn = false,
+            ack = true,
+            payloadBytes = 64,
+        )
+        val fromPacketUpload = CanonicalFlowTuple.fromRawIpv4Packet(rawUploadPacket, rawUploadPacket.size, isUpload = true)
+        assertNotNull(fromPacketUpload)
+
+        // Both must produce identical 14-byte network-order representation and identical TranslatedFlowKey
+        assertTrue(fromBpf.toNetworkByteOrderBytes().contentEquals(fromPacketUpload!!.toNetworkByteOrderBytes()))
+        assertEquals(fromBpf.toTranslatedFlowKey(), fromPacketUpload.toTranslatedFlowKey())
+
+        // Download reply packet (108.158.147.26:443 -> 192.0.2.2:51006) must also normalize to the exact same TranslatedFlowKey
+        val rawDownloadPacket = buildIpv4TcpPacket(
+            srcIp = "108.158.147.26",
+            dstIp = "192.0.2.2",
+            srcPort = 443,
+            dstPort = 51006,
+            syn = false,
+            ack = true,
+            payloadBytes = 120,
+        )
+        val fromPacketDownload = CanonicalFlowTuple.fromRawIpv4Packet(rawDownloadPacket, rawDownloadPacket.size, isUpload = false)
+        assertNotNull(fromPacketDownload)
+        assertEquals(fromBpf.toTranslatedFlowKey(), fromPacketDownload!!.toTranslatedFlowKey())
+    }
+
+    @Test
+    fun `23 v0_10_4_debug DeepTupleDiagnosticsTracker state machine transitions LRU eviction TTL expiration and generation invalidation`() {
+        val clock = java.util.concurrent.atomic.AtomicLong(100_000L)
+        val tracker = DeepTupleDiagnosticsTracker(
+            monotonicClockMs = { clock.get() },
+            maxTrackedFlows = 4,
+            maxSampleRecords = 16,
+            flowTtlMs = 60_000L,
+        )
+
+        val emptySnap = NatFlowSnapshot(
+            snapshotSequence = 0L,
+            sessionGeneration = 1L,
+            bindingGeneration = 1L,
+            collectedAtMonotonicMs = clock.get(),
+            publishedAtEpochMs = clock.get(),
+            upstreamIface = "testtun46",
+            downstreamIface = "ap0",
+        )
+
+        val quicTuple = CanonicalFlowTuple(
+            networkSessionGeneration = 1L,
+            bindingGeneration = 1L,
+            ipFamily = 4,
+            transportProtocol = 17,
+            direction = "UPLOAD",
+            srcIp = "192.0.2.2",
+            srcPortOrIcmpId = 55111,
+            dstIp = "142.250.190.46",
+            dstPortOrIcmpId = 443,
+            preNatOrPostNatRole = PreNatOrPostNatRole.POST_NAT_UPSTREAM,
+        )
+
+        // 1. First miss -> NEW_MISS, UDP/443 QUIC counter incremented
+        val state1 = tracker.onPacketMiss(
+            tuple = quicTuple,
+            packetBytes = 1200,
+            missReason = UnattributedReason.TUPLE_NOT_PRESENT,
+            snapshot = emptySnap,
+            directionConfidence = DirectionConfidence.KNOWN,
+            tupleRoleOrigin = TupleRoleOrigin.TUN_PACKET_POST_NAT,
+        )
+        assertEquals(FlowMissState.NEW_MISS, state1)
+
+        // 2. Second miss before any snapshot -> REPEATED_MISS
+        clock.addAndGet(50L)
+        val state2 = tracker.onPacketMiss(
+            tuple = quicTuple,
+            packetBytes = 1200,
+            missReason = UnattributedReason.TUPLE_NOT_PRESENT,
+            snapshot = emptySnap,
+            directionConfidence = DirectionConfidence.KNOWN,
+            tupleRoleOrigin = TupleRoleOrigin.TUN_PACKET_POST_NAT,
+        )
+        assertEquals(FlowMissState.REPEATED_MISS, state2)
+
+        // 3. Snapshot #1 published without this flow -> PERSISTENT_AFTER_REFRESH
+        clock.addAndGet(600L)
+        val snap1 = emptySnap.copy(
+            snapshotSequence = 1L,
+            collectedAtMonotonicMs = clock.get(),
+            publishedAtEpochMs = clock.get(),
+        )
+        tracker.onSnapshotPublished(snap1)
+        var snapDiag = tracker.snapshot()
+        assertEquals(1L, snapDiag.persistentAfterRefreshFlowsCount)
+        assertEquals(1, snapDiag.survived1SnapshotCount)
+
+        // 4. Snapshots #2 and #3 published after >= 2,000ms total age without this flow -> NOT_OFFLOADED_OR_NOT_OBSERVABLE
+        clock.addAndGet(800L)
+        tracker.onSnapshotPublished(snap1.copy(snapshotSequence = 2L, collectedAtMonotonicMs = clock.get()))
+        clock.addAndGet(1_000L)
+        tracker.onSnapshotPublished(snap1.copy(snapshotSequence = 3L, collectedAtMonotonicMs = clock.get()))
+        snapDiag = tracker.snapshot()
+        assertEquals(1L, snapDiag.notOffloadedOrNotObservableFlowsCount)
+        assertEquals(1, snapDiag.survived3PlusSnapshotsCount)
+        assertEquals(2L, snapDiag.udp443MissingPacketsCount)
+
+        // 5. Key mismatch suspicion: add a flow where the BPF snapshot has the reversed direction key
+        val reversedTuple = CanonicalFlowTuple(
+            networkSessionGeneration = 1L,
+            bindingGeneration = 1L,
+            ipFamily = 4,
+            transportProtocol = 6,
+            direction = "UPLOAD",
+            srcIp = "108.158.147.26",
+            srcPortOrIcmpId = 443,
+            dstIp = "192.0.2.2",
+            dstPortOrIcmpId = 51006,
+            preNatOrPostNatRole = PreNatOrPostNatRole.POST_NAT_UPSTREAM,
+        )
+        tracker.onPacketMiss(reversedTuple, 60, UnattributedReason.TUPLE_NOT_PRESENT, snap1)
+        val realFlowKey = TranslatedFlowKey(4, 6, "192.0.2.2", 51006, "108.158.147.26", 443)
+        val snapWithRealFlow = snap1.copy(
+            snapshotSequence = 4L,
+            collectedAtMonotonicMs = clock.addAndGet(200L),
+            flowsByTuple = mapOf(
+                realFlowKey to NatFlowMapping(
+                    sessionGeneration = 1L,
+                    bindingGeneration = 1L,
+                    downstreamIfIndex = 270,
+                    downstreamIfaceLabel = "ap0",
+                    upstreamIfIndex = 269,
+                    upstreamIfaceLabel = "testtun46",
+                    family = 4,
+                    protocol = 6,
+                    origClientIp = "192.168.167.151",
+                    origClientPort = 51006,
+                    translatedIp = "192.0.2.2",
+                    translatedPort = 51006,
+                    remoteIp = "108.158.147.26",
+                    remotePort = 443,
+                    verifiedMac = "E2:15:CD:54:E4:9B",
+                    reverseMapConfirmed = true,
+                    boundInIpToMacAtIngest = true,
+                    collectedAtMonotonicMs = clock.get(),
+                    rawDumpAgeMs = 10L,
+                ),
+            ),
+        )
+        tracker.onSnapshotPublished(snapWithRealFlow)
+        assertEquals(1L, tracker.snapshot().keyMismatchSuspectedFlowsCount)
+
+        // 6. Resolved after refresh: miss on a new TCP flow, then snapshot includes it, then subsequent packet attributed
+        val tcpMissTuple = CanonicalFlowTuple(
+            networkSessionGeneration = 1L,
+            bindingGeneration = 1L,
+            ipFamily = 4,
+            transportProtocol = 6,
+            direction = "UPLOAD",
+            srcIp = "192.0.2.2",
+            srcPortOrIcmpId = 61000,
+            dstIp = "1.1.1.1",
+            dstPortOrIcmpId = 443,
+            preNatOrPostNatRole = PreNatOrPostNatRole.POST_NAT_UPSTREAM,
+        )
+        tracker.onPacketMiss(tcpMissTuple, 64, UnattributedReason.TUPLE_NOT_PRESENT, snapWithRealFlow)
+        val resolvedKey = tcpMissTuple.toTranslatedFlowKey()
+        val snap5 = snapWithRealFlow.copy(
+            snapshotSequence = 5L,
+            collectedAtMonotonicMs = clock.addAndGet(200L),
+            flowsByTuple = snapWithRealFlow.flowsByTuple + (
+                resolvedKey to NatFlowMapping(
+                    sessionGeneration = 1L,
+                    bindingGeneration = 1L,
+                    downstreamIfIndex = 270,
+                    downstreamIfaceLabel = "ap0",
+                    upstreamIfIndex = 269,
+                    upstreamIfaceLabel = "testtun46",
+                    family = 4,
+                    protocol = 6,
+                    origClientIp = "192.168.167.151",
+                    origClientPort = 61000,
+                    translatedIp = "192.0.2.2",
+                    translatedPort = 61000,
+                    remoteIp = "1.1.1.1",
+                    remotePort = 443,
+                    verifiedMac = "E2:15:CD:54:E4:9B",
+                    reverseMapConfirmed = true,
+                    boundInIpToMacAtIngest = true,
+                    collectedAtMonotonicMs = clock.get(),
+                    rawDumpAgeMs = 10L,
+                )
+            ),
+        )
+        tracker.onSnapshotPublished(snap5)
+        assertEquals(1L, tracker.snapshot().postRefreshFlowKeysResolved)
+        assertTrue(tracker.onPacketAttributedByBpf(resolvedKey, 500, snap5))
+        val snapAfterAttr = tracker.snapshot()
+        assertEquals(1L, snapAfterAttr.postRefreshFirstSubsequentAttributedPackets)
+        assertEquals(500L, snapAfterAttr.postRefreshFirstSubsequentAttributedBytes)
+
+        // 7. Generation bump invalidates tracked flows
+        tracker.onGenerationChanged(sessionGeneration = 2L, bindingGeneration = 1L)
+        assertEquals(0, tracker.snapshot().activeTrackedFlowsCount)
+    }
+
+    @Test
+    fun `24 v0_10_4_debug conntrack procfs permission-denied backoff skips repeated procfs reads for 300s`() {
+        val conntrackClock = java.util.concurrent.atomic.AtomicLong(50_000L)
+        TunTrafficEngine.conntrackClockMillisProvider = { conntrackClock.get() }
+        try {
+            TunTrafficEngine.clearAll()
+            val host = DiscoveredHost(
+                mac = "E2:15:CD:54:E4:9B",
+                ip = "192.168.167.151",
+                allIps = listOf("192.168.167.151"),
+                interfaceName = "ap0",
+            )
+            TunTrafficEngine.updatePolicies(emptyMap(), listOf(host))
+            TunTrafficEngine.configureExperimentalBpf(
+                enabled = true,
+                pollIntervalMs = 1000L,
+                downstreamIface = "ap0",
+                upstreamIface = "testtun46",
+            )
+
+            // First unknown post-NAT packet triggers inspectConntrackPaths(), which sets 300_000ms backoff when procfs is unreadable/empty
+            val meta1 = TunTrafficEngine.PacketMeta(
+                version = 4,
+                protocol = 6,
+                srcIp = "192.0.2.2",
+                dstIp = "198.51.100.99",
+                srcPort = 62001,
+                dstPort = 443,
+                length = 120,
+                isSmallControlPacket = false,
+            )
+            val attr1 = TunTrafficEngine.resolveClientMacWithSource(meta1, isUpload = true)
+            assertNull(attr1.mac)
+            assertTrue("Expected conntrack backoff to be active after unreadable procfs check", TunTrafficEngine.getBpfAttributionReport().conntrackBackoffActive)
+
+            // Advance clock by 10s (still within 300s backoff) and send 5 more unknown packets -> skipped by conntrack backoff
+            for (i in 1..5) {
+                conntrackClock.addAndGet(2_000L)
+                val m = meta1.copy(srcPort = 62001 + i)
+                TunTrafficEngine.resolveClientMacWithSource(m, isUpload = true)
+            }
+            val report = TunTrafficEngine.getBpfAttributionReport()
+            assertTrue("Expected conntrackBackoffActive=true during 300s window", report.conntrackBackoffActive)
+            assertEquals(5L, report.conntrackBackoffSkippedCount)
+        } finally {
+            TunTrafficEngine.conntrackClockMillisProvider = { System.currentTimeMillis() }
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    @Test
+    fun `25 v0_10_4_debug multi-client safety keeps UNKNOWN_OWNER as ALLOW while enforcing blocked client and separating verified summary`() {
+        TunTrafficEngine.clearAll()
+        val macA = "E2:15:CD:54:E4:9B" // Blocked client
+        val macB = "F2:FF:8B:3D:B2:A6" // Allowed client (matches realDeviceExcerpt flow 44056)
+        val hosts = listOf(
+            DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "ap0"),
+            DiscoveredHost(mac = macB, ip = "192.168.167.17", allIps = listOf("192.168.167.17"), interfaceName = "ap0"),
+        )
+        TunTrafficEngine.updatePolicies(
+            mapOf(
+                macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true),
+                macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+            ),
+            hosts,
+        )
+        TunTrafficEngine.configureExperimentalBpf(
+            enabled = true,
+            pollIntervalMs = 1000L,
+            downstreamIface = "ap0",
+            upstreamIface = "testtun46",
+        )
+        TunTrafficEngine.configureDeepTupleDiagnostics(enabled = true)
+        val (verifiedBindings, verifiedMacs) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+        assertTrue(
+            TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                parsed = BpfDumpParser.parse(realDeviceExcerpt),
+                collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                collectionStatus = BpfCollectionStatus.OK,
+                collectionDurationMs = 5L,
+                ipToMac = verifiedBindings,
+                activeConnectedMacs = verifiedMacs,
+            ),
+        )
+
+        // 1. Blocked Client A mapped flow (51006 -> 108.158.147.26:443) -> DROPPED
+        val metaA = TunTrafficEngine.PacketMeta(
+            version = 4,
+            protocol = 6,
+            srcIp = "192.0.2.2",
+            dstIp = "108.158.147.26",
+            srcPort = 51006,
+            dstPort = 443,
+            length = 120,
+            isSmallControlPacket = false,
+        )
+        val attrA = TunTrafficEngine.resolveClientMacWithSource(metaA, isUpload = true)
+        assertEquals(macA, attrA.mac)
+        assertEquals(PacketDecision.DROP, TunTrafficEngine.evaluateAndShape(metaA, attrA.mac, isUpload = true, attributionSource = attrA.source))
+
+        // 2. Allowed Client B mapped flow (44056 -> 142.250.219.14:443) -> ALLOWED and counted in Client B's verified summary
+        val metaB = TunTrafficEngine.PacketMeta(
+            version = 4,
+            protocol = 6,
+            srcIp = "192.0.2.2",
+            dstIp = "142.250.219.14",
+            srcPort = 44056,
+            dstPort = 443,
+            length = 240,
+            isSmallControlPacket = false,
+        )
+        val attrB = TunTrafficEngine.resolveClientMacWithSource(metaB, isUpload = true)
+        assertEquals(macB, attrB.mac)
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(metaB, attrB.mac, isUpload = true, attributionSource = attrB.source))
+
+        // 3. Unmapped post-NAT packet (port 59999) -> UNKNOWN_OWNER -> MUST remain ALLOW (never attributed to Blocked Client A)
+        val metaUnknown = TunTrafficEngine.PacketMeta(
+            version = 4,
+            protocol = 6,
+            srcIp = "192.0.2.2",
+            dstIp = "93.184.216.34",
+            srcPort = 59999,
+            dstPort = 443,
+            length = 300,
+            isSmallControlPacket = false,
+        )
+        val attrUnknown = TunTrafficEngine.resolveClientMacWithSource(metaUnknown, isUpload = true)
+        assertNull(attrUnknown.mac)
+        assertEquals(PacketDecision.ALLOW, TunTrafficEngine.evaluateAndShape(metaUnknown, attrUnknown.mac, isUpload = true, attributionSource = attrUnknown.source))
+
+        val report = TunTrafficEngine.getBpfAttributionReport()
+        assertEquals("ALLOW", report.unknownOwnerPacketPolicy)
+        assertEquals(1L, report.unknownForwardedPackets)
+
+        val summaryA = report.perClientVerifiedSummaries.first { it.mac == macA }
+        val summaryB = report.perClientVerifiedSummaries.first { it.mac == macB }
+        assertEquals(1L, summaryA.blockedDropPackets)
+        assertEquals(0L, summaryA.verifiedUploadPackets)
+        assertEquals(1L, summaryB.verifiedUploadPackets)
+        assertEquals(240L, summaryB.verifiedUploadBytes)
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `26 v0_10_5_debug schema v3 JSON and 8-section Markdown report export with zero PII leakage`() {
+        val sampleRecord = TupleDiagnosticSampleRecord(
+            schemaVersion = 3,
+            featureVersion = "0.10.5-debug",
+            sessionGeneration = 1L,
+            bindingGeneration = 1L,
+            snapshotSequence = 7L,
+            snapshotAgeMs = 180L,
+            flowHash = "ephemeral:a1b2c3d4e5f60123",
+            ipFamily = "IPV4",
+            protocol = "UDP",
+            direction = "UPLOAD",
+            directionConfidence = DirectionConfidence.KNOWN.name,
+            tupleRoleOrigin = TupleRoleOrigin.TUN_PACKET_POST_NAT.name,
+            missReason = UnattributedReason.TUPLE_NOT_PRESENT.name,
+            flowMissState = FlowMissState.PERSISTENT_AFTER_REFRESH.name,
+            snapshotsSurvived = 2,
+            packetsSeenOnFlow = 5L,
+            bytesSeenOnFlow = 6_000L,
+            firstSeenRelativeMs = 0L,
+            lastSeenRelativeMs = 1_200L,
+            ownerConfidence = OwnerConfidence.UNKNOWN_OWNER.name,
+            decision = "ALLOW",
+            enforcementGuarantee = "NONE_FOR_UNKNOWN_OWNER",
+        )
+        val report = BpfAttributionStatusReport(
+            experimentalEnabled = true,
+            state = ExperimentalBpfState.MAPPINGS_AVAILABLE,
+            collectionStatus = BpfCollectionStatus.OK,
+            snapshotHealth = BpfSnapshotHealth.OK,
+            totalEligiblePackets = 200L,
+            totalEligibleBytes = 250_000L,
+            totalAttributedPackets = 185L,
+            totalAttributedBytes = 230_000L,
+            bpfAttributedPackets = 165L,
+            bpfAttributedBytes = 210_000L,
+            directAttributedPackets = 20L,
+            directAttributedBytes = 20_000L,
+            unknownForwardedPackets = 15L,
+            unknownForwardedBytes = 20_000L,
+            bpfRefreshOnMissEnabled = true,
+            refreshOnMissTriggeredCount = 4L,
+            refreshOnMissCompletedCount = 4L,
+            refreshCircuitBreakerState = RefreshCircuitBreakerState.CLOSED.name,
+            missRefreshLatency = RefreshLatencyPercentiles(
+                sampleCount = 4,
+                p50Ms = 6L,
+                p95Ms = 11L,
+                p99Ms = 14L,
+                maxMs = 14L,
+            ),
+            postRefreshFlowKeysResolved = 3L,
+            postRefreshFirstSubsequentAttributedPackets = 3L,
+            postRefreshFirstSubsequentAttributedBytes = 3_600L,
+            deepTupleDiagnosticsEnabled = true,
+            deepTupleDiagnostics = DeepTupleDiagnosticsSnapshot(
+                activeTrackedFlowsCount = 2,
+                resolvedAfterRefreshFlowsCount = 3L,
+                persistentAfterRefreshFlowsCount = 1L,
+                notOffloadedOrNotObservableFlowsCount = 1L,
+                udp443MissingPacketsCount = 8L,
+                udp443MissingBytesCount = 9_600L,
+                sampleRecords = listOf(sampleRecord),
+            ),
+            perClientVerifiedSummaries = listOf(
+                PerClientVerifiedTrafficSummary(
+                    mac = "E2:15:CD:54:E4:9B",
+                    originalIpv4 = "192.168.167.151",
+                    activeFlows = 4,
+                    verifiedUploadPackets = 80L,
+                    verifiedUploadBytes = 90_000L,
+                    verifiedDownloadPackets = 85L,
+                    verifiedDownloadBytes = 140_000L,
+                    directIpPackets = 10L,
+                    bpfNatPackets = 155L,
+                    conntrackPackets = 0L,
+                    blockedDropPackets = 0L,
+                    blockedDropBytes = 0L,
+                ),
+            ),
+            phaseD = PhaseDStatusReport(
+                phaseDMode = PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT,
+                interfaceLifecycleState = PhaseDInterfaceLifecycleState.ATTRIBUTION_READY,
+                verifiedFlowsAtTransitionTotal = 3L,
+                staleAllowCacheHitsPreventedTotal = 2L,
+                decisionsRecomputedTotal = 12L,
+                verifiedDroppedAfterBlockPacketsTotal = 10L,
+                verifiedDroppedAfterBlockBytesTotal = 12_000L,
+                unknownForwardedAfterBlockPackets = 4L,
+                unknownForwardedAfterBlockBytes = 2_400L,
+                unknownPostBlockByProtocolAndDirection = mapOf("UDP_IPv4_UPLOAD" to 4L),
+                activePinnedVerifiedFlowsCount = 2,
+                establishedTcpPinnedMatchedPackets = 6L,
+                establishedTcpPinnedMatchedBytes = 7_200L,
+            ),
+        )
+
+        val md = report.toMarkdownReport(
+            apkVersion = "0.10.5-debug",
+            sourceCommit = "ab2e16dcef1590fe09358fc462cf3a3561439602+v0.10.5-debug",
+            serviceBuildId = 20,
+            includeSensitiveEndpoints = false,
+            includePseudonymousIds = false,
+        )
+        val jsonObj = report.toJson(
+            includeSensitiveEndpoints = false,
+            includePseudonymousIds = false,
+        )
+        val jsonStr = jsonObj.toString()
+
+        // Verify all mandatory sections in Markdown report + Phase D section 7 + v0.10.8 sections 10, 11 & 12
+        assertTrue(md.contains("## 1. Build & Session Metadata"))
+        assertTrue(md.contains("## 2. Global Attribution Summary"))
+        assertTrue(md.contains("## 3. Unattributed Traffic by Structured Reason"))
+        assertTrue(md.contains("## 4. Phase B: Refresh-on-Miss Telemetry"))
+        assertTrue(md.contains("## 5. Phase C: Deep Tuple & Survival Diagnostics"))
+        assertTrue(md.contains("## 6. Multi-Client Verified Traffic Summary"))
+        assertTrue(md.contains("## 7. Phase D: Persistent Connection Leak Investigation & Experimental Enforcement"))
+        assertTrue(md.contains("## 8. Snapshot & Parser Health"))
+        assertTrue(md.contains("## 9. Explicit Limitations & Enforcement Status"))
+        assertTrue(md.contains("## 10. Exclusive Blocking Mode & Legacy Pre-NAT Retirement (`v0.10.8-debug`, Schema v6)"))
+        assertTrue(md.contains("## 11. Native SoftAP MAC Blocklist Engine & Ownership Journal (`v0.10.8-debug`, Schema v6)"))
+        assertTrue(md.contains("## 12. Domain Blocking & Per-Host Attribution Enforcement (`v0.10.9-debug`, Schema v7)"))
+        assertTrue(md.contains("## 13. VPN Loss Recovery & Fail-Closed Lifecycle (`v0.10.9-debug`, Schema v7)"))
+        assertTrue(md.contains("PARTIAL_ENFORCEMENT"))
+
+        // Verify schemaVersion = 7 in JSON and roundtrip deserialization
+        assertEquals(7, jsonObj.getInt("schemaVersion"))
+        assertEquals("0.10.9-debug", jsonObj.getString("featureVersion"))
+        val roundTrip = BpfAttributionStatusReport.fromJson(jsonObj)
+        assertEquals(RefreshCircuitBreakerState.CLOSED.name, roundTrip.refreshCircuitBreakerState)
+        assertEquals(3L, roundTrip.postRefreshFlowKeysResolved)
+        assertEquals(8L, roundTrip.udp443MissingPacketsCount)
+        assertEquals(PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT, roundTrip.phaseDMode)
+        assertEquals(2L, roundTrip.staleAllowCacheHitsPrevented)
+        assertEquals(12L, roundTrip.decisionsRecomputed)
+        assertEquals(6L, roundTrip.pinnedVerifiedFlowHitsPackets)
+        assertEquals(4L, roundTrip.unknownPostBlockByProtocolAndDirection["UDP_IPv4_UPLOAD"])
+        assertEquals(BlockingMode.BPF_NAT_VPN, roundTrip.preNatDiagnostics.effectiveMode)
+        assertTrue(roundTrip.preNatDiagnostics.exclusiveEngineInvariant)
+        assertEquals(SoftApEngineState.PROBE_REQUIRED, roundTrip.softApDiagnostics.engineState)
+        assertEquals(7, roundTrip.domainDiagnostics.schemaVersion)
+        assertEquals(12, roundTrip.domainDiagnostics.d01ToD12Matrix.size)
+        assertEquals(12, roundTrip.vpnRecoveryDiagnostics.v01ToV12Matrix.size)
+
+        // Verify zero unredacted PII
+        assertFalse(DiagnosticRedactor.containsUnredactedPii(md))
+        assertFalse(DiagnosticRedactor.containsUnredactedPii(jsonStr))
+    }
+
+    @Test
+    fun `27 v0_10_5_debug Phase D DIAGNOSTIC vs EXPERIMENTAL_ENFORCEMENT mode comparison on quota exhaustion pacing queue and pinned verified flows`() {
+        val macA = "E2:15:CD:54:E4:9B"
+        val macB = "F2:FF:8B:3D:B2:A6"
+        val hosts = listOf(
+            DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "ap0"),
+            DiscoveredHost(mac = macB, ip = "192.168.167.17", allIps = listOf("192.168.167.17"), interfaceName = "ap0"),
+        )
+
+        // --- PART 1: Mid-stream quota-crossing boundary packet & pacing queue reconciliation ---
+        // Run identical sequence in DIAGNOSTIC mode vs EXPERIMENTAL_ENFORCEMENT mode
+        fun runMidStreamQuotaCrossingScenario(mode: PhaseDEnforcementMode): Pair<PacketDecision, Int> {
+            TunTrafficEngine.clearAll()
+            TunTrafficEngine.configurePhaseDMode(mode)
+            TunTrafficEngine.configureExperimentalBpf(enabled = true, pollIntervalMs = 1_000L, downstreamIface = "ap0", upstreamIface = "testtun46")
+
+            // Client A has 2,000-byte data quota and 500 Kbps bandwidth limit; already used 1,500 bytes
+            val nextResetGen = (TunTrafficEngine.getQuotaRecord(macA)?.resetGeneration ?: 0L) + 1L
+            val ruleA = ClientRule(
+                mac = macA,
+                isBlocked = false,
+                bandwidthLimitKbps = 500,
+                dataLimitBytes = 2_000L,
+                quotaResetPeriod = QuotaResetPeriod.DAILY,
+                quotaUsedRxBytes = 1_000L,
+                quotaUsedTxBytes = 500L,
+                quotaResetGeneration = nextResetGen,
+            )
+            TunTrafficEngine.syncQuotaRules(listOf(ruleA))
+            TunTrafficEngine.updatePolicies(
+                mapOf(
+                    macA to TunTrafficEngine.EnforcedClientPolicy(
+                        mac = macA,
+                        isBlocked = false,
+                        bandwidthLimitKbps = 500,
+                        dataLimitBytes = 2_000L,
+                        quotaResetPeriod = QuotaResetPeriod.DAILY,
+                    ),
+                ),
+                hosts,
+            )
+
+            // Enqueue a paced packet for Client A BEFORE quota is crossed
+            val dummyBuf = ByteArray(400)
+            val snapBefore = TunTrafficEngine.getCounterSnapshot(macA)
+            assertTrue(
+                TunTrafficEngine.enqueuePacedPacket(
+                    mac = macA,
+                    isUpload = false,
+                    buf = dummyBuf,
+                    length = dummyBuf.size,
+                    paceDelayMs = 50L,
+                    policyVersion = snapBefore.policyVersion,
+                    targetFd = null,
+                ),
+            )
+            assertEquals(1, TunTrafficEngine.getQueuedPacketCountForClient(macA))
+
+            // Send a 1,000-byte packet that crosses the 2,000-byte quota (1,500 + 1,000 = 2,500 >= 2,000)
+            val boundaryMeta = TunTrafficEngine.PacketMeta(
+                version = 4,
+                protocol = 6,
+                srcIp = "192.168.167.151",
+                dstIp = "108.158.147.26",
+                srcPort = 51006,
+                dstPort = 443,
+                length = 1_000,
+                isSmallControlPacket = false,
+            )
+            val attr = TunTrafficEngine.resolveClientMacWithSource(boundaryMeta, isUpload = true)
+            boundaryMeta.resolvedAttribution = attr
+            val eval = TunTrafficEngine.evaluateAndShapeDetailed(
+                boundaryMeta,
+                attr.mac,
+                isUpload = true,
+                attributionSource = attr.source,
+            )
+            val remainingQueued = TunTrafficEngine.getQueuedPacketCountForClient(macA)
+            return eval.decision to remainingQueued
+        }
+
+        val (diagDecision, diagRemainingQueue) = runMidStreamQuotaCrossingScenario(PhaseDEnforcementMode.DIAGNOSTIC)
+        // In DIAGNOSTIC mode (0.10.4-debug baseline), boundary packet passes and queued packet remains until drained
+        assertEquals(PacketDecision.ALLOW, diagDecision)
+        assertEquals(1, diagRemainingQueue)
+        val diagRep = TunTrafficEngine.getBpfAttributionReport()
+        assertEquals(1L, diagRep.verifiedAllowedAfterBlockPackets)
+
+        val (enfDecision, enfRemainingQueue) = runMidStreamQuotaCrossingScenario(PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT)
+        // In EXPERIMENTAL_ENFORCEMENT mode, boundary packet is immediately dropped and queued paced packets are purged
+        assertEquals(PacketDecision.DROP, enfDecision)
+        assertEquals(0, enfRemainingQueue)
+        val enfRep = TunTrafficEngine.getBpfAttributionReport()
+        assertTrue(enfRep.staleAllowCacheHitsPrevented >= 1L)
+        assertTrue(enfRep.decisionsRecomputed >= 1L)
+        assertTrue(enfRep.verifiedDroppedAfterBlockPackets >= 2L)
+
+        // --- PART 2: Long-lived TCP connection across stale BPF snapshot (pinned verified flow ownership) ---
+        val clock = AtomicLong(10_000L)
+        val originalClock = TunTrafficEngine.bpfAttributor.monotonicClockMs
+        val originalMaxFreshness = TunTrafficEngine.bpfAttributor.maxFreshnessMs
+        TunTrafficEngine.bpfAttributor.monotonicClockMs = { clock.get() }
+        TunTrafficEngine.bpfAttributor.maxFreshnessMs = 4_500L
+        try {
+            fun runLongLivedTcpAfterSnapshotExpiry(mode: PhaseDEnforcementMode): Pair<TunTrafficEngine.PacketAttribution, PacketDecision> {
+                TunTrafficEngine.clearAll()
+                clock.set(10_000L)
+                TunTrafficEngine.configurePhaseDMode(mode)
+                TunTrafficEngine.configureExperimentalBpf(enabled = true, pollIntervalMs = 1_000L, downstreamIface = "ap0", upstreamIface = "testtun46")
+                TunTrafficEngine.updatePolicies(
+                    mapOf(
+                        macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = false),
+                        macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+                    ),
+                    hosts,
+                )
+
+                val (verifiedBindings, verifiedMacs) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+                assertTrue(
+                    TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                        parsed = BpfDumpParser.parse(realDeviceExcerpt),
+                        collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                        collectionStatus = BpfCollectionStatus.OK,
+                        collectionDurationMs = 5L,
+                        ipToMac = verifiedBindings,
+                        activeConnectedMacs = verifiedMacs,
+                    ),
+                )
+
+                val longLivedTcpMeta = TunTrafficEngine.PacketMeta(
+                    version = 4,
+                    protocol = 6,
+                    srcIp = "192.0.2.2",
+                    dstIp = "108.158.147.26",
+                    srcPort = 51006,
+                    dstPort = 443,
+                    length = 520,
+                    isSmallControlPacket = false,
+                )
+                // First packet while snapshot is fresh -> attributed via BPF_NAT and pins verified flow
+                val freshAttr = TunTrafficEngine.resolveClientMacWithSource(longLivedTcpMeta, isUpload = true)
+                assertEquals(macA, freshAttr.mac)
+                assertEquals(AttributionSource.BPF_NAT, freshAttr.source)
+                longLivedTcpMeta.resolvedAttribution = freshAttr
+                assertEquals(
+                    PacketDecision.ALLOW,
+                    TunTrafficEngine.evaluateAndShapeDetailed(longLivedTcpMeta, freshAttr.mac, isUpload = true, attributionSource = freshAttr.source).decision,
+                )
+
+                // Now block Client A
+                TunTrafficEngine.updatePolicies(
+                    mapOf(
+                        macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true),
+                        macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+                    ),
+                    hosts,
+                )
+
+                // Advance clock past maxFreshnessMs (10_000 + 6_000 = 16_000 -> snapshot is STALE)
+                clock.set(16_000L)
+                val postExpiryMeta = longLivedTcpMeta.copy()
+                val postExpiryAttr = TunTrafficEngine.resolveClientMacWithSource(postExpiryMeta, isUpload = true)
+                postExpiryMeta.resolvedAttribution = postExpiryAttr
+                val postExpiryEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                    postExpiryMeta,
+                    postExpiryAttr.mac,
+                    isUpload = true,
+                    attributionSource = postExpiryAttr.source,
+                )
+                return postExpiryAttr to postExpiryEval.decision
+            }
+
+            val (diagAttr, diagDec) = runLongLivedTcpAfterSnapshotExpiry(PhaseDEnforcementMode.DIAGNOSTIC)
+            // In DIAGNOSTIC mode, stale snapshot falls back to UNKNOWN_OWNER -> ALLOW, but records pinnedFlowHitsInDiagnosticMode
+            assertNull(diagAttr.mac)
+            assertEquals(UnattributedReason.SNAPSHOT_STALE, diagAttr.unattributedReason)
+            assertEquals(PacketDecision.ALLOW, diagDec)
+            val diagSnapRep = TunTrafficEngine.getBpfAttributionReport()
+            assertEquals(1L, diagSnapRep.pinnedFlowHitsInDiagnosticMode)
+            assertEquals(1L, diagSnapRep.unknownForwardedAfterBlockPackets)
+
+            val (enfAttr, enfDec) = runLongLivedTcpAfterSnapshotExpiry(PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT)
+            // In EXPERIMENTAL_ENFORCEMENT mode, pinned verified flow retains ownership for Client A -> DROPPED!
+            assertEquals(macA, enfAttr.mac)
+            assertTrue(enfAttr.pinnedFlowHit)
+            assertEquals(PacketDecision.DROP, enfDec)
+            val enfSnapRep = TunTrafficEngine.getBpfAttributionReport()
+            assertEquals(1L, enfSnapRep.pinnedVerifiedFlowHitsPackets)
+            assertEquals(520L, enfSnapRep.pinnedVerifiedFlowHitsBytes)
+            assertEquals(1L, enfSnapRep.verifiedDroppedAfterBlockPackets)
+            assertEquals(0L, enfSnapRep.unknownForwardedAfterBlockPackets)
+        } finally {
+            TunTrafficEngine.bpfAttributor.monotonicClockMs = originalClock
+            TunTrafficEngine.bpfAttributor.maxFreshnessMs = originalMaxFreshness
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    @Test
+    fun `28 v0_10_5_debug Phase D verified flow pins invalidate on TCP SYN FIN RST client disconnect IP reassignment and session generation change`() {
+        val clock = AtomicLong(20_000L)
+        val originalClock = TunTrafficEngine.bpfAttributor.monotonicClockMs
+        val originalMaxFreshness = TunTrafficEngine.bpfAttributor.maxFreshnessMs
+        TunTrafficEngine.bpfAttributor.monotonicClockMs = { clock.get() }
+        TunTrafficEngine.bpfAttributor.maxFreshnessMs = 4_500L
+        try {
+            val macA = "E2:15:CD:54:E4:9B"
+            val macB = "F2:FF:8B:3D:B2:A6"
+            val hosts = listOf(
+                DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "ap0"),
+                DiscoveredHost(mac = macB, ip = "192.168.167.17", allIps = listOf("192.168.167.17"), interfaceName = "ap0"),
+            )
+            TunTrafficEngine.clearAll()
+            TunTrafficEngine.configurePhaseDMode(PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT)
+            TunTrafficEngine.configureExperimentalBpf(enabled = true, pollIntervalMs = 1_000L, downstreamIface = "ap0", upstreamIface = "testtun46")
+            TunTrafficEngine.updatePolicies(
+                mapOf(macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true)),
+                hosts,
+            )
+
+            val (verifiedBindings, verifiedMacs) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+            assertTrue(
+                TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                    parsed = BpfDumpParser.parse(realDeviceExcerpt),
+                    collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                    collectionStatus = BpfCollectionStatus.OK,
+                    collectionDurationMs = 5L,
+                    ipToMac = verifiedBindings,
+                    activeConnectedMacs = verifiedMacs,
+                ),
+            )
+            assertTrue(TunTrafficEngine.getBpfAttributionReport().activePinnedVerifiedFlowsCount >= 2)
+
+            // Advance clock so snapshot is stale -> pin still attributes normal TCP data packet
+            clock.set(26_000L)
+            val normalMeta = TunTrafficEngine.PacketMeta(
+                version = 4, protocol = 6, srcIp = "192.0.2.2", dstIp = "108.158.147.26",
+                srcPort = 51006, dstPort = 443, length = 400, isSmallControlPacket = false,
+            )
+            val pinnedAttr = TunTrafficEngine.resolveClientMacWithSource(normalMeta, isUpload = true)
+            assertEquals(macA, pinnedAttr.mac)
+            assertTrue(pinnedAttr.pinnedFlowHit)
+
+            // TCP FIN/RST invalidates the pin after attributing the closing packet
+            val finMeta = normalMeta.copy(isTcpFinOrRst = true)
+            val finAttr = TunTrafficEngine.resolveClientMacWithSource(finMeta, isUpload = true)
+            assertEquals(macA, finAttr.mac)
+            val afterFinAttr = TunTrafficEngine.resolveClientMacWithSource(normalMeta.copy(), isUpload = true)
+            assertNull("Expected pin for 51006 to be invalidated after TCP FIN/RST", afterFinAttr.mac)
+
+            // Client B flow (44056) is still pinned while Client B is connected, but if Client B disconnects, pin is invalidated
+            val metaB = TunTrafficEngine.PacketMeta(
+                version = 4, protocol = 6, srcIp = "192.0.2.2", dstIp = "142.250.219.14",
+                srcPort = 44056, dstPort = 443, length = 400, isSmallControlPacket = false,
+            )
+            assertEquals(macB, TunTrafficEngine.resolveClientMacWithSource(metaB, isUpload = true).mac)
+
+            // Disconnect Client B -> pin for Client B is purged and cannot match
+            TunTrafficEngine.updatePolicies(
+                mapOf(macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true)),
+                listOf(hosts[0]), // Only Client A remains connected
+            )
+            assertNull("Disconnected client pin must be purged immediately", TunTrafficEngine.resolveClientMacWithSource(metaB.copy(), isUpload = true).mac)
+        } finally {
+            TunTrafficEngine.bpfAttributor.monotonicClockMs = originalClock
+            TunTrafficEngine.bpfAttributor.maxFreshnessMs = originalMaxFreshness
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    @Test
+    fun `29 v0_10_5_debug Phase D UNKNOWN_OWNER remains ALLOW in both modes and tracks post-block protocol direction and delivery test markers`() {
+        TunTrafficEngine.clearAll()
+        val macA = "E2:15:CD:54:E4:9B"
+        val hostA = DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "ap0")
+
+        TunTrafficEngine.configurePhaseDMode(PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT)
+        TunTrafficEngine.recordDeliveryTestMarker("TEST_SESSION_START", macA, "Start WhatsApp block test")
+
+        // Block Client A
+        TunTrafficEngine.updatePolicies(
+            mapOf(macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true)),
+            listOf(hostA),
+        )
+
+        // Send unattributed UDP/443 (QUIC) and UDP/53 (DNS) post-NAT packets while Client A is blocked
+        val quicMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 17, srcIp = "192.0.2.2", dstIp = "157.240.22.53",
+            srcPort = 58111, dstPort = 443, length = 1200, isSmallControlPacket = false,
+        )
+        val dnsMeta = TunTrafficEngine.PacketMeta(
+            version = 4, protocol = 17, srcIp = "192.0.2.2", dstIp = "8.8.8.8",
+            srcPort = 58112, dstPort = 53, length = 90, isSmallControlPacket = true,
+        )
+
+        val quicAttr = TunTrafficEngine.resolveClientMacWithSource(quicMeta, isUpload = true)
+        assertNull(quicAttr.mac)
+        quicMeta.resolvedAttribution = quicAttr
+        assertEquals(
+            PacketDecision.ALLOW,
+            TunTrafficEngine.evaluateAndShapeDetailed(quicMeta, quicAttr.mac, isUpload = true, attributionSource = quicAttr.source).decision,
+        )
+
+        val dnsAttr = TunTrafficEngine.resolveClientMacWithSource(dnsMeta, isUpload = true)
+        assertNull(dnsAttr.mac)
+        dnsMeta.resolvedAttribution = dnsAttr
+        assertEquals(
+            PacketDecision.ALLOW,
+            TunTrafficEngine.evaluateAndShapeDetailed(dnsMeta, dnsAttr.mac, isUpload = true, attributionSource = dnsAttr.source).decision,
+        )
+
+        TunTrafficEngine.recordDeliveryTestMarker("TEST_SESSION_STOP", macA, "Stop WhatsApp block test")
+
+        val rep = TunTrafficEngine.getBpfAttributionReport()
+        assertEquals(2L, rep.unknownForwardedAfterBlockPackets)
+        assertEquals(1290L, rep.unknownForwardedAfterBlockBytes)
+        assertEquals(2L, rep.unknownPostBlockByProtocolAndDirection["UDP_IPv4_UPLOAD"])
+        assertEquals(1L, rep.unknownPostBlockByProtocolAndDirection["UDP/443"])
+        assertEquals(1L, rep.unknownPostBlockByProtocolAndDirection["UDP/53"])
+        assertTrue(rep.policyTransitionEvents.any { it.transitionType == "ALLOW_TO_BLOCK" })
+        assertTrue(rep.deliveryTestMarkers.any { it.markerType == "TEST_SESSION_START" })
+        assertTrue(rep.deliveryTestMarkers.any { it.markerType == "POLICY_ACTIVATED" })
+        assertTrue(rep.deliveryTestMarkers.any { it.markerType == "TEST_SESSION_STOP" })
+
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `30 v0_10_6_debug Pre-NAT capability state machine in rootless UID 2000 vs privileged CAP_NET_ADMIN zero read-only mutations and user-approved scoped probe`() {
+        val originalExecutor = ExclusiveBlockingModeController.preNatEngine.shellExecutor
+        try {
+            TunTrafficEngine.clearAll()
+            ExclusiveBlockingModeController.resetForTesting()
+
+            val macA = "E2:15:CD:54:E4:9B"
+            val hostA = DiscoveredHost(
+                mac = macA,
+                ip = "192.168.167.151",
+                allIps = listOf("192.168.167.151", "2804:38a:a08a:c641::55"),
+                interfaceName = "ap0",
+            )
+            TunTrafficEngine.updatePolicies(
+                mapOf(macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true)),
+                listOf(hostA),
+            )
+            TunTrafficEngine.configureExperimentalBpf(
+                enabled = true,
+                pollIntervalMs = 1_000L,
+                downstreamIface = "ap0",
+                upstreamIface = "testtun46",
+            )
+
+            // 1. Rootless UID 2000 shell executor (CapEff = 0, iptables denied)
+            val executedRootlessCmds = mutableListOf<String>()
+            val rootlessExecutor = object : PreNatShellExecutor {
+                override fun resolveUid(): Int = 2000
+                override fun resolveGid(): Int = 2000
+                override fun resolveShizukuUid(): Int = 2000
+                override fun resolveShizukuRunning(): Boolean = true
+                override fun resolveSeLinuxContext(): String = "u:r:shell:s0"
+                override fun resolveEffectiveCapabilitiesHex(): String = "0000000000000000"
+                override fun execute(vararg args: String, timeoutMs: Long): HostFirewall.CommandResult {
+                    val cmd = args.joinToString(" ")
+                    executedRootlessCmds.add(cmd)
+                    return when {
+                        cmd.startsWith("iptables") || cmd.startsWith("ip6tables") ->
+                            HostFirewall.CommandResult(
+                                command = cmd,
+                                exitCode = 3,
+                                stdout = "",
+                                stderr = "iptables v1.8.7 (legacy): can't initialize iptables table `filter': Permission denied (you must be root)",
+                                timedOut = false,
+                                errorKind = ProbeErrorKind.PERMISSION_DENIED,
+                            )
+                        cmd.startsWith("nft") ->
+                            HostFirewall.CommandResult(cmd, 0, "nftables v1.0.2", "", false, ProbeErrorKind.NONE)
+                        cmd.startsWith("tc") ->
+                            HostFirewall.CommandResult(cmd, 0, "tc utility, iproute2", "", false, ProbeErrorKind.NONE)
+                        cmd.startsWith("ip ") ->
+                            HostFirewall.CommandResult(cmd, 0, "0:\tfrom all lookup local", "", false, ProbeErrorKind.NONE)
+                        else ->
+                            HostFirewall.CommandResult(cmd, 0, "", "", false, ProbeErrorKind.NONE)
+                    }
+                }
+            }
+            ExclusiveBlockingModeController.resetForTesting(rootlessExecutor)
+
+            // DB01: Migrating legacy "PRE_NAT_FIREWALL" in rootless UID 2000 migrates to BPF_NAT_VPN cleanly
+            val (parsedMode, migratedFromLegacyPreNat) = BlockingMode.parseWithMigration("PRE_NAT_FIREWALL")
+            assertEquals(BlockingMode.BPF_NAT_VPN, parsedMode)
+            assertTrue(migratedFromLegacyPreNat)
+
+            val rootlessReport = ExclusiveBlockingModeController.migrateAndReconcilePersistedMode("PRE_NAT_FIREWALL")
+            assertEquals(BlockingMode.BPF_NAT_VPN, rootlessReport.requestedMode)
+            assertEquals(BlockingMode.BPF_NAT_VPN, rootlessReport.effectiveMode)
+            assertTrue(rootlessReport.legacyPreNatMigrated)
+            assertTrue(rootlessReport.legacyPreNatCleanupVerified)
+            assertTrue(rootlessReport.exclusiveEngineInvariant)
+            assertTrue(TunTrafficEngine.bpfNatVpnEnforcementEnabled)
+        } finally {
+            ExclusiveBlockingModeController.resetForTesting(originalExecutor)
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    @Test
+    fun `31 v0_10_8_debug ExclusiveBlockingModeController cleans up lingering legacy Pre-NAT chains and enters RECOVERY_REQUIRED on unverified cleanup`() {
+        val originalExecutor = ExclusiveBlockingModeController.preNatEngine.shellExecutor
+        try {
+            TunTrafficEngine.clearAll()
+            ExclusiveBlockingModeController.resetForTesting()
+
+            val activeChains = mutableSetOf("SHIZZI_PN4")
+            val activeJumps = mutableSetOf("SHIZZI_PN4")
+            var simulateStuckChainOnCleanup = false
+
+            val mockPrivilegedExecutor = object : PreNatShellExecutor {
+                override fun resolveUid(): Int = 0
+                override fun resolveGid(): Int = 0
+                override fun resolveShizukuUid(): Int = 0
+                override fun resolveShizukuRunning(): Boolean = true
+                override fun resolveSeLinuxContext(): String = "u:r:su:s0"
+                override fun resolveEffectiveCapabilitiesHex(): String = "0000003fffffffff"
+                override fun execute(vararg args: String, timeoutMs: Long): HostFirewall.CommandResult {
+                    val command = args.joinToString(" ")
+                    if (command.contains(" -X ")) {
+                        val chain = command.substringAfter(" -X ").trim()
+                        if (!simulateStuckChainOnCleanup) {
+                            activeChains.remove(chain)
+                        }
+                        return HostFirewall.CommandResult(command, if (simulateStuckChainOnCleanup) 1 else 0, "", "", false, ProbeErrorKind.NONE)
+                    }
+                    if (command.contains(" -D FORWARD ") && command.contains(" -j ")) {
+                        val chain = command.substringAfter(" -j ").trim()
+                        if (!simulateStuckChainOnCleanup) {
+                            activeJumps.remove(chain)
+                        }
+                        return HostFirewall.CommandResult(command, if (simulateStuckChainOnCleanup) 1 else 0, "", "", false, ProbeErrorKind.NONE)
+                    }
+                    if (command.contains(" -S ")) {
+                        val token = command.substringAfter(" -S ").trim()
+                        if (token == "FORWARD") {
+                            val fwdLines = buildString {
+                                append("-P FORWARD ACCEPT")
+                                for (jmp in activeJumps) {
+                                    append("\n-A FORWARD -j $jmp")
+                                }
+                            }
+                            return HostFirewall.CommandResult(command, 0, fwdLines, "", false, ProbeErrorKind.NONE)
+                        }
+                        val exists = activeChains.contains(token)
+                        return HostFirewall.CommandResult(
+                            command = command,
+                            exitCode = if (exists) 0 else 1,
+                            stdout = if (exists) "-N $token" else "",
+                            stderr = if (exists) "" else "No chain",
+                            timedOut = false,
+                            errorKind = if (exists) ProbeErrorKind.NONE else ProbeErrorKind.EXECUTION_FAILED,
+                        )
+                    }
+                    return HostFirewall.CommandResult(command, 0, "ok", "", false, ProbeErrorKind.NONE)
+                }
+            }
+            ExclusiveBlockingModeController.resetForTesting(mockPrivilegedExecutor)
+
+            // Seed a lingering legacy Pre-NAT chain in the journal and simulate stuck cleanup -> RECOVERY_REQUIRED (DB02)
+            ExclusiveBlockingModeController.preNatEngine.seedLegacyJournalForTests(chainV4 = "SHIZZI_PN4")
+            simulateStuckChainOnCleanup = true
+
+            val stuckReport = ExclusiveBlockingModeController.migrateAndReconcilePersistedMode("PRE_NAT_FIREWALL")
+            assertEquals(PreNatRuntimeState.RECOVERY_REQUIRED, stuckReport.runtimeState)
+            assertFalse(stuckReport.legacyPreNatCleanupVerified)
+            assertNull("effectiveModeOrNull must be null during RECOVERY_REQUIRED", ExclusiveBlockingModeController.effectiveModeOrNull)
+            assertFalse("BPF_NAT_VPN must NOT be re-enabled while legacy pre-NAT cleanup is unverified", TunTrafficEngine.bpfNatVpnEnforcementEnabled)
+            assertTrue(stuckReport.exclusiveEngineInvariant)
+
+            // Once stuck chain clears, restoreBpfNatVpnMode recovers cleanly
+            simulateStuckChainOnCleanup = false
+            val recoveredReport = ExclusiveBlockingModeController.restoreBpfNatVpnMode("Recover after legacy Pre-NAT cleanup fixed")
+            assertEquals(BlockingMode.BPF_NAT_VPN, recoveredReport.effectiveMode)
+            assertEquals(PreNatRuntimeState.CURRENT_ACTIVE, recoveredReport.runtimeState)
+            assertTrue(recoveredReport.legacyPreNatCleanupVerified)
+            assertTrue(TunTrafficEngine.bpfNatVpnEnforcementEnabled)
+            assertTrue(activeChains.isEmpty())
+        } finally {
+            ExclusiveBlockingModeController.resetForTesting(originalExecutor)
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    @Test
+    fun `32 v0_10_6_debug BPF_NAT_VPN host-blocking improvements ingest IPv4 downstream-only flows and bind IPv6 downstream client addresses`() {
+        TunTrafficEngine.clearAll()
+        val macA = "E2:15:CD:54:E4:9B" // Blocked client
+        val macB = "F2:FF:8B:3D:B2:A6" // Allowed client
+        val hosts = listOf(
+            DiscoveredHost(
+                mac = macA,
+                ip = "192.168.167.151",
+                allIps = listOf("192.168.167.151"),
+                interfaceName = "ap0",
+            ),
+            DiscoveredHost(
+                mac = macB,
+                ip = "192.168.167.17",
+                allIps = listOf("192.168.167.17"),
+                interfaceName = "ap0",
+            ),
+        )
+        TunTrafficEngine.configurePhaseDMode(PhaseDEnforcementMode.EXPERIMENTAL_ENFORCEMENT)
+        TunTrafficEngine.configureExperimentalBpf(
+            enabled = true,
+            pollIntervalMs = 1_000L,
+            downstreamIface = "ap0",
+            upstreamIface = "testtun46",
+        )
+        TunTrafficEngine.updatePolicies(
+            mapOf(
+                macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true),
+                macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+            ),
+            hosts,
+        )
+
+        // Verify EXPERIMENTAL_ENFORCEMENT auto-enables fast bpfRefreshOnMiss (150ms cooldown)
+        assertTrue(TunTrafficEngine.bpfRefreshOnMissEnabled)
+        assertEquals(150L, TunTrafficEngine.bpfReader.refreshOnMissCooldownMs)
+
+        // Dump containing:
+        // 1) An IPv4 Downstream-only flow (e.g., server-pushed WhatsApp notification socket on port 52222)
+        // 2) An IPv6 Downstream entry for a new RFC 4941 privacy IPv6 address (2804:38a:a08a:c641:9999:8888:7777:6666)
+        val downstreamAndIpv6Dump = """
+            Tethering:
+              BPF offload:
+                IPv4 Upstream:
+                  269 (testtun46) -> 269 (testtun46)
+                  270 (ap0) -> 270 (ap0)
+                IPv4 Downstream:
+                  269 (testtun46) -> 269 (testtun46)
+                  270 (ap0) -> 270 (ap0)
+                  tcp [00:00:00:00:00:00] 269(testtun46) 157.240.22.53:443 -> 270(ap0) 192.0.2.2:52222 -> 192.168.167.151:52222 [e2:15:cd:54:e4:9b] 1500 45ms
+                IPv6 Downstream:
+                  269(testtun46) 270(ap0) 2804:38a:a08a:c641:9999:8888:7777:6666 [00:00:00:00:00:00] [e2:15:cd:54:e4:9b] 1500
+        """.trimIndent()
+
+        val parsed = BpfDumpParser.parse(downstreamAndIpv6Dump)
+        assertEquals(0, parsed.ipv4UpstreamEntries.size)
+        assertEquals(1, parsed.ipv4DownstreamEntries.size)
+        assertEquals(1, parsed.ipv6Entries.size)
+
+        val (verifiedBindings, verifiedMacs) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+        assertTrue(
+            TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                parsed = parsed,
+                collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                collectionStatus = BpfCollectionStatus.OK,
+                collectionDurationMs = 4L,
+                ipToMac = verifiedBindings,
+                activeConnectedMacs = verifiedMacs,
+            ),
+        )
+
+        // 1. Verify IPv4 Downstream-only flow for blocked Client A is attributed and DROPPED
+        val serverPushMeta = TunTrafficEngine.PacketMeta(
+            version = 4,
+            protocol = 6,
+            srcIp = "157.240.22.53",
+            dstIp = "192.0.2.2",
+            srcPort = 443,
+            dstPort = 52222,
+            length = 640,
+            isSmallControlPacket = false,
+        )
+        val pushAttr = TunTrafficEngine.resolveClientMacWithSource(serverPushMeta, isUpload = false)
+        assertEquals(macA, pushAttr.mac)
+        assertEquals(AttributionSource.BPF_NAT, pushAttr.source)
+        serverPushMeta.resolvedAttribution = pushAttr
+        assertEquals(
+            PacketDecision.DROP,
+            TunTrafficEngine.evaluateAndShapeDetailed(serverPushMeta, pushAttr.mac, isUpload = false, attributionSource = pushAttr.source).decision,
+        )
+
+        // 2. Verify IPv6 Downstream entry bound the new privacy IPv6 address to Client A and drops its packets via DIRECT_IP
+        val privacyIpv6Meta = TunTrafficEngine.PacketMeta(
+            version = 6,
+            protocol = 17,
+            srcIp = "2804:38a:a08a:c641:9999:8888:7777:6666",
+            dstIp = "2606:4700:4700::1111",
+            srcPort = 53111,
+            dstPort = 443,
+            length = 900,
+            isSmallControlPacket = false,
+        )
+        val v6Attr = TunTrafficEngine.resolveClientMacWithSource(privacyIpv6Meta, isUpload = true)
+        assertEquals(macA, v6Attr.mac)
+        assertEquals(AttributionSource.DIRECT_IP, v6Attr.source)
+        privacyIpv6Meta.resolvedAttribution = v6Attr
+        assertEquals(
+            PacketDecision.DROP,
+            TunTrafficEngine.evaluateAndShapeDetailed(privacyIpv6Meta, v6Attr.mac, isUpload = true, attributionSource = v6Attr.source).decision,
+        )
+
+        TunTrafficEngine.clearAll()
+    }
+
+    @Test
+    fun `33 v0_10_7_debug Shizuku offline and unpermitted states report NOT_TESTED_SHIZUKU_UNAVAILABLE and SHIZUKU_NOT_RUNNING with UNKNOWN identity without fabricating UID 2000`() {
+        val originalExecutor = ExclusiveBlockingModeController.preNatEngine.shellExecutor
+        val originalAdapter = ExclusiveBlockingModeController.softApEngine.platformAdapter
+        try {
+            // 1. Shizuku offline PreNatShellExecutor (simulates DefaultPreNatShellExecutor when Shizuku is not running)
+            val shizukuOfflineExecutor = object : PreNatShellExecutor {
+                override fun resolveUid(): Int = -1
+                override fun resolveGid(): Int = -1
+                override fun resolveShizukuUid(): Int = -1
+                override fun resolveShizukuRunning(): Boolean = false
+                override fun resolveShizukuPermissionGranted(): Boolean = false
+                override fun resolveSeLinuxContext(): String = "UNKNOWN"
+                override fun resolveEffectiveCapabilitiesHex(): String = "UNKNOWN"
+                override fun execute(vararg args: String, timeoutMs: Long): HostFirewall.CommandResult =
+                    HostFirewall.CommandResult(args.joinToString(" "), -1, "", "Shizuku not running", false, ProbeErrorKind.EXECUTION_FAILED)
+            }
+            val shizukuOfflineAdapter = object : SoftApPlatformAdapter {
+                override fun inspectExecutionIdentity(): SoftApExecutionIdentity = SoftApExecutionIdentity(
+                    shizukuState = "SHIZUKU_NOT_RUNNING",
+                    shizukuRunning = false,
+                    shizukuPermissionGranted = false,
+                    uid = "UNKNOWN",
+                    gid = "UNKNOWN",
+                    selinuxContext = "UNKNOWN",
+                    capEff = "UNKNOWN",
+                    provenance = "SHIZUKU_BINDER_DEAD",
+                )
+                override fun isHotspotActive(): Boolean = false
+                override fun resolveTetherInterface(): String = "wlan1"
+                override fun querySoftApCapability(): SoftApPlatformCapabilitySnapshot = SoftApPlatformCapabilitySnapshot(
+                    callbackRegistered = false,
+                    capabilityReceived = false,
+                    forceDisconnectSupported = false,
+                )
+                override fun readSoftApConfiguration(): SoftApConfigSnapshot = SoftApConfigSnapshot(readable = false)
+                override fun writeBlockedClientList(updatedBlockedMacs: List<String>): SoftApWriteOutcome =
+                    SoftApWriteOutcome(invoked = false, returnedTrue = false, readbackSnapshot = SoftApConfigSnapshot(readable = false))
+                override fun queryConnectedClientMacs(): List<String> = emptyList()
+            }
+            ExclusiveBlockingModeController.resetForTesting(shizukuOfflineExecutor, shizukuOfflineAdapter)
+
+            val preNatOffline = ExclusiveBlockingModeController.checkCapabilityReadOnly()
+            assertEquals(PreNatCapabilityStatus.NOT_TESTED_SHIZUKU_UNAVAILABLE, preNatOffline.capability.capabilityStatus)
+            assertEquals(-1, preNatOffline.capability.uid)
+            assertEquals(-1, preNatOffline.capability.gid)
+            assertEquals("UNKNOWN", preNatOffline.capability.shizukuPrivilegeMode)
+            assertEquals("UNKNOWN", preNatOffline.capability.selinuxContext)
+            assertEquals("UNKNOWN", preNatOffline.capability.capEffHex)
+            assertTrue("Must not run any shell commands when Shizuku is offline", preNatOffline.capability.auditedCommands.isEmpty())
+
+            val softApOffline = ExclusiveBlockingModeController.checkSoftApCapability()
+            assertEquals(SoftApEngineState.SHIZUKU_NOT_RUNNING, softApOffline.engineState)
+            assertEquals("SHIZUKU_NOT_RUNNING", softApOffline.shizukuState)
+            assertEquals("UNKNOWN", softApOffline.executionIdentity.uid)
+            assertEquals("UNKNOWN", softApOffline.executionIdentity.gid)
+            assertEquals("UNKNOWN", softApOffline.executionIdentity.selinuxContext)
+            assertEquals("UNKNOWN", softApOffline.executionIdentity.capEffHex)
+            assertEquals("SHIZUKU_BINDER_DEAD", softApOffline.executionIdentity.provenance)
+
+            // 2. Shizuku running, but permission not granted -> SHIZUKU_PERMISSION_REQUIRED
+            val shizukuUnpermittedAdapter = object : SoftApPlatformAdapter by shizukuOfflineAdapter {
+                override fun inspectExecutionIdentity(): SoftApExecutionIdentity = SoftApExecutionIdentity(
+                    shizukuState = "SHIZUKU_PERMISSION_REQUIRED",
+                    shizukuRunning = true,
+                    shizukuPermissionGranted = false,
+                    uid = "UNKNOWN",
+                    gid = "UNKNOWN",
+                    selinuxContext = "UNKNOWN",
+                    capEff = "UNKNOWN",
+                    provenance = "SHIZUKU_PERMISSION_NOT_GRANTED",
+                )
+            }
+            ExclusiveBlockingModeController.resetForTesting(shizukuOfflineExecutor, shizukuUnpermittedAdapter)
+            val softApUnpermitted = ExclusiveBlockingModeController.checkSoftApCapability()
+            assertEquals(SoftApEngineState.SHIZUKU_PERMISSION_REQUIRED, softApUnpermitted.engineState)
+            assertEquals("SHIZUKU_PERMISSION_REQUIRED", softApUnpermitted.shizukuState)
+        } finally {
+            ExclusiveBlockingModeController.resetForTesting(originalExecutor, originalAdapter)
+        }
+    }
+
+    @Test
+    fun `34 v0_10_7_debug SoftApPolicyReducer enforces multi-reason OR semantics and strict unicast MAC validation`() {
+        val mac = "E2:15:CD:54:E4:9B"
+
+        // 1. Validate unicast MAC address rules (SA19)
+        assertTrue(SoftApPolicyReducer.isValidUnicastMac(mac))
+        assertFalse("Broadcast MAC must be rejected", SoftApPolicyReducer.isValidUnicastMac("FF:FF:FF:FF:FF:FF"))
+        assertFalse("Zero MAC must be rejected", SoftApPolicyReducer.isValidUnicastMac("00:00:00:00:00:00"))
+        assertFalse("Multicast MAC (least-significant bit of first octet = 1) must be rejected", SoftApPolicyReducer.isValidUnicastMac("01:00:5E:00:00:01"))
+        assertFalse("Locally administered multicast MAC must be rejected", SoftApPolicyReducer.isValidUnicastMac("03:15:CD:54:E4:9B"))
+
+        // 2. Multi-reason OR semantics (SA10, SA11, SA12, AC09):
+        // Apply both MANUAL_BLOCK (via rule.isBlocked = true) and QUOTA_EXHAUSTED (via extraReasons / quota exceeded)
+        val bothReasons = SoftApPolicyReducer.evaluateRuleReasons(
+            rule = ClientRule(mac = mac, isBlocked = true),
+            extraReasons = setOf(SoftApClientBlockReason.QUOTA_EXHAUSTED),
+        )
+        assertEquals(
+            setOf(SoftApClientBlockReason.MANUAL_BLOCK, SoftApClientBlockReason.QUOTA_EXHAUSTED),
+            bothReasons,
+        )
+        assertTrue(SoftApPolicyReducer.shouldBlock(bothReasons))
+
+        // Resetting quota removes QUOTA_EXHAUSTED, but MANUAL_BLOCK keeps client blocked!
+        val afterQuotaReset = SoftApPolicyReducer.evaluateRuleReasons(
+            rule = ClientRule(mac = mac, isBlocked = true),
+            extraReasons = emptySet(),
+        )
+        assertEquals(setOf(SoftApClientBlockReason.MANUAL_BLOCK), afterQuotaReset)
+        assertTrue("Client must remain blocked while MANUAL_BLOCK is still active", SoftApPolicyReducer.shouldBlock(afterQuotaReset))
+
+        // Unblocking MANUAL_BLOCK while QUOTA_EXHAUSTED is active -> QUOTA_EXHAUSTED keeps client blocked!
+        val afterManualUnblock = SoftApPolicyReducer.evaluateRuleReasons(
+            rule = ClientRule(mac = mac, isBlocked = false),
+            extraReasons = setOf(SoftApClientBlockReason.QUOTA_EXHAUSTED),
+        )
+        assertEquals(setOf(SoftApClientBlockReason.QUOTA_EXHAUSTED), afterManualUnblock)
+        assertTrue("Client must remain blocked while QUOTA_EXHAUSTED is still active", SoftApPolicyReducer.shouldBlock(afterManualUnblock))
+
+        // Clearing the final active reason unblocks the client
+        val allCleared = SoftApPolicyReducer.evaluateRuleReasons(
+            rule = ClientRule(mac = mac, isBlocked = false),
+            extraReasons = emptySet(),
+        )
+        assertTrue(allCleared.isEmpty())
+        assertFalse("Client must transition to unblocked once all reasons are cleared", SoftApPolicyReducer.shouldBlock(allCleared))
+    }
+
+    @Test
+    fun `35 v0_10_7_debug SoftApMacBlockEngine and SoftApOwnershipJournal preserve priorBlockedMacs detect allowlist conflicts run 2-client live probe and handle crash recovery`() {
+        val tempJournalFile = java.io.File.createTempFile("shizzyluna-softap-journal-test", ".json")
+        val originalExecutor = ExclusiveBlockingModeController.preNatEngine.shellExecutor
+        val originalAdapter = ExclusiveBlockingModeController.softApEngine.platformAdapter
+        try {
+            val priorUserMac = "AA:AA:AA:AA:AA:01"
+            val allowlistedMac = "CC:CC:CC:CC:CC:03"
+            val clientAMac = "E2:15:CD:54:E4:9B"
+            val clientBMac = "F2:FF:8B:3D:B2:A6"
+
+            val currentBlockedList = mutableListOf(priorUserMac)
+            val currentAllowedList = mutableListOf(allowlistedMac)
+            val connectedHotspotMacs = mutableSetOf(clientAMac, clientBMac)
+            var shizukuAlive = true
+            var disconnectClientAOnBlock = true
+            var disconnectClientBCollateral = false
+            var setConfigSucceeds = true
+
+            val mockAdapter = object : SoftApPlatformAdapter {
+                override fun inspectExecutionIdentity(): SoftApExecutionIdentity =
+                    if (shizukuAlive) {
+                        SoftApExecutionIdentity(
+                            shizukuState = "SHIZUKU_RUNNING",
+                            shizukuRunning = true,
+                            shizukuPermissionGranted = true,
+                            uid = "2000",
+                            gid = "2000",
+                            selinuxContext = "u:r:shell:s0",
+                            capEff = "0000000000000000",
+                            provenance = "LIVE_SHIZUKU_USERSERVICE_PROCESS",
+                        )
+                    } else {
+                        SoftApExecutionIdentity(
+                            shizukuState = "SHIZUKU_NOT_RUNNING",
+                            shizukuRunning = false,
+                            shizukuPermissionGranted = false,
+                            uid = "UNKNOWN",
+                            gid = "UNKNOWN",
+                            selinuxContext = "UNKNOWN",
+                            capEff = "UNKNOWN",
+                            provenance = "SHIZUKU_BINDER_DEAD",
+                        )
+                    }
+
+                override fun isHotspotActive(): Boolean = shizukuAlive
+                override fun resolveTetherInterface(): String = "ap0"
+                override fun querySoftApCapability(): SoftApPlatformCapabilitySnapshot = SoftApPlatformCapabilitySnapshot(
+                    callbackRegistered = true,
+                    capabilityReceived = true,
+                    forceDisconnectSupported = true,
+                )
+
+                override fun readSoftApConfiguration(): SoftApConfigSnapshot {
+                    if (!shizukuAlive) return SoftApConfigSnapshot(readable = false, errorDetail = "Shizuku dead")
+                    val blockedSorted = currentBlockedList.map { it.uppercase() }.distinct()
+                    val allowedSorted = currentAllowedList.map { it.uppercase() }.distinct()
+                    return SoftApConfigSnapshot(
+                        readable = true,
+                        ssidPresent = true,
+                        ssidLength = 10,
+                        securityType = 1,
+                        bandsSummary = "1,2",
+                        maxNumberOfClients = 10,
+                        clientControlByUserEnabled = true,
+                        blockedClientMacs = blockedSorted,
+                        allowedClientMacs = allowedSorted,
+                        configFingerprint = "fp1234567890",
+                    )
+                }
+
+                override fun writeBlockedClientList(updatedBlockedMacs: List<String>): SoftApWriteOutcome {
+                    if (!shizukuAlive || !setConfigSucceeds) {
+                        return SoftApWriteOutcome(
+                            invoked = false,
+                            returnedTrue = false,
+                            readbackSnapshot = readSoftApConfiguration(),
+                            errorDetail = "Write rejected",
+                        )
+                    }
+                    currentBlockedList.clear()
+                    currentBlockedList.addAll(updatedBlockedMacs.map { it.uppercase() }.distinct())
+                    if (disconnectClientAOnBlock && clientAMac in currentBlockedList) {
+                        connectedHotspotMacs.remove(clientAMac)
+                    } else if (clientAMac !in currentBlockedList) {
+                        connectedHotspotMacs.add(clientAMac)
+                    }
+                    if (disconnectClientBCollateral && clientAMac in currentBlockedList) {
+                        connectedHotspotMacs.remove(clientBMac)
+                    }
+                    return SoftApWriteOutcome(
+                        invoked = true,
+                        returnedTrue = true,
+                        readbackSnapshot = readSoftApConfiguration(),
+                    )
+                }
+
+                override fun queryConnectedClientMacs(): List<String> = connectedHotspotMacs.toList()
+            }
+
+            val journal = SoftApOwnershipJournal(journalFile = tempJournalFile)
+            val engine = SoftApMacBlockEngine(
+                platformAdapter = mockAdapter,
+                journal = journal,
+            )
+
+            // 1. Read-only capability inspection -> PROBE_REQUIRED, captures priorUserMac
+            val cap = engine.inspectCapability()
+            assertEquals(SoftApEngineState.PROBE_REQUIRED, engine.currentState())
+            assertTrue(cap.getSoftApConfigSupported)
+            assertTrue(cap.setSoftApConfigSupported)
+            assertEquals(listOf(priorUserMac), journal.currentSnapshot().priorBlockedMacs)
+
+            // 2. Unconfirmed live probe must not mutate
+            val unconfirmed = engine.runControlledLiveProbe(clientAMac, clientBMac, userConfirmed = false)
+            assertFalse(unconfirmed.probePassed)
+            assertEquals(SoftApEngineState.PROBE_REQUIRED, unconfirmed.resultingState)
+
+            // 3. Live probe where Client A fails to disconnect within timeout -> LIVE_UPDATE_UNSUPPORTED & restores config
+            disconnectClientAOnBlock = false
+            val noLiveDisconnect = engine.runControlledLiveProbe(
+                clientAMac = clientAMac,
+                clientBMac = clientBMac,
+                userConfirmed = true,
+                disconnectTimeoutMs = 300L,
+                pollIntervalMs = 50L,
+            )
+            assertEquals(SoftApEngineState.LIVE_UPDATE_UNSUPPORTED, engine.currentState())
+            assertFalse(noLiveDisconnect.clientADisconnected)
+            assertTrue(noLiveDisconnect.restoredVerified)
+            assertEquals(listOf(priorUserMac), currentBlockedList.toList())
+            disconnectClientAOnBlock = true
+
+            // 4. Live probe where Client B also disconnects (collateral hotspot restart) -> fails probe
+            disconnectClientBCollateral = true
+            connectedHotspotMacs.add(clientAMac)
+            connectedHotspotMacs.add(clientBMac)
+            val collateralFail = engine.runControlledLiveProbe(
+                clientAMac = clientAMac,
+                clientBMac = clientBMac,
+                userConfirmed = true,
+                disconnectTimeoutMs = 300L,
+                pollIntervalMs = 50L,
+            )
+            assertFalse(collateralFail.probePassed)
+            assertFalse(collateralFail.clientBRemainedConnected)
+            assertTrue(collateralFail.restoredVerified)
+            disconnectClientBCollateral = false
+            connectedHotspotMacs.add(clientAMac)
+            connectedHotspotMacs.add(clientBMac)
+
+            // 5. Successful 2-client live probe -> transitions to READY and preserves priorBlockedMacs
+            val probePass = engine.runControlledLiveProbe(
+                clientAMac = clientAMac,
+                clientBMac = clientBMac,
+                userConfirmed = true,
+                disconnectTimeoutMs = 600L,
+                pollIntervalMs = 40L,
+            )
+            assertTrue(probePass.probePassed)
+            assertEquals("READY", probePass.verdict)
+            assertEquals(SoftApEngineState.READY, engine.currentState())
+            assertTrue(probePass.clientADisconnected)
+            assertTrue(probePass.clientBRemainedConnected)
+            assertTrue(probePass.restoredVerified)
+            assertEquals(listOf(priorUserMac), currentBlockedList.toList())
+
+            // 6. Activate mode and enforce rules:
+            // - clientAMac is manually blocked -> BLOCK_CONFIRMED, added to SoftAP blocked list alongside priorUserMac
+            // - allowlistedMac is manually blocked -> CONFLICT_ALLOWLIST, never added to SoftAP blocked list
+            connectedHotspotMacs.add(clientAMac)
+            val (activated, _) = engine.activateEngine(
+                rules = listOf(
+                    ClientRule(mac = clientAMac, isBlocked = true),
+                    ClientRule(mac = allowlistedMac, isBlocked = true),
+                ),
+            )
+            assertTrue(activated)
+            assertEquals(SoftApEngineState.ACTIVE, engine.currentState())
+            assertEquals(setOf(priorUserMac, clientAMac), currentBlockedList.toSet())
+            assertEquals(listOf(priorUserMac), journal.currentSnapshot().priorBlockedMacs)
+            assertEquals(listOf(clientAMac), journal.currentSnapshot().appOwnedMacs)
+
+            val recordsByMac = engine.getClientRecords().associateBy { it.mac }
+            assertEquals(SoftApAppliedState.BLOCK_CONFIRMED, recordsByMac[clientAMac]?.appliedState)
+            assertEquals(SoftApAppliedState.CONFLICT_ALLOWLIST, recordsByMac[allowlistedMac]?.appliedState)
+
+            // 7. Simulate Shizuku dying before teardown -> ROLLBACK_REQUIRED
+            shizukuAlive = false
+            val (deactivatedWhileDead, _) = engine.deactivateAndRollbackAllAppOwnedBlocks()
+            assertFalse(deactivatedWhileDead)
+            assertEquals(SoftApEngineState.ROLLBACK_REQUIRED, engine.currentState())
+            assertTrue(journal.currentSnapshot().rollbackRequired)
+
+            // When Shizuku comes back, deactivateAndRollbackAllAppOwnedBlocks succeeds and restores only priorUserMac
+            shizukuAlive = true
+            val (recovered, _) = engine.deactivateAndRollbackAllAppOwnedBlocks()
+            assertTrue(recovered)
+            assertEquals(SoftApEngineState.READY, engine.currentState())
+            assertFalse(journal.currentSnapshot().rollbackRequired)
+            assertEquals(listOf(priorUserMac), currentBlockedList.toList())
+        } finally {
+            tempJournalFile.delete()
+            ExclusiveBlockingModeController.resetForTesting(originalExecutor, originalAdapter)
+        }
+    }
+
+    @Test
+    fun `36 v0_10_7_debug ExclusiveBlockingModeController coordinates all 3 engines with exclusiveEngineInvariant and enforces SoftAP quota exhaustion without duplicate TUN drops`() {
+        val originalExecutor = ExclusiveBlockingModeController.preNatEngine.shellExecutor
+        val originalAdapter = ExclusiveBlockingModeController.softApEngine.platformAdapter
+        try {
+            TunTrafficEngine.clearAll()
+            val clientAMac = "E2:15:CD:54:E4:9B"
+            val clientBMac = "F2:FF:8B:3D:B2:A6"
+            val currentBlockedList = mutableListOf<String>()
+            val connectedHotspotMacs = mutableSetOf(clientAMac, clientBMac)
+
+            val mockAdapter = object : SoftApPlatformAdapter {
+                override fun inspectExecutionIdentity(): SoftApExecutionIdentity = SoftApExecutionIdentity(
+                    shizukuState = "SHIZUKU_RUNNING",
+                    shizukuRunning = true,
+                    shizukuPermissionGranted = true,
+                    uid = "2000",
+                    gid = "2000",
+                    selinuxContext = "u:r:shell:s0",
+                    capEff = "0000000000000000",
+                    provenance = "LIVE_SHIZUKU_USERSERVICE_PROCESS",
+                )
+                override fun isHotspotActive(): Boolean = true
+                override fun resolveTetherInterface(): String = "ap0"
+                override fun querySoftApCapability(): SoftApPlatformCapabilitySnapshot = SoftApPlatformCapabilitySnapshot(
+                    callbackRegistered = true,
+                    capabilityReceived = true,
+                    forceDisconnectSupported = true,
+                )
+                override fun readSoftApConfiguration(): SoftApConfigSnapshot = SoftApConfigSnapshot(
+                    readable = true,
+                    clientControlByUserEnabled = true,
+                    blockedClientMacs = currentBlockedList.toList(),
+                    allowedClientMacs = emptyList(),
+                    configFingerprint = "abc1234567890def",
+                )
+                override fun writeBlockedClientList(updatedBlockedMacs: List<String>): SoftApWriteOutcome {
+                    currentBlockedList.clear()
+                    currentBlockedList.addAll(updatedBlockedMacs.map { it.uppercase() }.distinct())
+                    if (clientAMac in currentBlockedList) connectedHotspotMacs.remove(clientAMac) else connectedHotspotMacs.add(clientAMac)
+                    return SoftApWriteOutcome(
+                        invoked = true,
+                        returnedTrue = true,
+                        readbackSnapshot = readSoftApConfiguration(),
+                    )
+                }
+                override fun queryConnectedClientMacs(): List<String> = connectedHotspotMacs.toList()
+            }
+
+            ExclusiveBlockingModeController.resetForTesting(originalExecutor, mockAdapter)
+            ExclusiveBlockingModeController.checkSoftApCapability()
+            val probeRep = ExclusiveBlockingModeController.runSoftApLiveProbe(
+                clientAMac = clientAMac,
+                clientBMac = clientBMac,
+                userConfirmed = true,
+                disconnectTimeoutMs = 600L,
+                pollIntervalMs = 40L,
+            )
+            assertEquals(SoftApEngineState.READY, probeRep.engineState)
+            connectedHotspotMacs.add(clientAMac)
+
+            // Configure Client A with a 1,000-byte quota and 500 Kbps bandwidth limit (not manually blocked yet)
+            val hostA = DiscoveredHost(mac = clientAMac, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "ap0")
+            val ruleA = ClientRule(
+                mac = clientAMac,
+                isBlocked = false,
+                bandwidthLimitKbps = 500,
+                dataLimitBytes = 1_000L,
+                quotaResetPeriod = QuotaResetPeriod.DAILY,
+            )
+            TunTrafficEngine.syncQuotaRules(listOf(ruleA))
+
+            // Activate SOFTAP_MAC_BLOCK mode
+            val softApRep = ExclusiveBlockingModeController.activateSoftApBlockingMode(rules = listOf(ruleA), discoveredHosts = listOf(hostA))
+            assertEquals(BlockingMode.SOFTAP_MAC_BLOCK, ExclusiveBlockingModeController.effectiveModeOrNull)
+            assertEquals(SoftApEngineState.ACTIVE, softApRep.engineState)
+            assertTrue(softApRep.exclusiveEngineInvariant)
+            assertFalse("TUN packet drop/throttle enforcement must be disabled when SOFTAP_MAC_BLOCK is active", TunTrafficEngine.bpfNatVpnEnforcementEnabled)
+
+            // HostFirewall.enforce in SOFTAP_MAC_BLOCK mode must keep TunTrafficEngine.bpfNatVpnEnforcementEnabled == false
+            HostFirewall.enforce(rules = listOf(ruleA), connectedHosts = listOf(hostA), logSummary = false)
+            assertFalse(TunTrafficEngine.bpfNatVpnEnforcementEnabled)
+            assertTrue(currentBlockedList.isEmpty())
+
+            // Send a 1,200-byte packet from Client A through TunTrafficEngine:
+            // Because bpfNatVpnEnforcementEnabled == false, TUN does NOT drop or throttle the packet,
+            // BUT recordQuotaBytes accounts the 1,200 bytes, crosses the 1,000-byte quota, and triggers SoftAP MAC block!
+            val pktMeta = TunTrafficEngine.PacketMeta(
+                version = 4,
+                protocol = 6,
+                srcIp = "192.168.167.151",
+                dstIp = "1.1.1.1",
+                srcPort = 55000,
+                dstPort = 443,
+                length = 1_200,
+                isSmallControlPacket = false,
+            )
+            val attr = TunTrafficEngine.resolveClientMacWithSource(pktMeta, isUpload = true)
+            pktMeta.resolvedAttribution = attr
+            val eval = TunTrafficEngine.evaluateAndShapeDetailed(pktMeta, attr.mac, isUpload = true, attributionSource = attr.source)
+            assertEquals("TUN engine must not drop packets while SOFTAP_MAC_BLOCK is the active enforcement engine", PacketDecision.ALLOW, eval.decision)
+            assertTrue("Crossing data quota must automatically add Client A to SoftAP MAC blocklist", clientAMac in currentBlockedList)
+
+            // Resetting Client A's quota removes QUOTA_EXHAUSTED and unblocks Client A in SoftAP
+            TunTrafficEngine.resetClientQuota(clientAMac)
+            assertFalse("Resetting Client A quota with no other block reasons must remove Client A from SoftAP MAC blocklist", clientAMac in currentBlockedList)
+
+            // Restore BPF_NAT_VPN mode -> deactivates SoftAP engine and re-enables TUN enforcement
+            val restoredBpf = ExclusiveBlockingModeController.restoreBpfNatVpnMode("Switch back to BPF_NAT_VPN")
+            assertEquals(BlockingMode.BPF_NAT_VPN, restoredBpf.effectiveMode)
+            assertTrue(restoredBpf.exclusiveEngineInvariant)
+            assertTrue(TunTrafficEngine.bpfNatVpnEnforcementEnabled)
+        } finally {
+            ExclusiveBlockingModeController.resetForTesting(originalExecutor, originalAdapter)
+            TunTrafficEngine.resetAllQuotaStatesForTest(deleteCheckpointFile = false)
+        }
+    }
+
+    @Test
+    fun `37 v0_10_8_debug DomainNormalizer and DomainRule validate normalize match and deduplicate DB04 DB05 DB13`() {
+        // 1. Valid normalization (DB04)
+        val normBasic = DomainNormalizer.validateAndNormalize("  *.Example.COM. ")
+        assertTrue(normBasic.isValid)
+        assertEquals("example.com", normBasic.normalizedDomain)
+        assertTrue(normBasic.hadLeadingWildcard)
+
+        // IDNA Punycode normalization
+        val normIdna = DomainNormalizer.validateAndNormalize("münchen.de")
+        assertTrue(normIdna.isValid)
+        assertEquals("xn--mnchen-3ya.de", normIdna.normalizedDomain)
+
+        // 2. Reject invalid inputs (DB04)
+        assertFalse("Blank input must be rejected", DomainNormalizer.validateAndNormalize("   ").isValid)
+        assertFalse("URL with scheme must be rejected", DomainNormalizer.validateAndNormalize("https://example.com").isValid)
+        assertFalse("URL with path must be rejected", DomainNormalizer.validateAndNormalize("example.com/path").isValid)
+        assertFalse("Host with port must be rejected", DomainNormalizer.validateAndNormalize("example.com:443").isValid)
+        assertFalse("Raw IPv4 literal must be rejected", DomainNormalizer.validateAndNormalize("192.168.1.1").isValid)
+        assertFalse("Raw IPv6 literal must be rejected", DomainNormalizer.validateAndNormalize("[2001:db8::1]").isValid)
+        assertFalse("Single-label hostname must be rejected", DomainNormalizer.validateAndNormalize("localhost").isValid)
+        assertFalse("Mid-string wildcard must be rejected", DomainNormalizer.validateAndNormalize("a.*.example.com").isValid)
+        assertFalse("Leading hyphen label must be rejected", DomainNormalizer.validateAndNormalize("-bad.example.com").isValid)
+
+        // 3. INCLUDE_SUBDOMAINS vs EXACT_HOSTNAME matching (DB05)
+        assertTrue(DomainNormalizer.matchesDomain("example.com", "example.com", DomainMatchMode.INCLUDE_SUBDOMAINS))
+        assertTrue(DomainNormalizer.matchesDomain("a.b.example.com", "example.com", DomainMatchMode.INCLUDE_SUBDOMAINS))
+        assertFalse(DomainNormalizer.matchesDomain("notexample.com", "example.com", DomainMatchMode.INCLUDE_SUBDOMAINS))
+        assertFalse(DomainNormalizer.matchesDomain("example.org", "example.com", DomainMatchMode.INCLUDE_SUBDOMAINS))
+
+        assertTrue(DomainNormalizer.matchesDomain("example.com", "example.com", DomainMatchMode.EXACT_HOSTNAME))
+        assertFalse(DomainNormalizer.matchesDomain("sub.example.com", "example.com", DomainMatchMode.EXACT_HOSTNAME))
+
+        // 4. DomainRule persistence & per-scope deduplication round-trip (DB13)
+        val rules = listOf(
+            DomainRule(
+                id = "r1",
+                scope = DomainRuleScope.GLOBAL,
+                normalizedDomain = "example.com",
+                matchMode = DomainMatchMode.EXACT_HOSTNAME,
+                enabled = true,
+            ),
+            DomainRule(
+                id = "r2",
+                scope = DomainRuleScope.GLOBAL,
+                normalizedDomain = "EXAMPLE.COM.",
+                matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                enabled = true,
+            ),
+            DomainRule(
+                id = "r3",
+                scope = DomainRuleScope.CLIENT,
+                clientMac = "e2:15:cd:54:e4:9b",
+                normalizedDomain = "tiktok.com",
+                matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                enabled = true,
+            ),
+        )
+        val encoded = DomainRule.toJsonArrayString(rules)
+        val decoded = DomainRule.fromJsonArrayString(encoded)
+        assertEquals("Duplicate GLOBAL rules for example.com must deduplicate", 2, decoded.size)
+        val globalExample = decoded.first { it.scope == DomainRuleScope.GLOBAL }
+        assertEquals(DomainMatchMode.INCLUDE_SUBDOMAINS, globalExample.matchMode)
+        val clientTiktok = decoded.first { it.scope == DomainRuleScope.CLIENT }
+        assertEquals("E2:15:CD:54:E4:9B", clientTiktok.clientMac)
+    }
+
+    @Test
+    fun `38 v0_10_8_debug DnsWirePacketParser DnsRefusedResponseBuilder and ConnectionHostnameClassifier handle IPv4 IPv6 DNS RCODE 5 REFUSED malformed packets and TLS SNI HTTP Host DB14 DB15 DB19`() {
+        // 1. Build a valid IPv4 UDP/53 query for "ads.example.com" (txId = 0x1234)
+        val ipv4DnsQuery = buildIpv4UdpDnsQueryPacket(
+            srcIp = "192.168.43.101",
+            dstIp = "8.8.8.8",
+            srcPort = 54321,
+            dstPort = 53,
+            txId = 0x1234,
+            qname = "Ads.Example.COM",
+            qtype = 1,
+        )
+        val parsedV4 = DnsWirePacketParser.parsePacket(ipv4DnsQuery, ipv4DnsQuery.size)
+        assertNotNull(parsedV4)
+        assertEquals(4, parsedV4!!.ipVersion)
+        assertEquals(17, parsedV4.protocol)
+        assertEquals(0x1234, parsedV4.transactionId)
+        assertEquals("ads.example.com", parsedV4.qname)
+        assertEquals(1, parsedV4.qtype)
+
+        // Synthesize RCODE=5 (REFUSED) response and verify wire fields
+        val refusedV4 = DnsRefusedResponseBuilder.buildRefusedResponse(ipv4DnsQuery, ipv4DnsQuery.size, parsedV4)
+        assertNotNull(refusedV4)
+        // Verify swapped IPv4 src/dst and UDP ports, QR=1, RCODE=5
+        val respUdpOffset = 20
+        val respDnsOffset = 28
+        val respSrcPort = ((refusedV4!![respUdpOffset].toInt() and 0xFF) shl 8) or (refusedV4[respUdpOffset + 1].toInt() and 0xFF)
+        val respDstPort = ((refusedV4[respUdpOffset + 2].toInt() and 0xFF) shl 8) or (refusedV4[respUdpOffset + 3].toInt() and 0xFF)
+        assertEquals(53, respSrcPort)
+        assertEquals(54321, respDstPort)
+        val respTxId = ((refusedV4[respDnsOffset].toInt() and 0xFF) shl 8) or (refusedV4[respDnsOffset + 1].toInt() and 0xFF)
+        val respFlags = ((refusedV4[respDnsOffset + 2].toInt() and 0xFF) shl 8) or (refusedV4[respDnsOffset + 3].toInt() and 0xFF)
+        assertEquals(0x1234, respTxId)
+        assertTrue("QR bit must be 1 (response)", (respFlags and 0x8000) != 0)
+        assertEquals("RCODE must be 5 (REFUSED)", 5, respFlags and 0x000F)
+
+        // 2. Build an IPv6 UDP/53 query and synthesize RCODE=5 response (DB14)
+        val ipv6DnsQuery = buildIpv6UdpDnsQueryPacket(
+            srcPort = 51111,
+            dstPort = 53,
+            txId = 0xABCD,
+            qname = "video.tiktok.com",
+            qtype = 28,
+        )
+        val parsedV6 = DnsWirePacketParser.parsePacket(ipv6DnsQuery, ipv6DnsQuery.size)
+        assertNotNull(parsedV6)
+        assertEquals(6, parsedV6!!.ipVersion)
+        assertEquals("video.tiktok.com", parsedV6.qname)
+        assertEquals(28, parsedV6.qtype)
+        val refusedV6 = DnsRefusedResponseBuilder.buildRefusedResponse(ipv6DnsQuery, ipv6DnsQuery.size, parsedV6)
+        assertNotNull(refusedV6)
+        val v6RespFlags = ((refusedV6!![48 + 2].toInt() and 0xFF) shl 8) or (refusedV6[48 + 3].toInt() and 0xFF)
+        assertEquals(5, v6RespFlags and 0x000F)
+
+        // 3. Malformed / truncated / compression pointer loop safety (DB15)
+        val loopPacket = ipv4DnsQuery.copyOf()
+        // Replace QNAME first byte with self-referencing compression pointer 0xC0 0x0C
+        loopPacket[28 + 12] = 0xC0.toByte()
+        loopPacket[28 + 13] = 0x0C.toByte()
+        assertNull("Self-referencing DNS compression pointer must return null safely without infinite loop", DnsWirePacketParser.parsePacket(loopPacket, loopPacket.size))
+        assertNull("Truncated packet must return null safely", DnsWirePacketParser.parsePacket(ipv4DnsQuery, 15))
+
+        // 4. Bounded TLS ClientHello SNI and HTTP Host extraction (DB19)
+        val httpPkt = buildIpv4TcpPayloadPacket(
+            srcIp = "192.168.43.101",
+            dstIp = "93.184.216.34",
+            srcPort = 52000,
+            dstPort = 80,
+            payload = "GET /index.html HTTP/1.1\r\nHost: Sub.BlockedExample.com:8080\r\nUser-Agent: curl\r\n\r\n".toByteArray(Charsets.US_ASCII),
+        )
+        val extractedHttp = ConnectionHostnameClassifier.extractHostnameFromPacket(httpPkt, httpPkt.size)
+        assertNotNull(extractedHttp)
+        assertEquals("sub.blockedexample.com", extractedHttp!!.hostname)
+        assertFalse(extractedHttp.isTlsSni)
+
+        val tlsClientHelloPayload = buildTlsClientHelloWithSni("sni.blockedexample.com")
+        val tlsPkt = buildIpv4TcpPayloadPacket(
+            srcIp = "192.168.43.101",
+            dstIp = "93.184.216.34",
+            srcPort = 52001,
+            dstPort = 443,
+            payload = tlsClientHelloPayload,
+        )
+        val extractedSni = ConnectionHostnameClassifier.extractHostnameFromPacket(tlsPkt, tlsPkt.size)
+        assertNotNull(extractedSni)
+        assertEquals("sni.blockedexample.com", extractedSni!!.hostname)
+        assertTrue(extractedSni.isTlsSni)
+    }
+
+    @Test
+    fun `39 v0_10_8_debug TunTrafficEngine and DomainFilterEngine enforce GLOBAL and CLIENT domain rules host provenance unknown-owner skip and rule precedence DB06 DB07 DB08 DB09 DB10 DB11 DB12 DB16 DB17 DB20`() {
+        try {
+            TunTrafficEngine.clearAll()
+            ExclusiveBlockingModeController.resetForTesting()
+
+            val macA = "E2:15:CD:54:E4:9B"
+            val macB = "F2:FF:8B:3D:B2:A6"
+            val hosts = listOf(
+                DiscoveredHost(mac = macA, ip = "192.168.43.101", allIps = listOf("192.168.43.101"), interfaceName = "ap0"),
+                DiscoveredHost(mac = macB, ip = "192.168.43.102", allIps = listOf("192.168.43.102"), interfaceName = "ap0"),
+            )
+            TunTrafficEngine.updatePolicies(
+                mapOf(
+                    macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = false),
+                    macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+                ),
+                hosts,
+            )
+
+            // Configure 1 GLOBAL rule (globalblock.com) and 1 CLIENT rule for macA (clientablock.com)
+            val rules = listOf(
+                DomainRule(
+                    id = "g1",
+                    scope = DomainRuleScope.GLOBAL,
+                    normalizedDomain = "globalblock.com",
+                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                    enabled = true,
+                ),
+                DomainRule(
+                    id = "c1",
+                    scope = DomainRuleScope.CLIENT,
+                    clientMac = macA,
+                    normalizedDomain = "clientablock.com",
+                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                    enabled = true,
+                ),
+            )
+            val gen1 = TunTrafficEngine.updateDomainRules(rules)
+            assertTrue(gen1 > 0L)
+
+            // 1. GLOBAL rule blocks DNS query even when matchedMac == null (post-NAT hotspot TUN packet) (DB06)
+            val globalDnsPkt = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 53001,
+                dstPort = 53,
+                txId = 0x2222,
+                qname = "sub.globalblock.com",
+            )
+            val globalMeta = TunTrafficEngine.parsePacketMeta(globalDnsPkt, globalDnsPkt.size)!!
+            val globalEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = globalMeta,
+                matchedMac = null,
+                isUpload = true,
+                attributionSource = AttributionSource.UNMATCHED_UNKNOWN,
+                rawPacket = globalDnsPkt,
+                rawLength = globalDnsPkt.size,
+            )
+            assertEquals(PacketDecision.DROP, globalEval.decision)
+            assertEquals("DOMAIN_BLOCK_GLOBAL_DNS", globalEval.reason)
+            assertNotNull("Blocked UDP/53 query must synthesize RCODE=5 REFUSED response", globalEval.synthesizedDnsResponse)
+
+            // 2. Host-phone local/loopback traffic (127.0.0.1) is NEVER blocked by GLOBAL rules (DB09)
+            val loopbackDnsPkt = buildIpv4UdpDnsQueryPacket(
+                srcIp = "127.0.0.1",
+                dstIp = "8.8.8.8",
+                srcPort = 53002,
+                dstPort = 53,
+                txId = 0x2223,
+                qname = "sub.globalblock.com",
+            )
+            val loopbackMeta = TunTrafficEngine.parsePacketMeta(loopbackDnsPkt, loopbackDnsPkt.size)!!
+            val loopbackEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = loopbackMeta,
+                matchedMac = null,
+                isUpload = true,
+                attributionSource = AttributionSource.UNMATCHED_UNKNOWN,
+                rawPacket = loopbackDnsPkt,
+                rawLength = loopbackDnsPkt.size,
+            )
+            assertEquals("Host-phone local traffic without hotspot provenance must not be blocked", PacketDecision.ALLOW, loopbackEval.decision)
+
+            // 3. CLIENT rule blocks Client A (DB07) while Client B is allowed (DB08)
+            val clientADnsPkt = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.168.43.101",
+                dstIp = "8.8.8.8",
+                srcPort = 53003,
+                dstPort = 53,
+                txId = 0x3333,
+                qname = "api.clientablock.com",
+            )
+            val clientAMeta = TunTrafficEngine.parsePacketMeta(clientADnsPkt, clientADnsPkt.size)!!
+            val clientAEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = clientAMeta,
+                matchedMac = macA,
+                isUpload = true,
+                attributionSource = AttributionSource.DIRECT_IP,
+                rawPacket = clientADnsPkt,
+                rawLength = clientADnsPkt.size,
+            )
+            assertEquals(PacketDecision.DROP, clientAEval.decision)
+            assertEquals("DOMAIN_BLOCK_CLIENT_DNS", clientAEval.reason)
+            assertNotNull(clientAEval.synthesizedDnsResponse)
+
+            val clientBDnsPkt = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.168.43.102",
+                dstIp = "8.8.8.8",
+                srcPort = 53004,
+                dstPort = 53,
+                txId = 0x3334,
+                qname = "api.clientablock.com",
+            )
+            val clientBMeta = TunTrafficEngine.parsePacketMeta(clientBDnsPkt, clientBDnsPkt.size)!!
+            val clientBEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = clientBMeta,
+                matchedMac = macB,
+                isUpload = true,
+                attributionSource = AttributionSource.DIRECT_IP,
+                rawPacket = clientBDnsPkt,
+                rawLength = clientBDnsPkt.size,
+            )
+            assertEquals("Client B must not be blocked by Client A's per-host domain rule", PacketDecision.ALLOW, clientBEval.decision)
+
+            // 4. Unknown owner (matchedMac == null) skips CLIENT rules and increments DOMAIN_CLIENT_OWNER_UNKNOWN (DB10, DB16)
+            val unknownOwnerEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = clientAMeta,
+                matchedMac = null,
+                isUpload = true,
+                attributionSource = AttributionSource.UNMATCHED_UNKNOWN,
+                rawPacket = clientADnsPkt,
+                rawLength = clientADnsPkt.size,
+            )
+            assertEquals("Per-client domain rules must not guess packet ownership when matchedMac == null", PacketDecision.ALLOW, unknownOwnerEval.decision)
+
+            val diagReport = TunTrafficEngine.getBpfStatusReport()
+            assertTrue(diagReport.domainDiagnostics.unknownOwnerClientRuleSkips >= 1L)
+            assertEquals(
+                DomainFilterCapabilityStatus.PARTIAL_DOMAIN_ENFORCEMENT.name,
+                diagReport.domainDiagnostics.capabilityStatus,
+            )
+
+            // 5. Whole-client block takes priority over domain rules (DB11)
+            TunTrafficEngine.updatePolicies(
+                mapOf(
+                    macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = true),
+                    macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+                ),
+                hosts,
+            )
+            val wholeClientBlockedEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = clientAMeta,
+                matchedMac = macA,
+                isUpload = true,
+                attributionSource = AttributionSource.DIRECT_IP,
+                rawPacket = clientADnsPkt,
+                rawLength = clientADnsPkt.size,
+            )
+            assertEquals(PacketDecision.DROP, wholeClientBlockedEval.decision)
+            assertEquals("BLOCKED_CLIENT_POLICY", wholeClientBlockedEval.reason)
+
+            // Unblock Client A whole-client policy -> Client A domain rule is still active
+            TunTrafficEngine.updatePolicies(
+                mapOf(
+                    macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = false),
+                    macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+                ),
+                hosts,
+            )
+
+            // 6. Removing Client A's domain rule increments ruleGeneration and immediately allows clientablock.com while GLOBAL rule remains active (DB11, DB12)
+            val gen2 = TunTrafficEngine.updateDomainRules(rules.filter { it.scope == DomainRuleScope.GLOBAL })
+            assertTrue(gen2 > gen1)
+            val afterClientRuleRemoved = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = clientAMeta,
+                matchedMac = macA,
+                isUpload = true,
+                attributionSource = AttributionSource.DIRECT_IP,
+                rawPacket = clientADnsPkt,
+                rawLength = clientADnsPkt.size,
+            )
+            assertEquals(PacketDecision.ALLOW, afterClientRuleRemoved.decision)
+
+            // 7. Verify Schema v6 export redacts domains and MACs by default (DB20)
+            val fullReport = TunTrafficEngine.getBpfStatusReport()
+            val redactedJson = fullReport.toJson(includeSensitiveEndpoints = false, includePseudonymousIds = false).toString()
+            val redactedMd = fullReport.toMarkdownReport(includeSensitiveEndpoints = false, includePseudonymousIds = false)
+            assertFalse("Redacted JSON must not contain raw blocked domain name", redactedJson.contains("globalblock.com"))
+            assertFalse("Redacted Markdown must not contain raw blocked domain name", redactedMd.contains("globalblock.com"))
+            assertTrue("Redacted export must use Domain# hash token", redactedJson.contains("Domain#"))
+            assertFalse(DiagnosticRedactor.containsUnredactedPii(redactedJson))
+            assertFalse(DiagnosticRedactor.containsUnredactedPii(redactedMd))
+        } finally {
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    private fun buildIpv4UdpDnsQueryPacket(
+        srcIp: String,
+        dstIp: String,
+        srcPort: Int,
+        dstPort: Int,
+        txId: Int,
+        qname: String,
+        qtype: Int = 1,
+    ): ByteArray {
+        val qnameBytes = encodeDnsQname(qname)
+        val dnsLen = 12 + qnameBytes.size + 4
+        val udpLen = 8 + dnsLen
+        val totalLen = 20 + udpLen
+        val pkt = ByteArray(totalLen)
+        pkt[0] = 0x45.toByte()
+        pkt[2] = ((totalLen ushr 8) and 0xFF).toByte()
+        pkt[3] = (totalLen and 0xFF).toByte()
+        pkt[8] = 64.toByte()
+        pkt[9] = 17.toByte() // UDP
+        val srcParts = srcIp.split(".").map { it.toInt() }
+        val dstParts = dstIp.split(".").map { it.toInt() }
+        for (i in 0..3) {
+            pkt[12 + i] = srcParts[i].toByte()
+            pkt[16 + i] = dstParts[i].toByte()
+        }
+        pkt[20] = ((srcPort ushr 8) and 0xFF).toByte()
+        pkt[21] = (srcPort and 0xFF).toByte()
+        pkt[22] = ((dstPort ushr 8) and 0xFF).toByte()
+        pkt[23] = (dstPort and 0xFF).toByte()
+        pkt[24] = ((udpLen ushr 8) and 0xFF).toByte()
+        pkt[25] = (udpLen and 0xFF).toByte()
+
+        val dnsOffset = 28
+        pkt[dnsOffset] = ((txId ushr 8) and 0xFF).toByte()
+        pkt[dnsOffset + 1] = (txId and 0xFF).toByte()
+        pkt[dnsOffset + 2] = 0x01.toByte() // RD = 1, QR = 0
+        pkt[dnsOffset + 3] = 0x00.toByte()
+        pkt[dnsOffset + 4] = 0x00.toByte()
+        pkt[dnsOffset + 5] = 0x01.toByte() // QDCOUNT = 1
+        System.arraycopy(qnameBytes, 0, pkt, dnsOffset + 12, qnameBytes.size)
+        val qtypeOffset = dnsOffset + 12 + qnameBytes.size
+        pkt[qtypeOffset] = ((qtype ushr 8) and 0xFF).toByte()
+        pkt[qtypeOffset + 1] = (qtype and 0xFF).toByte()
+        pkt[qtypeOffset + 2] = 0x00.toByte()
+        pkt[qtypeOffset + 3] = 0x01.toByte() // QCLASS = IN
+        return pkt
+    }
+
+    private fun buildIpv6UdpDnsQueryPacket(
+        srcPort: Int,
+        dstPort: Int,
+        txId: Int,
+        qname: String,
+        qtype: Int = 28,
+    ): ByteArray {
+        val qnameBytes = encodeDnsQname(qname)
+        val dnsLen = 12 + qnameBytes.size + 4
+        val udpLen = 8 + dnsLen
+        val totalLen = 40 + udpLen
+        val pkt = ByteArray(totalLen)
+        pkt[0] = 0x60.toByte() // IPv6
+        pkt[4] = ((udpLen ushr 8) and 0xFF).toByte()
+        pkt[5] = (udpLen and 0xFF).toByte()
+        pkt[6] = 17.toByte() // Next Header = UDP
+        pkt[7] = 64.toByte() // Hop Limit
+        // Src IP: 2001:db8::1, Dst IP: 2001:4860:4860::8888
+        pkt[8] = 0x20.toByte()
+        pkt[9] = 0x01.toByte()
+        pkt[23] = 0x01.toByte()
+        pkt[24] = 0x20.toByte()
+        pkt[25] = 0x01.toByte()
+        pkt[38] = 0x88.toByte()
+        pkt[39] = 0x88.toByte()
+
+        val udpOffset = 40
+        pkt[udpOffset] = ((srcPort ushr 8) and 0xFF).toByte()
+        pkt[udpOffset + 1] = (srcPort and 0xFF).toByte()
+        pkt[udpOffset + 2] = ((dstPort ushr 8) and 0xFF).toByte()
+        pkt[udpOffset + 3] = (dstPort and 0xFF).toByte()
+        pkt[udpOffset + 4] = ((udpLen ushr 8) and 0xFF).toByte()
+        pkt[udpOffset + 5] = (udpLen and 0xFF).toByte()
+
+        val dnsOffset = 48
+        pkt[dnsOffset] = ((txId ushr 8) and 0xFF).toByte()
+        pkt[dnsOffset + 1] = (txId and 0xFF).toByte()
+        pkt[dnsOffset + 2] = 0x01.toByte()
+        pkt[dnsOffset + 5] = 0x01.toByte() // QDCOUNT = 1
+        System.arraycopy(qnameBytes, 0, pkt, dnsOffset + 12, qnameBytes.size)
+        val qtypeOffset = dnsOffset + 12 + qnameBytes.size
+        pkt[qtypeOffset] = ((qtype ushr 8) and 0xFF).toByte()
+        pkt[qtypeOffset + 1] = (qtype and 0xFF).toByte()
+        pkt[qtypeOffset + 3] = 0x01.toByte()
+        return pkt
+    }
+
+    private fun encodeDnsQname(domain: String): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        for (label in domain.trim('.').split('.')) {
+            val bytes = label.toByteArray(Charsets.US_ASCII)
+            out.write(bytes.size)
+            out.write(bytes)
+        }
+        out.write(0)
+        return out.toByteArray()
+    }
+
+    private fun buildIpv4TcpPayloadPacket(
+        srcIp: String,
+        dstIp: String,
+        srcPort: Int,
+        dstPort: Int,
+        payload: ByteArray,
+    ): ByteArray {
+        val totalLen = 20 + 20 + payload.size
+        val pkt = ByteArray(totalLen)
+        pkt[0] = 0x45.toByte()
+        pkt[2] = ((totalLen ushr 8) and 0xFF).toByte()
+        pkt[3] = (totalLen and 0xFF).toByte()
+        pkt[8] = 64.toByte()
+        pkt[9] = 6.toByte() // TCP
+        val srcParts = srcIp.split(".").map { it.toInt() }
+        val dstParts = dstIp.split(".").map { it.toInt() }
+        for (i in 0..3) {
+            pkt[12 + i] = srcParts[i].toByte()
+            pkt[16 + i] = dstParts[i].toByte()
+        }
+        pkt[20] = ((srcPort ushr 8) and 0xFF).toByte()
+        pkt[21] = (srcPort and 0xFF).toByte()
+        pkt[22] = ((dstPort ushr 8) and 0xFF).toByte()
+        pkt[23] = (dstPort and 0xFF).toByte()
+        pkt[32] = 0x50.toByte() // Data offset = 5 (20 bytes)
+        pkt[33] = 0x18.toByte() // PSH + ACK
+        System.arraycopy(payload, 0, pkt, 40, payload.size)
+        return pkt
+    }
+
+    private fun buildTlsClientHelloWithSni(hostname: String): ByteArray {
+        val hostBytes = hostname.toByteArray(Charsets.US_ASCII)
+        val sniEntryLen = 1 + 2 + hostBytes.size
+        val sniListLen = sniEntryLen
+        val extDataLen = 2 + sniListLen
+        val extTotalLen = 2 + 2 + extDataLen
+        // Handshake body: version(2) + random(32) + session_id_len(1) + cipher_suites_len(2)+suite(2) + comp_len(1)+comp(1) + extensions_len(2) + ext
+        val bodyLen = 2 + 32 + 1 + 4 + 2 + 2 + extTotalLen
+        val recordLen = 4 + bodyLen
+        val out = ByteArray(5 + recordLen)
+        var p = 0
+        out[p++] = 0x16.toByte() // Handshake
+        out[p++] = 0x03.toByte()
+        out[p++] = 0x01.toByte()
+        out[p++] = ((recordLen ushr 8) and 0xFF).toByte()
+        out[p++] = (recordLen and 0xFF).toByte()
+        out[p++] = 0x01.toByte() // ClientHello
+        out[p++] = 0x00.toByte()
+        out[p++] = ((bodyLen ushr 8) and 0xFF).toByte()
+        out[p++] = (bodyLen and 0xFF).toByte()
+        out[p++] = 0x03.toByte()
+        out[p++] = 0x03.toByte() // TLS 1.2
+        p += 32 // Random
+        out[p++] = 0x00.toByte() // Session ID len = 0
+        out[p++] = 0x00.toByte()
+        out[p++] = 0x02.toByte() // Cipher suites len = 2
+        out[p++] = 0x13.toByte()
+        out[p++] = 0x01.toByte()
+        out[p++] = 0x01.toByte() // Compression methods len = 1
+        out[p++] = 0x00.toByte()
+        out[p++] = ((extTotalLen ushr 8) and 0xFF).toByte()
+        out[p++] = (extTotalLen and 0xFF).toByte()
+        // Extension: server_name (0x0000)
+        out[p++] = 0x00.toByte()
+        out[p++] = 0x00.toByte()
+        out[p++] = ((extDataLen ushr 8) and 0xFF).toByte()
+        out[p++] = (extDataLen and 0xFF).toByte()
+        out[p++] = ((sniListLen ushr 8) and 0xFF).toByte()
+        out[p++] = (sniListLen and 0xFF).toByte()
+        out[p++] = 0x00.toByte() // host_name (0)
+        out[p++] = ((hostBytes.size ushr 8) and 0xFF).toByte()
+        out[p++] = (hostBytes.size and 0xFF).toByte()
+        System.arraycopy(hostBytes, 0, out, p, hostBytes.size)
+        return out
+    }
+
+    @Test
+    fun `40 v0_10_9_debug Per-Host Domain Enforcement D01 to D12 BPF_NAT DNS HTTP Host TLS SNI bounded DNS retry queue and atomic rule snapshot`() {
+        val originalClock = TunTrafficEngine.bpfAttributor.monotonicClockMs
+        try {
+            val testClock = AtomicLong(50_000L)
+            TunTrafficEngine.bpfAttributor.monotonicClockMs = { testClock.get() }
+            TunTrafficEngine.clearAll()
+            ExclusiveBlockingModeController.resetForTesting()
+
+            val macA = "E2:15:CD:54:E4:9B"
+            val macB = "F2:FF:8B:3D:B2:A6"
+            val hosts = listOf(
+                DiscoveredHost(mac = macA, ip = "192.168.167.151", allIps = listOf("192.168.167.151"), interfaceName = "ap0"),
+                DiscoveredHost(mac = macB, ip = "192.168.167.17", allIps = listOf("192.168.167.17"), interfaceName = "ap0"),
+            )
+            TunTrafficEngine.configureExperimentalBpf(
+                enabled = true,
+                pollIntervalMs = 1_000L,
+                downstreamIface = "ap0",
+                upstreamIface = "testtun46",
+            )
+            TunTrafficEngine.updatePolicies(
+                mapOf(
+                    macA to TunTrafficEngine.EnforcedClientPolicy(mac = macA, isBlocked = false),
+                    macB to TunTrafficEngine.EnforcedClientPolicy(mac = macB, isBlocked = false),
+                ),
+                hosts,
+            )
+
+            // Configure D01 GLOBAL rule (globalonly.com) and D02 CLIENT rule for macA (hostaonly.com)
+            val rules = listOf(
+                DomainRule(
+                    id = "d01-g",
+                    scope = DomainRuleScope.GLOBAL,
+                    normalizedDomain = "globalonly.com",
+                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                    enabled = true,
+                ),
+                DomainRule(
+                    id = "d02-c",
+                    scope = DomainRuleScope.CLIENT,
+                    clientMac = macA,
+                    normalizedDomain = "hostaonly.com",
+                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                    enabled = true,
+                ),
+            )
+            TunTrafficEngine.updateDomainRules(rules)
+
+            // D02: Ingest BPF NAT dump with UDP/53 flow for Client A (post-NAT port 59053 -> 8.8.8.8:53)
+            // and UDP/53 flow for Client B (post-NAT port 59054 -> 8.8.8.8:53)
+            val dnsBpfDump = """
+                Tethering BPF offload:
+                  IPv4 Upstream:
+                    17 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:53101 -> 33(testtun46) 192.0.2.2:59053 -> 8.8.8.8:53 [bc:00:00:00:00:00] 1500 10ms
+                    17 [f2:ff:8b:3d:b2:a6] 29(ap0) 192.168.167.17:53102 -> 33(testtun46) 192.0.2.2:59054 -> 8.8.8.8:53 [bc:00:00:00:00:00] 1500 10ms
+                    6 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:52101 -> 33(testtun46) 192.0.2.2:59080 -> 93.184.216.34:80 [bc:00:00:00:00:00] 1500 10ms
+                    6 [f2:ff:8b:3d:b2:a6] 29(ap0) 192.168.167.17:52102 -> 33(testtun46) 192.0.2.2:59081 -> 93.184.216.34:80 [bc:00:00:00:00:00] 1500 10ms
+                    6 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:52443 -> 33(testtun46) 192.0.2.2:59443 -> 93.184.216.34:443 [bc:00:00:00:00:00] 1500 10ms
+                    6 [f2:ff:8b:3d:b2:a6] 29(ap0) 192.168.167.17:52444 -> 33(testtun46) 192.0.2.2:59444 -> 93.184.216.34:443 [bc:00:00:00:00:00] 1500 10ms
+            """.trimIndent()
+            val (verifiedBindings, verifiedMacs) = TunTrafficEngine.getVerifiedClientBindingsSnapshot()
+            assertTrue(
+                TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                    parsed = BpfDumpParser.parse(dnsBpfDump),
+                    collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                    collectionStatus = BpfCollectionStatus.OK,
+                    collectionDurationMs = 4L,
+                    ipToMac = verifiedBindings,
+                    activeConnectedMacs = verifiedMacs,
+                ),
+            )
+
+            // D02: Post-NAT DNS query from Client A (192.0.2.2:59053) for sub.hostaonly.com -> attributed via BPF_NAT -> BLOCKED
+            val pktDnsA = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59053,
+                dstPort = 53,
+                txId = 0x4101,
+                qname = "sub.hostaonly.com",
+            )
+            val metaDnsA = TunTrafficEngine.parsePacketMeta(pktDnsA, pktDnsA.size)!!
+            val attrDnsA = TunTrafficEngine.resolveClientMacWithSource(metaDnsA, isUpload = true)
+            assertEquals(macA, attrDnsA.mac)
+            assertEquals(AttributionSource.BPF_NAT, attrDnsA.source)
+            val evalDnsA = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaDnsA,
+                matchedMac = attrDnsA.mac,
+                isUpload = true,
+                attributionSource = attrDnsA.source,
+                rawPacket = pktDnsA,
+                rawLength = pktDnsA.size,
+            )
+            assertEquals(PacketDecision.DROP, evalDnsA.decision)
+            assertEquals("DOMAIN_BLOCK_CLIENT_DNS", evalDnsA.reason)
+            assertNotNull(evalDnsA.synthesizedDnsResponse)
+
+            // D02: Post-NAT DNS query from Client B (192.0.2.2:59054) for sub.hostaonly.com -> attributed to macB -> ALLOWED (DOMAIN_CLIENT_OWNER_MISMATCH)
+            val pktDnsB = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59054,
+                dstPort = 53,
+                txId = 0x4102,
+                qname = "sub.hostaonly.com",
+            )
+            val metaDnsB = TunTrafficEngine.parsePacketMeta(pktDnsB, pktDnsB.size)!!
+            val attrDnsB = TunTrafficEngine.resolveClientMacWithSource(metaDnsB, isUpload = true)
+            assertEquals(macB, attrDnsB.mac)
+            val evalDnsB = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaDnsB,
+                matchedMac = attrDnsB.mac,
+                isUpload = true,
+                attributionSource = attrDnsB.source,
+                rawPacket = pktDnsB,
+                rawLength = pktDnsB.size,
+            )
+            assertEquals(PacketDecision.ALLOW, evalDnsB.decision)
+
+            // D03: Post-NAT HTTP Host request for Client A (59080) vs Client B (59081)
+            val httpPayload = "GET / HTTP/1.1\r\nHost: web.hostaonly.com\r\n\r\n".toByteArray(Charsets.US_ASCII)
+            val pktHttpA = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59080, 80, httpPayload)
+            val metaHttpA = TunTrafficEngine.parsePacketMeta(pktHttpA, pktHttpA.size)!!
+            val attrHttpA = TunTrafficEngine.resolveClientMacWithSource(metaHttpA, isUpload = true)
+            assertEquals(macA, attrHttpA.mac)
+            val evalHttpA = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaHttpA,
+                matchedMac = attrHttpA.mac,
+                isUpload = true,
+                attributionSource = attrHttpA.source,
+                rawPacket = pktHttpA,
+                rawLength = pktHttpA.size,
+            )
+            assertEquals(PacketDecision.DROP, evalHttpA.decision)
+            assertEquals("DOMAIN_BLOCK_CLIENT_HOSTNAME", evalHttpA.reason)
+
+            val pktHttpB = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59081, 80, httpPayload)
+            val metaHttpB = TunTrafficEngine.parsePacketMeta(pktHttpB, pktHttpB.size)!!
+            val attrHttpB = TunTrafficEngine.resolveClientMacWithSource(metaHttpB, isUpload = true)
+            assertEquals(macB, attrHttpB.mac)
+            val evalHttpB = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaHttpB,
+                matchedMac = attrHttpB.mac,
+                isUpload = true,
+                attributionSource = attrHttpB.source,
+                rawPacket = pktHttpB,
+                rawLength = pktHttpB.size,
+            )
+            assertEquals(PacketDecision.ALLOW, evalHttpB.decision)
+
+            // D04: Post-NAT TLS ClientHello SNI for Client A (59443) vs Client B (59444)
+            val tlsPayload = buildTlsClientHelloWithSni("tls.hostaonly.com")
+            val pktTlsA = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59443, 443, tlsPayload)
+            val metaTlsA = TunTrafficEngine.parsePacketMeta(pktTlsA, pktTlsA.size)!!
+            val attrTlsA = TunTrafficEngine.resolveClientMacWithSource(metaTlsA, isUpload = true)
+            assertEquals(macA, attrTlsA.mac)
+            val evalTlsA = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaTlsA,
+                matchedMac = attrTlsA.mac,
+                isUpload = true,
+                attributionSource = attrTlsA.source,
+                rawPacket = pktTlsA,
+                rawLength = pktTlsA.size,
+            )
+            assertEquals(PacketDecision.DROP, evalTlsA.decision)
+            assertEquals("DOMAIN_BLOCK_CLIENT_HOSTNAME", evalTlsA.reason)
+
+            val pktTlsB = buildIpv4TcpPayloadPacket("192.0.2.2", "93.184.216.34", 59444, 443, tlsPayload)
+            val metaTlsB = TunTrafficEngine.parsePacketMeta(pktTlsB, pktTlsB.size)!!
+            val attrTlsB = TunTrafficEngine.resolveClientMacWithSource(metaTlsB, isUpload = true)
+            assertEquals(macB, attrTlsB.mac)
+            val evalTlsB = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaTlsB,
+                matchedMac = attrTlsB.mac,
+                isUpload = true,
+                attributionSource = attrTlsB.source,
+                rawPacket = pktTlsB,
+                rawLength = pktTlsB.size,
+            )
+            assertEquals(PacketDecision.ALLOW, evalTlsB.decision)
+
+            // D07 & D08: Bounded First-Packet DNS Attribution Retry Queue
+            TunTrafficEngine.configureDnsAttributionRetry(enabled = true, maxWaitMs = 200L)
+            assertTrue(TunTrafficEngine.dnsAttributionRetryEnabled)
+            assertEquals(200L, TunTrafficEngine.dnsRetryMaxWaitMs)
+
+            // Send unattributed DNS query on port 59901 for retry.hostaonly.com -> queued for retry (`DNS_RETRY_QUEUED`)
+            val pktRetryResolve = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59901,
+                dstPort = 53,
+                txId = 0x5101,
+                qname = "retry.hostaonly.com",
+            )
+            val metaRetryResolve = TunTrafficEngine.parsePacketMeta(pktRetryResolve, pktRetryResolve.size)!!
+            val evalQueued = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaRetryResolve,
+                matchedMac = null,
+                isUpload = true,
+                attributionSource = AttributionSource.UNMATCHED_UNKNOWN,
+                rawPacket = pktRetryResolve,
+                rawLength = pktRetryResolve.size,
+            )
+            assertTrue(evalQueued.heldForDnsRetry)
+            assertEquals("DNS_RETRY_QUEUED", evalQueued.reason)
+            assertEquals(1, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            // Mutate caller buffer in-place to prove defensive copy inside PendingDnsRetryPacket
+            pktRetryResolve.fill(0)
+
+            // Publish BPF snapshot mapping 59901 -> macA before 200ms deadline
+            testClock.set(50_050L)
+            val retryBpfDump = """
+                Tethering BPF offload:
+                  IPv4 Upstream:
+                    17 [e2:15:cd:54:e4:9b] 29(ap0) 192.168.167.151:53901 -> 33(testtun46) 192.0.2.2:59901 -> 8.8.8.8:53 [bc:00:00:00:00:00] 1500 5ms
+            """.trimIndent()
+            assertTrue(
+                TunTrafficEngine.bpfAttributor.ingestParsedDump(
+                    parsed = BpfDumpParser.parse(retryBpfDump),
+                    collectionSessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+                    collectionStatus = BpfCollectionStatus.OK,
+                    collectionDurationMs = 3L,
+                    ipToMac = verifiedBindings,
+                    activeConnectedMacs = verifiedMacs,
+                ),
+            )
+            TunTrafficEngine.processPendingDnsAttributionRetries(nowMonoMs = testClock.get())
+            assertEquals("Queued DNS packet must resolve and synthesize REFUSED response once BPF maps port 59901 -> macA", 0, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            // Now test D08 timeout fail-open: enqueue unattributed DNS query on port 59902 and advance clock past 200ms without BPF mapping
+            val pktRetryTimeout = buildIpv4UdpDnsQueryPacket(
+                srcIp = "192.0.2.2",
+                dstIp = "8.8.8.8",
+                srcPort = 59902,
+                dstPort = 53,
+                txId = 0x5102,
+                qname = "timeout.hostaonly.com",
+            )
+            val metaRetryTimeout = TunTrafficEngine.parsePacketMeta(pktRetryTimeout, pktRetryTimeout.size)!!
+            val evalTimeoutQueued = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = metaRetryTimeout,
+                matchedMac = null,
+                isUpload = true,
+                attributionSource = AttributionSource.UNMATCHED_UNKNOWN,
+                rawPacket = pktRetryTimeout,
+                rawLength = pktRetryTimeout.size,
+            )
+            assertTrue(evalTimeoutQueued.heldForDnsRetry)
+            assertEquals("DNS_RETRY_QUEUED", evalTimeoutQueued.reason)
+            assertEquals(1, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            testClock.set(50_300L) // Past 50_050 + 200ms deadline
+            TunTrafficEngine.processPendingDnsAttributionRetries(nowMonoMs = testClock.get())
+            assertEquals("Timed-out DNS retry packet must fail-open and be released", 0, TunTrafficEngine.getPendingDnsRetryQueueSize())
+
+            val domDiag = TunTrafficEngine.getBpfStatusReport().domainDiagnostics
+            assertTrue(domDiag.dnsBpfNat >= 2L)
+            assertTrue(domDiag.clientRuleMatched >= 3L)
+            assertTrue(domDiag.clientRuleOwnerMismatch >= 3L)
+            assertEquals(2L, domDiag.dnsRetryQueued)
+            assertEquals(1L, domDiag.dnsRetryResolved)
+            assertEquals(1L, domDiag.dnsRetryTimeout)
+
+            // D10: Atomic snapshot swap under concurrent rule updates & evaluations
+            val errors = java.util.concurrent.CopyOnWriteArrayList<Throwable>()
+            val writerThread = Thread {
+                try {
+                    for (i in 1..40) {
+                        DomainFilterEngine.replaceAllRules(
+                            listOf(
+                                DomainRule(
+                                    id = "g-$i",
+                                    scope = DomainRuleScope.GLOBAL,
+                                    normalizedDomain = "concurrent$i.com",
+                                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                                    enabled = true,
+                                ),
+                                DomainRule(
+                                    id = "c-$i",
+                                    scope = DomainRuleScope.CLIENT,
+                                    clientMac = macA,
+                                    normalizedDomain = "hostaonly.com",
+                                    matchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+                                    enabled = true,
+                                ),
+                            ),
+                        )
+                    }
+                } catch (t: Throwable) {
+                    errors.add(t)
+                }
+            }
+            val readerThread = Thread {
+                try {
+                    for (i in 1..80) {
+                        val dec = DomainFilterEngine.evaluateUploadPacket(
+                            rawPacket = pktDnsA,
+                            length = pktDnsA.size,
+                            srcIp = "192.0.2.2",
+                            matchedMac = macA,
+                            ownerVerified = true,
+                            ownershipSource = "BPF_NAT",
+                        )
+                        assertTrue(dec.blocked)
+                    }
+                } catch (t: Throwable) {
+                    errors.add(t)
+                }
+            }
+            writerThread.start()
+            readerThread.start()
+            writerThread.join(5_000L)
+            readerThread.join(5_000L)
+            assertTrue("Concurrent atomic snapshot updates and packet evaluations must have zero exceptions: $errors", errors.isEmpty())
+        } finally {
+            TunTrafficEngine.bpfAttributor.monotonicClockMs = originalClock
+            TunTrafficEngine.clearAll()
+        }
+    }
+
+    @Test
+    fun `41 v0_10_9_debug VpnUpstream and VpnWatchdog V01 to V12 stopOnLoss fail-closed gate new-handle H2 same-handle H1 extended outage and 3x reconnect cycles`() {
+        try {
+            TunTrafficEngine.clearAll()
+
+            var currentVpnHandle = 1001L
+            var bindShouldSucceed = true
+            val boundHandles = mutableListOf<Long>()
+            val lostCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+            val fakeLocator = VpnLocator { currentVpnHandle }
+            val fakeBinder: (Long) -> Unit = { handle ->
+                boundHandles.add(handle)
+                if (!bindShouldSucceed) {
+                    throw IllegalStateException("Simulated setUnderlyingNetworks failure for handle $handle")
+                }
+            }
+
+            // V01: Default stopHotspotOnVpnDisconnect == true tears down session after 3 missed polls
+            val upstreamV01 = VpnUpstream(
+                locatorProvider = { fakeLocator },
+                onLost = { lostCount.incrementAndGet() },
+            )
+            upstreamV01.updateStopHotspotOnVpnDisconnect(true)
+            upstreamV01.followWithBinder(
+                mode = VpnMode.AUTO,
+                startMonitorThread = false,
+                binder = fakeBinder,
+            )
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamV01.lifecycleState)
+            // Disconnect VPN -> 3 consecutive polls trigger SESSION_STOPPED
+            currentVpnHandle = VpnUpstream.UNBOUND
+            upstreamV01.pollOnceForTest()
+            upstreamV01.pollOnceForTest()
+            upstreamV01.pollOnceForTest()
+            assertEquals(1, lostCount.get())
+            assertEquals(VpnLifecycleState.SESSION_STOPPED, upstreamV01.lifecycleState)
+            upstreamV01.stop()
+            assertFalse("Default teardown mode must not leave fail-closed gate closed after session stops", TunTrafficEngine.vpnForwardingGateClosed)
+
+            // V02, V03, V04, V05: stopHotspotOnVpnDisconnect == false keeps hotspot alive, closes fail-closed gate, and recovers on new handle (H2) and same handle (H1)
+            currentVpnHandle = 2001L
+            lostCount.set(0)
+            val upstreamRecovery = VpnUpstream(
+                locatorProvider = { fakeLocator },
+                onLost = { lostCount.incrementAndGet() },
+            )
+            upstreamRecovery.updateStopHotspotOnVpnDisconnect(false)
+            upstreamRecovery.followWithBinder(
+                mode = VpnMode.AUTO,
+                startMonitorThread = false,
+                binder = fakeBinder,
+            )
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+
+            // Transient 1-2 poll dip recovers before 3rd strike without incrementing outageCount
+            currentVpnHandle = VpnUpstream.UNBOUND
+            upstreamRecovery.pollOnceForTest() // strike 1
+            assertTrue(TunTrafficEngine.vpnForwardingGateClosed) // closed immediately on first missing poll!
+            currentVpnHandle = 2001L
+            upstreamRecovery.pollOnceForTest() // recovered before 3rd strike!
+            assertFalse("Gate must reopen when transient strike recovers", TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertEquals(0L, upstreamRecovery.outageCount.get())
+
+            // V02 & V05: Confirmed VPN disconnect (3 strikes) + extended outage (20 additional polls) -> 0 onLost calls, 1 outageCount, gate stays closed
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(0, lostCount.get())
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            assertTrue(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(1L, upstreamRecovery.outageCount.get())
+
+            // Verify V12: while fail-closed gate is closed, client packet is dropped with VPN_FAIL_CLOSED_GATE
+            val testClientPkt = buildIpv4UdpDnsQueryPacket("192.168.43.101", "8.8.8.8", 54000, 53, 0x1111, "example.com")
+            val testClientMeta = TunTrafficEngine.parsePacketMeta(testClientPkt, testClientPkt.size)!!
+            val gatedEval = TunTrafficEngine.evaluateAndShapeDetailed(
+                meta = testClientMeta,
+                matchedMac = "E2:15:CD:54:E4:9B",
+                isUpload = true,
+                attributionSource = AttributionSource.DIRECT_IP,
+                rawPacket = testClientPkt,
+                rawLength = testClientPkt.size,
+            )
+            assertEquals("Client traffic must NEVER bypass disconnected VPN when fail-closed gate is closed", PacketDecision.DROP, gatedEval.decision)
+            assertEquals("VPN_FAIL_CLOSED_GATE", gatedEval.reason)
+            assertTrue(TunTrafficEngine.vpnFailClosedDroppedPackets.get() >= 1L)
+
+            // Extended outage (20 more polls) must not increment outageCount or call onLost
+            repeat(20) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(0, lostCount.get())
+            assertEquals(1L, upstreamRecovery.outageCount.get())
+
+            // V03: Reconnect with NEW handle H2 (2002L) -> rebinds, reopens gate, increments recoveryCount
+            currentVpnHandle = 2002L
+            upstreamRecovery.pollOnceForTest()
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertEquals(2002L, upstreamRecovery.handle)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(1L, upstreamRecovery.recoveryCount.get())
+
+            // V04: Disconnect again (3 strikes) and reconnect with SAME handle (2002L) -> must still emit Adopted and recover!
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            assertTrue(TunTrafficEngine.vpnForwardingGateClosed)
+            currentVpnHandle = 2002L // Same handle as before disconnect!
+            upstreamRecovery.pollOnceForTest()
+            assertEquals("Same-handle VPN reconnect must re-adopt because boundHandle was reset on loss", VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(2L, upstreamRecovery.recoveryCount.get())
+
+            // V10: Rebind failure when VPN handle reappears -> transitions to VPN_RECOVERY_FAILED, keeps fail-closed gate CLOSED, and retries on next poll
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            bindShouldSucceed = false
+            currentVpnHandle = 2003L
+            upstreamRecovery.pollOnceForTest()
+            assertEquals(VpnLifecycleState.VPN_RECOVERY_FAILED, upstreamRecovery.lifecycleState)
+            assertTrue("Fail-closed gate must remain CLOSED when setUnderlyingNetworks fails", TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(1L, upstreamRecovery.failedRebindCount.get())
+
+            // Next poll succeeds -> recovers cleanly to VPN_BOUND (3rd cycle = V11)
+            bindShouldSucceed = true
+            upstreamRecovery.pollOnceForTest()
+            assertEquals(VpnLifecycleState.VPN_BOUND, upstreamRecovery.lifecycleState)
+            assertFalse(TunTrafficEngine.vpnForwardingGateClosed)
+            assertEquals(3L, upstreamRecovery.outageCount.get())
+            assertEquals(3L, upstreamRecovery.recoveryCount.get())
+
+            // Live toggle false -> true while waiting for recovery immediately stops session
+            currentVpnHandle = VpnUpstream.UNBOUND
+            repeat(3) { upstreamRecovery.pollOnceForTest() }
+            assertEquals(VpnLifecycleState.VPN_WAITING_FOR_RECOVERY, upstreamRecovery.lifecycleState)
+            upstreamRecovery.updateStopHotspotOnVpnDisconnect(true)
+            assertEquals(1, lostCount.get())
+            assertEquals(VpnLifecycleState.SESSION_STOPPED, upstreamRecovery.lifecycleState)
+            upstreamRecovery.stop()
+        } finally {
+            TunTrafficEngine.clearAll()
+        }
+    }
 }
+
+
+

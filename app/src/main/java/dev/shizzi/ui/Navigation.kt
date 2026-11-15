@@ -23,6 +23,7 @@ enum class Screen(val depth: Int) {
     HOME(0),
     SETTINGS(1),
     CLIENTS(1),
+    DOMAIN_BLOCKING(1),
     LOG(2),
     FIREWALL_DIAGNOSTIC(2),
     EASTER_EGG(1),

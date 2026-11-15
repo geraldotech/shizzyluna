@@ -69,7 +69,15 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private fun observeSettings() {
         if (settingsCollector?.isActive == true) return
         settingsCollector = viewModelScope.launch {
-            settings.collect {
+            runCatching { settingsStore.migrateLegacyBlockingModeIfNeeded() }
+            settings.collect { current ->
+                if (current != null) {
+                    DomainFilterEngine.replaceAllRules(current.domainRules)
+                    TunTrafficEngine.configureDnsAttributionRetry(
+                        enabled = current.dnsAttributionRetryEnabled,
+                        maxWaitMs = current.dnsRetryMaxWaitMs.toLong(),
+                    )
+                }
                 refreshClients()
             }
         }
@@ -155,6 +163,38 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { settingsStore.setVpnMode(mode) }
     }
 
+    fun setStopHotspotOnVpnDisconnect(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.setStopHotspotOnVpnDisconnect(enabled)
+            SessionService.updateStopHotspotOnVpnDisconnect(enabled)
+            runCatching {
+                val statusJson = diagnostics.setStopHotspotOnVpnDisconnect(enabled)
+                localState.update { current -> current.applyOutcome(Result.success(statusJson)) }
+            }
+            SessionLog.info("Stop hotspot when VPN disconnects set to $enabled")
+        }
+    }
+
+    fun setDnsAttributionRetryEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            val maxWaitMs = settings.value?.dnsRetryMaxWaitMs ?: 200
+            settingsStore.setDnsAttributionRetryEnabled(enabled)
+            TunTrafficEngine.configureDnsAttributionRetry(enabled = enabled, maxWaitMs = maxWaitMs.toLong())
+            SessionService.updateDnsAttributionRetryConfig(enabled, maxWaitMs)
+            runCatching {
+                val report = diagnostics.setDnsAttributionRetryConfig(enabled, maxWaitMs)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("Bounded DNS Attribution Retry Queue (v0.10.9-debug) ${if (enabled) "ENABLED" else "DISABLED"}")
+            refreshClients()
+        }
+    }
+
     fun setTheme(choice: ThemeChoice) {
         viewModelScope.launch { settingsStore.setTheme(choice) }
     }
@@ -226,9 +266,12 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                         }
                     },
                     onFailure = { err ->
+                        val localReport = TunTrafficEngine.collectBpfSnapshotNow()
+                        localState.update { it.copy(bpfAttribution = localReport) }
                         localFirewallDiag.update {
                             it.copy(
                                 isCollectingBpf = false,
+                                bpfReport = localReport,
                                 error = "${err.javaClass.simpleName}: ${err.message}",
                             )
                         }
@@ -237,6 +280,272 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             refreshClients()
         }
     }
+
+    fun setBpfRefreshOnMissEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.setBpfRefreshOnMissEnabled(enabled)
+            TunTrafficEngine.configureBpfRefreshOnMiss(enabled = enabled)
+            SessionService.updateBpfRefreshOnMissConfig(enabled)
+            runCatching {
+                val report = diagnostics.setBpfRefreshOnMissConfig(enabled)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("BPF Refresh-on-Miss (Phase B experiment) ${if (enabled) "ENABLED" else "DISABLED"}")
+            refreshClients()
+        }
+    }
+
+    fun setBpfDeepTupleDiagnosticsEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.setBpfDeepTupleDiagnosticsEnabled(enabled)
+            TunTrafficEngine.configureDeepTupleDiagnostics(enabled = enabled)
+            SessionService.updateDeepTupleDiagnosticsEnabled(enabled)
+            runCatching {
+                val report = diagnostics.setDeepTupleDiagnosticsEnabled(enabled)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("BPF Deep Tuple Diagnostics (Phase C) ${if (enabled) "ENABLED" else "DISABLED"}")
+            refreshClients()
+        }
+    }
+
+    fun setBpfExportPseudonymousIds(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsStore.setBpfExportPseudonymousIds(enabled)
+        }
+    }
+
+    fun resetBpfDiagnosticsCounters() {
+        viewModelScope.launch {
+            TunTrafficEngine.resetAttributionDiagnosticsCounters()
+            SessionService.resetBpfDiagnosticsCounters()
+            runCatching {
+                val report = diagnostics.resetBpfDiagnosticsCounters()
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("BPF Attribution diagnostic counters reset to 0 (policies and quotas preserved)")
+            refreshClients()
+        }
+    }
+
+    fun setPhaseDEnforcementMode(mode: PhaseDEnforcementMode) {
+        viewModelScope.launch {
+            settingsStore.setPhaseDEnforcementMode(mode)
+            TunTrafficEngine.configurePhaseDMode(mode)
+            SessionService.updatePhaseDEnforcementMode(mode)
+            runCatching {
+                val report = diagnostics.setPhaseDEnforcementMode(mode)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("Phase D mode set to ${mode.name}")
+            refreshClients()
+        }
+    }
+
+    fun recordPhaseDDeliveryTestMarker(markerType: String, note: String = "") {
+        viewModelScope.launch {
+            TunTrafficEngine.recordDeliveryTestMarker(markerType = markerType, note = note)
+            SessionService.recordPhaseDDeliveryTestMarker(markerType, note)
+            runCatching {
+                val report = diagnostics.recordPhaseDDeliveryTestMarker(markerType, note)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("Phase D delivery test marker recorded: $markerType")
+            refreshClients()
+        }
+    }
+
+    fun selectBlockingMode(mode: BlockingMode) {
+        viewModelScope.launch {
+            settingsStore.setRequestedBlockingMode(mode)
+            ExclusiveBlockingModeController.selectRequestedMode(mode)
+            SessionService.updateBlockingMode(mode)
+            runCatching {
+                val report = diagnostics.selectBlockingMode(mode)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            SessionLog.info("Blocking mode requested: ${mode.name} (effective=${ExclusiveBlockingModeController.effectiveMode.name})")
+            refreshClients()
+        }
+    }
+
+    fun checkPreNatCapability() {
+        viewModelScope.launch {
+            runCatching {
+                val report = diagnostics.checkPreNatCapability()
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.checkCapabilityReadOnly()
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun reviewPreNatScopedProbe() {
+        viewModelScope.launch {
+            runCatching {
+                val report = diagnostics.reviewPreNatScopedProbe()
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.reviewScopedProbePlan()
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun runPreNatScopedProbe(userConfirmed: Boolean) {
+        viewModelScope.launch {
+            runCatching {
+                val report = diagnostics.runPreNatScopedProbe(userConfirmed)
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.runUserApprovedScopedProbe(userConfirmed)
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun activatePreNatBlockingMode() {
+        viewModelScope.launch {
+            settingsStore.setRequestedBlockingMode(BlockingMode.BPF_NAT_VPN)
+            runCatching {
+                val report = diagnostics.activatePreNatBlockingMode()
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.activatePreNatMode()
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun restoreBpfBlockingMode() {
+        viewModelScope.launch {
+            settingsStore.setRequestedBlockingMode(BlockingMode.BPF_NAT_VPN)
+            runCatching {
+                val report = diagnostics.restoreBpfBlockingMode()
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.restoreBpfNatVpnMode(reason = "User requested restore current engine")
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun checkSoftApCapability() {
+        viewModelScope.launch {
+            runCatching {
+                val report = diagnostics.checkSoftApCapability()
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.checkSoftApCapability()
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun runSoftApLiveProbe(
+        clientAMac: String,
+        clientBMac: String,
+        userConfirmed: Boolean,
+        disconnectTimeoutMs: Int = 5_000,
+    ) {
+        viewModelScope.launch {
+            runCatching {
+                val report = diagnostics.runSoftApLiveProbe(
+                    clientAMac = clientAMac,
+                    clientBMac = clientBMac,
+                    userConfirmed = userConfirmed,
+                    disconnectTimeoutMs = disconnectTimeoutMs,
+                )
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.runSoftApLiveProbe(
+                    clientAMac = clientAMac,
+                    clientBMac = clientBMac,
+                    userConfirmed = userConfirmed,
+                    disconnectTimeoutMs = disconnectTimeoutMs.toLong().coerceIn(500L, 15_000L),
+                )
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
+    fun activateSoftApBlockingMode() {
+        viewModelScope.launch {
+            settingsStore.setRequestedBlockingMode(BlockingMode.SOFTAP_MAC_BLOCK)
+            val currentRules = settings.value?.clientRules.orEmpty()
+            runCatching {
+                val report = diagnostics.activateSoftApBlockingMode()
+                localState.update { it.copy(bpfAttribution = report) }
+                localFirewallDiag.update { it.copy(bpfReport = report) }
+            }.onFailure {
+                ExclusiveBlockingModeController.activateSoftApBlockingMode(rules = currentRules)
+                val localReport = TunTrafficEngine.getBpfAttributionReport()
+                localState.update { it.copy(bpfAttribution = localReport) }
+                localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            }
+            refreshClients()
+        }
+    }
+
 
     fun saveClientRule(rule: ClientRule) {
         viewModelScope.launch {
@@ -325,6 +634,100 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             val updatedRules = settingsStore.settings.first().clientRules
             SessionService.updateRules(updatedRules)
             SessionLog.info("Rule removed for $mac")
+            refreshClients()
+        }
+    }
+
+    fun upsertDomainRule(
+        existingRuleId: String? = null,
+        rawDomain: String,
+        scope: DomainRuleScope,
+        clientMac: String? = null,
+        matchMode: DomainMatchMode = DomainMatchMode.INCLUDE_SUBDOMAINS,
+        enabled: Boolean = true,
+    ): DomainValidationResult {
+        val check = DomainNormalizer.validateAndNormalize(rawDomain, matchMode)
+        if (!check.isValid) {
+            return check
+        }
+        if (!existingRuleId.isNullOrBlank()) {
+            DomainFilterEngine.removeRuleById(existingRuleId)
+        }
+        val (validation, savedRule) = DomainFilterEngine.upsertRule(
+            rawDomain = rawDomain,
+            scope = scope,
+            clientMac = clientMac,
+            matchMode = matchMode,
+            enabled = enabled,
+        )
+        if (!validation.isValid || savedRule == null) {
+            return validation
+        }
+        val allRules = DomainFilterEngine.getAllRules()
+        viewModelScope.launch {
+            settingsStore.saveDomainRules(allRules)
+            SessionService.updateDomainRules(allRules)
+            runCatching { diagnostics.updateDomainRules(DomainRule.serializeList(allRules)) }
+            val localReport = TunTrafficEngine.getBpfAttributionReport()
+            localState.update { it.copy(bpfAttribution = localReport) }
+            localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            refreshClients()
+        }
+        return validation
+    }
+
+    fun toggleDomainRuleEnabled(ruleId: String, enabled: Boolean) {
+        DomainFilterEngine.setRuleEnabled(ruleId, enabled) ?: return
+        val allRules = DomainFilterEngine.getAllRules()
+        viewModelScope.launch {
+            settingsStore.saveDomainRules(allRules)
+            SessionService.updateDomainRules(allRules)
+            runCatching { diagnostics.updateDomainRules(DomainRule.serializeList(allRules)) }
+            val localReport = TunTrafficEngine.getBpfAttributionReport()
+            localState.update { it.copy(bpfAttribution = localReport) }
+            localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            refreshClients()
+        }
+    }
+
+    fun removeDomainRule(ruleId: String) {
+        if (!DomainFilterEngine.removeRuleById(ruleId)) return
+        val allRules = DomainFilterEngine.getAllRules()
+        viewModelScope.launch {
+            settingsStore.saveDomainRules(allRules)
+            SessionService.updateDomainRules(allRules)
+            runCatching { diagnostics.updateDomainRules(DomainRule.serializeList(allRules)) }
+            val localReport = TunTrafficEngine.getBpfAttributionReport()
+            localState.update { it.copy(bpfAttribution = localReport) }
+            localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            refreshClients()
+        }
+    }
+
+    fun clearGlobalDomainRules() {
+        DomainFilterEngine.clearGlobalRules()
+        val allRules = DomainFilterEngine.getAllRules()
+        viewModelScope.launch {
+            settingsStore.saveDomainRules(allRules)
+            SessionService.updateDomainRules(allRules)
+            runCatching { diagnostics.updateDomainRules(DomainRule.serializeList(allRules)) }
+            val localReport = TunTrafficEngine.getBpfAttributionReport()
+            localState.update { it.copy(bpfAttribution = localReport) }
+            localFirewallDiag.update { it.copy(bpfReport = localReport) }
+            refreshClients()
+        }
+    }
+
+    fun clearClientDomainRules(clientMac: String? = null) {
+        DomainFilterEngine.clearClientRules(clientMac)
+        val allRules = DomainFilterEngine.getAllRules()
+        viewModelScope.launch {
+            settingsStore.saveDomainRules(allRules)
+            SessionService.updateDomainRules(allRules)
+            runCatching { diagnostics.updateDomainRules(DomainRule.serializeList(allRules)) }
+            val localReport = TunTrafficEngine.getBpfAttributionReport()
+            localState.update { it.copy(bpfAttribution = localReport) }
+            localFirewallDiag.update { it.copy(bpfReport = localReport) }
             refreshClients()
         }
     }

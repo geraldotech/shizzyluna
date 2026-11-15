@@ -78,6 +78,129 @@ class TetherSession(private val context: Context) {
         return TunTrafficEngine.collectBpfSnapshotNow().toJson().toString()
     }
 
+    fun setBpfRefreshOnMissConfig(enabled: Boolean, cooldownMs: Int): String {
+        TunTrafficEngine.configureBpfRefreshOnMiss(
+            enabled = enabled,
+            cooldownMs = cooldownMs.toLong(),
+        )
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun setDeepTupleDiagnosticsEnabled(enabled: Boolean): String {
+        TunTrafficEngine.configureDeepTupleDiagnostics(enabled = enabled)
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun resetBpfDiagnosticsCounters(): String {
+        TunTrafficEngine.resetAttributionDiagnosticsCounters()
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun setPhaseDEnforcementMode(mode: String): String {
+        val parsed = runCatching { PhaseDEnforcementMode.valueOf(mode.trim()) }
+            .getOrDefault(PhaseDEnforcementMode.DIAGNOSTIC)
+        TunTrafficEngine.configurePhaseDMode(parsed)
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun recordPhaseDDeliveryTestMarker(markerType: String, note: String): String {
+        TunTrafficEngine.recordDeliveryTestMarker(markerType = markerType, note = note)
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun setStopHotspotOnVpnDisconnect(enabled: Boolean): String {
+        vpn.updateStopHotspotOnVpnDisconnect(enabled)
+        return status()
+    }
+
+    fun setDnsAttributionRetryConfig(enabled: Boolean, maxWaitMs: Int): String {
+        TunTrafficEngine.configureDnsAttributionRetry(
+            enabled = enabled,
+            maxWaitMs = maxWaitMs.toLong(),
+        )
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    private fun syncInterfacesIfActive() {
+        if (isActive) {
+            val snapshot = downstream.inspectSnapshot(forceRefresh = false)
+            HostFirewall.enforce(activeRules, snapshot.clients, logSummary = false)
+            val downIface = snapshot.apInterfaces.firstOrNull().orEmpty()
+            TunTrafficEngine.bpfAttributor.syncInterfaces(downIface, interfaceName.orEmpty())
+        }
+    }
+
+    fun selectBlockingMode(mode: String): String {
+        syncInterfacesIfActive()
+        val parsed = runCatching { BlockingMode.valueOf(mode.trim()) }
+            .getOrDefault(BlockingMode.BPF_NAT_VPN)
+        ExclusiveBlockingModeController.selectRequestedMode(parsed)
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun checkPreNatCapability(): String {
+        syncInterfacesIfActive()
+        ExclusiveBlockingModeController.checkCapabilityReadOnly()
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun reviewPreNatScopedProbe(): String {
+        syncInterfacesIfActive()
+        ExclusiveBlockingModeController.reviewScopedProbePlan()
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun runPreNatScopedProbe(userConfirmed: Boolean): String {
+        syncInterfacesIfActive()
+        ExclusiveBlockingModeController.runUserApprovedScopedProbe(userConfirmed)
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun activatePreNatBlockingMode(): String {
+        syncInterfacesIfActive()
+        ExclusiveBlockingModeController.activatePreNatMode()
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun restoreBpfBlockingMode(): String {
+        syncInterfacesIfActive()
+        ExclusiveBlockingModeController.restoreBpfNatVpnMode(reason = "User requested restore current engine")
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun checkSoftApCapability(): String {
+        syncInterfacesIfActive()
+        ExclusiveBlockingModeController.checkSoftApCapability()
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun runSoftApLiveProbe(
+        clientAMac: String,
+        clientBMac: String,
+        userConfirmed: Boolean,
+        disconnectTimeoutMs: Int,
+    ): String {
+        syncInterfacesIfActive()
+        ExclusiveBlockingModeController.runSoftApLiveProbe(
+            clientAMac = clientAMac,
+            clientBMac = clientBMac,
+            userConfirmed = userConfirmed,
+            disconnectTimeoutMs = disconnectTimeoutMs.coerceIn(500, 30_000).toLong(),
+        )
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
+    fun activateSoftApBlockingMode(): String {
+        syncInterfacesIfActive()
+        val clients = if (isActive) downstream.listDiscoveredClients(forceRefresh = true) else emptyList()
+        ExclusiveBlockingModeController.activateSoftApBlockingMode(
+            rules = activeRules,
+            discoveredHosts = clients,
+        )
+        HostFirewall.enforce(activeRules, clients, logSummary = true)
+        return TunTrafficEngine.getBpfAttributionReport().toJson().toString()
+    }
+
     fun updateRules(rulesJson: String) {
         val previousCount = activeRules.size
         activeRules = ClientRule.parseList(rulesJson)
@@ -92,6 +215,16 @@ class TetherSession(private val context: Context) {
                     "backend=${summary.firewallBackend.name}, datapath=${summary.datapathMode.name})",
             )
         }
+    }
+
+    fun updateDomainRules(domainRulesJson: String) {
+        val parsed = DomainRule.deserializeList(domainRulesJson)
+        DomainFilterEngine.replaceAllRules(parsed)
+        val globalCount = parsed.count { it.scope == DomainRuleScope.GLOBAL && it.enabled }
+        val clientCount = parsed.count { it.scope == DomainRuleScope.CLIENT && it.enabled }
+        SessionLog.info(
+            "Domain filter rules updated: total=${parsed.size} (enabledGlobal=$globalCount, enabledPerHost=$clientCount, gen=${DomainFilterEngine.currentRuleGeneration()})",
+        )
     }
 
     fun resetClientQuota(mac: String) {
@@ -192,6 +325,7 @@ class TetherSession(private val context: Context) {
 
     private fun followVpn(group: SessionResources) {
         if (vpnMode == VpnMode.NEVER) {
+            vpn.configureForSessionStart(VpnMode.NEVER)
             SessionLog.info("vpn mode never: datapath left unbound")
             return
         }
@@ -199,7 +333,7 @@ class TetherSession(private val context: Context) {
         check(vpnMode != VpnMode.ALWAYS || vpn.isVpnPresent()) {
             "followVpn: vpn mode always requires an active VPN, none is connected"
         }
-        vpn.follow(group)
+        vpn.follow(group, vpnMode)
     }
 
     private fun startWatchdog(name: String) {
@@ -276,6 +410,11 @@ class TetherSession(private val context: Context) {
         vpn.stop()
         teardown.removeShutdownHook()
         HostFirewall.clearAll()
+        ExclusiveBlockingModeController.onSessionOrInterfacesChanged(
+            downstreamIface = "",
+            upstreamIface = "",
+            sessionGeneration = TunTrafficEngine.bpfAttributor.currentSessionGeneration,
+        )
 
         val summary = if (activeSince == 0L) null else sessionSummary()
 
@@ -327,12 +466,31 @@ class TetherSession(private val context: Context) {
     }
 
     fun status(): String = JSONObject().apply {
+        val bypassed = isVpnBypassed()
+        val vpnDiag = vpn.buildDiagnostics(isSessionActive = isActive, isVpnBypassed = bypassed)
+        val effectiveDetail = when {
+            isActive && vpnDiag.vpnLifecycleState == VpnLifecycleState.VPN_WAITING_FOR_RECOVERY ->
+                "VPN disconnected — waiting for reconnection"
+            isActive && vpnDiag.vpnLifecycleState == VpnLifecycleState.VPN_REBINDING ->
+                "VPN reconnecting — re-binding datapath"
+            isActive && vpnDiag.vpnLifecycleState == VpnLifecycleState.VPN_RECOVERY_FAILED ->
+                "VPN reconnect failed — retrying (traffic paused)"
+            else -> detail
+        }
         put("state", state.name)
-        put("detail", detail)
+        put("detail", effectiveDetail)
         put("interface", interfaceName ?: JSONObject.NULL)
 
         put("isVpnBound", vpn.isBound)
-        put("isVpnBypassed", isVpnBypassed())
+        put("isVpnBypassed", bypassed)
+        put("vpnLifecycleState", vpnDiag.vpnLifecycleState.name)
+        put("stopHotspotOnVpnDisconnect", vpnDiag.stopHotspotOnVpnDisconnect)
+        put("vpnOutageCount", vpnDiag.vpnOutageCount)
+        put("vpnRecoveryCount", vpnDiag.vpnRecoveryCount)
+        put("vpnWaitingDurationMs", vpnDiag.vpnWaitingDurationMs)
+        put("vpnForwardingGateClosed", vpnDiag.vpnForwardingGateClosed)
+        put("vpnStatusLabel", vpnDiag.vpnStatusLabel)
+        put("vpnRecoveryDiagnostics", vpnDiag.toJson())
 
         val traffic = interfaceName?.let(InterfaceCounters::read) ?: Traffic()
         put("bytesUp", traffic.up)
@@ -395,7 +553,12 @@ class TetherSession(private val context: Context) {
             }
         }
         put("connectedClients", clientsArray)
-        put("bpfAttribution", TunTrafficEngine.getBpfAttributionReport().toJson())
+        put(
+            "bpfAttribution",
+            TunTrafficEngine.getBpfAttributionReport()
+                .copy(vpnRecoveryDiagnostics = vpnDiag)
+                .toJson(),
+        )
     }.toString()
 
     private fun isVpnBypassed(): Boolean {

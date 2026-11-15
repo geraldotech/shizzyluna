@@ -27,6 +27,7 @@ data class Settings(
     val isLogging: Boolean = true,
 
     val vpnMode: VpnMode = VpnMode.AUTO,
+    val stopHotspotOnVpnDisconnect: Boolean = true,
 
     val hasCompletedOnboarding: Boolean = false,
 
@@ -37,6 +38,15 @@ data class Settings(
     val clientRules: List<ClientRule> = emptyList(),
     val experimentalBpfEnabled: Boolean = true,
     val bpfPollIntervalMs: Int = 1000,
+    val bpfRefreshOnMissEnabled: Boolean = false,
+    val bpfDeepTupleDiagnosticsEnabled: Boolean = false,
+    val bpfExportPseudonymousIds: Boolean = false,
+    val phaseDEnforcementMode: PhaseDEnforcementMode = PhaseDEnforcementMode.DIAGNOSTIC,
+    val requestedBlockingMode: BlockingMode = BlockingMode.BPF_NAT_VPN,
+    val legacyPreNatMigrated: Boolean = false,
+    val domainRules: List<DomainRule> = emptyList(),
+    val dnsAttributionRetryEnabled: Boolean = false,
+    val dnsRetryMaxWaitMs: Int = 200,
 )
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
@@ -83,6 +93,10 @@ class SettingsStore(private val context: Context) {
 
     suspend fun setVpnMode(mode: VpnMode) {
         context.dataStore.edit { it[VPN_MODE] = mode.name }
+    }
+
+    suspend fun setStopHotspotOnVpnDisconnect(enabled: Boolean) {
+        context.dataStore.edit { it[STOP_HOTSPOT_ON_VPN_DISCONNECT] = enabled }
     }
 
     suspend fun setOnboardingComplete(hasCompleted: Boolean) {
@@ -234,6 +248,54 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { it[BPF_POLL_INTERVAL_MS] = intervalMs.coerceIn(500, 5000) }
     }
 
+    suspend fun setBpfRefreshOnMissEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[BPF_REFRESH_ON_MISS_ENABLED] = enabled }
+    }
+
+    suspend fun setBpfDeepTupleDiagnosticsEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[BPF_DEEP_TUPLE_DIAGNOSTICS_ENABLED] = enabled }
+    }
+
+    suspend fun setBpfExportPseudonymousIds(enabled: Boolean) {
+        context.dataStore.edit { it[BPF_EXPORT_PSEUDONYMOUS_IDS] = enabled }
+    }
+
+    suspend fun setPhaseDEnforcementMode(mode: PhaseDEnforcementMode) {
+        context.dataStore.edit { it[PHASE_D_ENFORCEMENT_MODE] = mode.name }
+    }
+
+    suspend fun setRequestedBlockingMode(mode: BlockingMode) {
+        context.dataStore.edit { it[REQUESTED_BLOCKING_MODE] = mode.name }
+    }
+
+    suspend fun migrateLegacyBlockingModeIfNeeded(): Boolean {
+        var migrated = false
+        context.dataStore.edit { preferences ->
+            val raw = preferences[REQUESTED_BLOCKING_MODE]
+            val (mode, wasLegacy) = BlockingMode.parseWithMigration(raw)
+            if (wasLegacy) {
+                preferences[REQUESTED_BLOCKING_MODE] = mode.name
+                preferences[LEGACY_PRENAT_MIGRATED] = true
+                migrated = true
+            }
+        }
+        return migrated
+    }
+
+    suspend fun saveDomainRules(rules: List<DomainRule>) {
+        context.dataStore.edit { preferences ->
+            preferences[DOMAIN_RULES] = DomainRule.serializeList(rules)
+        }
+    }
+
+    suspend fun setDnsAttributionRetryEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[DNS_ATTRIBUTION_RETRY_ENABLED] = enabled }
+    }
+
+    suspend fun setDnsRetryMaxWaitMs(maxWaitMs: Int) {
+        context.dataStore.edit { it[DNS_RETRY_MAX_WAIT_MS] = maxWaitMs.coerceIn(150, 300) }
+    }
+
     private fun MutablePreferences.mintTokenIfAbsent() {
         if (!this[AUTOMATION_TOKEN].isNullOrEmpty()) return
 
@@ -257,25 +319,50 @@ internal val CUSTOM_DNS_SECONDARY = stringPreferencesKey("custom_dns_secondary")
 internal val CLIENT_RULES = stringPreferencesKey("client_rules")
 internal val EXPERIMENTAL_BPF_ENABLED = booleanPreferencesKey("experimental_bpf_enabled")
 internal val BPF_POLL_INTERVAL_MS = intPreferencesKey("bpf_poll_interval_ms")
+internal val BPF_REFRESH_ON_MISS_ENABLED = booleanPreferencesKey("bpf_refresh_on_miss_enabled")
+internal val BPF_DEEP_TUPLE_DIAGNOSTICS_ENABLED = booleanPreferencesKey("bpf_deep_tuple_diagnostics_enabled")
+internal val BPF_EXPORT_PSEUDONYMOUS_IDS = booleanPreferencesKey("bpf_export_pseudonymous_ids")
+internal val PHASE_D_ENFORCEMENT_MODE = stringPreferencesKey("phase_d_enforcement_mode")
+internal val REQUESTED_BLOCKING_MODE = stringPreferencesKey("requested_blocking_mode")
+internal val LEGACY_PRENAT_MIGRATED = booleanPreferencesKey("legacy_prenat_migrated")
+internal val DOMAIN_RULES = stringPreferencesKey("domain_rules")
+internal val STOP_HOTSPOT_ON_VPN_DISCONNECT = booleanPreferencesKey("stop_hotspot_on_vpn_disconnect")
+internal val DNS_ATTRIBUTION_RETRY_ENABLED = booleanPreferencesKey("dns_attribution_retry_enabled")
+internal val DNS_RETRY_MAX_WAIT_MS = intPreferencesKey("dns_retry_max_wait_ms")
 
-internal fun toSettings(preferences: Preferences) = Settings(
-    theme = runCatching { ThemeChoice.valueOf(preferences[THEME].orEmpty()) }
-        .getOrDefault(ThemeChoice.SYSTEM),
-    design = runCatching { DesignLanguage.valueOf(preferences[DESIGN].orEmpty()) }
-        .getOrDefault(DesignLanguage.MATERIAL_EXPRESSIVE),
-    accent = parseAccent(preferences[ACCENT]),
-    customAccents = parseAccents(preferences[CUSTOM_ACCENTS]),
-    isLogging = preferences[LOGGING] ?: true,
-    vpnMode = parseVpnMode(preferences[VPN_MODE]),
-    hasCompletedOnboarding = preferences[ONBOARDED] ?: false,
-    isAutomationEnabled = preferences[AUTOMATION] ?: false,
-    automationToken = preferences[AUTOMATION_TOKEN].orEmpty(),
-    dnsSettings = DnsSettings(
-        preset = DnsPreset.parse(preferences[DNS_PRESET]),
-        customPrimary = preferences[CUSTOM_DNS_PRIMARY].orEmpty(),
-        customSecondary = preferences[CUSTOM_DNS_SECONDARY].orEmpty(),
-    ),
-    clientRules = ClientRule.parseList(preferences[CLIENT_RULES]),
-    experimentalBpfEnabled = preferences[EXPERIMENTAL_BPF_ENABLED] ?: true,
-    bpfPollIntervalMs = (preferences[BPF_POLL_INTERVAL_MS] ?: 1000).coerceIn(500, 5000),
-)
+internal fun toSettings(preferences: Preferences): Settings {
+    val (parsedMode, wasLegacyPreNat) = BlockingMode.parseWithMigration(preferences[REQUESTED_BLOCKING_MODE])
+    return Settings(
+        theme = runCatching { ThemeChoice.valueOf(preferences[THEME].orEmpty()) }
+            .getOrDefault(ThemeChoice.SYSTEM),
+        design = runCatching { DesignLanguage.valueOf(preferences[DESIGN].orEmpty()) }
+            .getOrDefault(DesignLanguage.MATERIAL_EXPRESSIVE),
+        accent = parseAccent(preferences[ACCENT]),
+        customAccents = parseAccents(preferences[CUSTOM_ACCENTS]),
+        isLogging = preferences[LOGGING] ?: true,
+        vpnMode = parseVpnMode(preferences[VPN_MODE]),
+        stopHotspotOnVpnDisconnect = preferences[STOP_HOTSPOT_ON_VPN_DISCONNECT] ?: true,
+        hasCompletedOnboarding = preferences[ONBOARDED] ?: false,
+        isAutomationEnabled = preferences[AUTOMATION] ?: false,
+        automationToken = preferences[AUTOMATION_TOKEN].orEmpty(),
+        dnsSettings = DnsSettings(
+            preset = DnsPreset.parse(preferences[DNS_PRESET]),
+            customPrimary = preferences[CUSTOM_DNS_PRIMARY].orEmpty(),
+            customSecondary = preferences[CUSTOM_DNS_SECONDARY].orEmpty(),
+        ),
+        clientRules = ClientRule.parseList(preferences[CLIENT_RULES]),
+        experimentalBpfEnabled = preferences[EXPERIMENTAL_BPF_ENABLED] ?: true,
+        bpfPollIntervalMs = (preferences[BPF_POLL_INTERVAL_MS] ?: 1000).coerceIn(500, 5000),
+        bpfRefreshOnMissEnabled = preferences[BPF_REFRESH_ON_MISS_ENABLED] ?: false,
+        bpfDeepTupleDiagnosticsEnabled = preferences[BPF_DEEP_TUPLE_DIAGNOSTICS_ENABLED] ?: false,
+        bpfExportPseudonymousIds = preferences[BPF_EXPORT_PSEUDONYMOUS_IDS] ?: false,
+        phaseDEnforcementMode = runCatching {
+            PhaseDEnforcementMode.valueOf(preferences[PHASE_D_ENFORCEMENT_MODE].orEmpty())
+        }.getOrDefault(PhaseDEnforcementMode.DIAGNOSTIC),
+        requestedBlockingMode = parsedMode,
+        legacyPreNatMigrated = wasLegacyPreNat || (preferences[LEGACY_PRENAT_MIGRATED] ?: false),
+        domainRules = DomainRule.deserializeList(preferences[DOMAIN_RULES]),
+        dnsAttributionRetryEnabled = preferences[DNS_ATTRIBUTION_RETRY_ENABLED] ?: false,
+        dnsRetryMaxWaitMs = (preferences[DNS_RETRY_MAX_WAIT_MS] ?: 200).coerceIn(150, 300),
+    )
+}

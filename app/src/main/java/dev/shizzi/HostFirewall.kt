@@ -384,6 +384,38 @@ object HostFirewall {
         }
     }
 
+    @Volatile
+    private var lastEnforcedRules: List<ClientRule> = emptyList()
+
+    @Volatile
+    private var lastConnectedHosts: List<DiscoveredHost> = emptyList()
+
+    fun reconcileSoftApFromQuotaChange() {
+        val rulesSnap = lastEnforcedRules
+        val hostsSnap = lastConnectedHosts
+        val updatedRules = rulesSnap.map { rule ->
+            val q = TunTrafficEngine.getQuotaRecord(rule.cleanMac)
+            if (q != null) {
+                rule.copy(
+                    quotaUsedRxBytes = maxOf(rule.quotaUsedRxBytes, q.sanitizedRxBytes),
+                    quotaUsedTxBytes = maxOf(rule.quotaUsedTxBytes, q.sanitizedTxBytes),
+                    quotaWindowId = q.windowId.ifBlank { rule.quotaWindowId },
+                    quotaWindowStartEpochMs = maxOf(rule.quotaWindowStartEpochMs, q.windowStartEpochMs),
+                    quotaLastUpdatedEpochMs = maxOf(rule.quotaLastUpdatedEpochMs, q.lastUpdatedEpochMs),
+                    quotaResetGeneration = maxOf(rule.quotaResetGeneration, q.resetGeneration),
+                )
+            } else {
+                rule
+            }
+        }
+        ExclusiveBlockingModeController.softApEngine.reconcilePolicies(
+            rules = updatedRules,
+            discoveredHosts = hostsSnap,
+            nowEpochMs = TunTrafficEngine.quotaClockMillisProvider(),
+            zoneId = TunTrafficEngine.quotaZoneIdProvider(),
+        )
+    }
+
     @Synchronized
     fun enforce(
         rules: List<ClientRule>,
@@ -392,6 +424,8 @@ object HostFirewall {
     ): EnforcementSummary {
         ensureKernelCapabilityChecked()
         TunTrafficEngine.syncQuotaRules(rules)
+        lastEnforcedRules = rules
+        lastConnectedHosts = connectedHosts
 
         val nowMillis = TunTrafficEngine.quotaClockMillisProvider()
         val currentHour = Calendar.getInstance(java.util.TimeZone.getTimeZone(TunTrafficEngine.quotaZoneIdProvider())).apply {
@@ -511,9 +545,38 @@ object HostFirewall {
             }
         }
 
+        // In SOFTAP_MAC_BLOCK mode, TunTrafficEngine packet drops/throttling must remain disabled
+        // while quota accounting continues and SoftApMacBlockEngine enforces client blocks natively.
+        if (ExclusiveBlockingModeController.effectiveModeOrNull == BlockingMode.SOFTAP_MAC_BLOCK) {
+            TunTrafficEngine.bpfNatVpnEnforcementEnabled = false
+        }
+
         TunTrafficEngine.updatePolicies(userspacePolicies, connectedHosts)
 
-        if (isKernelNetfilterAvailable &&
+        val rulesWithLiveQuota = rules.map { rule ->
+            val q = TunTrafficEngine.getQuotaRecord(rule.cleanMac)
+            if (q != null) {
+                rule.copy(
+                    quotaUsedRxBytes = maxOf(rule.quotaUsedRxBytes, q.sanitizedRxBytes),
+                    quotaUsedTxBytes = maxOf(rule.quotaUsedTxBytes, q.sanitizedTxBytes),
+                    quotaWindowId = q.windowId.ifBlank { rule.quotaWindowId },
+                    quotaWindowStartEpochMs = maxOf(rule.quotaWindowStartEpochMs, q.windowStartEpochMs),
+                    quotaLastUpdatedEpochMs = maxOf(rule.quotaLastUpdatedEpochMs, q.lastUpdatedEpochMs),
+                    quotaResetGeneration = maxOf(rule.quotaResetGeneration, q.resetGeneration),
+                )
+            } else {
+                rule
+            }
+        }
+        ExclusiveBlockingModeController.softApEngine.reconcilePolicies(
+            rules = rulesWithLiveQuota,
+            discoveredHosts = connectedHosts,
+            nowEpochMs = nowMillis,
+            zoneId = TunTrafficEngine.quotaZoneIdProvider(),
+        )
+
+        if (ExclusiveBlockingModeController.effectiveModeOrNull != BlockingMode.SOFTAP_MAC_BLOCK &&
+            isKernelNetfilterAvailable &&
             (capabilityMatrix.canWriteBothFamiliesNetfilter || capabilityMatrix.canWriteBothFamiliesIpRule)
         ) {
             syncKernelRules(targetBlockIps, targetBlockMacs, targetThrottleIps)

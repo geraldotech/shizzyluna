@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -25,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.shizzi.SessionUiState
 import dev.shizzi.UiStatus
+import dev.shizzi.VpnLifecycleState
 import dev.shizzi.ui.theme.HeaderHeight
 import dev.shizzi.ui.theme.ScreenPadding
 import dev.shizzi.ui.theme.ShizziTheme
@@ -55,6 +57,7 @@ fun HomePage(
             state = state,
             onOpenSettings = actions.onOpenSettings,
             onOpenClients = actions.onOpenClients,
+            onOpenDomainBlocking = actions.onOpenDomainBlocking,
         )
 
         HomeBody(state = state, actions = actions)
@@ -69,7 +72,11 @@ fun HomePage(
                 contentAlignment = Alignment.BottomCenter,
             ) {
                 RiseIn(isVisible = isShowingVpn(state)) {
-                    VpnChip(isBypassed = state.isVpnBypassed)
+                    VpnChip(
+                        isBypassed = state.isVpnBypassed,
+                        vpnLifecycleState = state.vpnLifecycleState,
+                        vpnRecoveryCount = state.vpnRecoveryCount,
+                    )
                 }
             }
 
@@ -87,6 +94,7 @@ data class HomeActions(
     val onOpenSettings: () -> Unit,
     val onOpenClients: () -> Unit,
     val onOpenEasterEgg: () -> Unit,
+    val onOpenDomainBlocking: () -> Unit = {},
 )
 
 @Composable
@@ -94,6 +102,7 @@ private fun HomeHeader(
     state: SessionUiState,
     onOpenSettings: () -> Unit,
     onOpenClients: () -> Unit,
+    onOpenDomainBlocking: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -107,6 +116,15 @@ private fun HomeHeader(
         }
 
         Spacer(Modifier.weight(1f))
+
+        ShizziIconButton(
+            icon = Icons.Filled.Dns,
+            contentDescription = "Domain Blocking",
+            onClick = onOpenDomainBlocking,
+            tint = ShizziTheme.colors.onSurfaceMuted,
+        )
+
+        Spacer(Modifier.width(4.dp))
 
         ShizziIconButton(
             icon = Icons.Filled.Devices,
@@ -127,7 +145,11 @@ private fun HomeHeader(
 }
 
 private fun isShowingVpn(state: SessionUiState): Boolean {
-    val hasVpn = state.isVpnBound || state.isVpnBypassed
+    val hasVpn = state.isVpnBound ||
+        state.isVpnBypassed ||
+        state.vpnLifecycleState == VpnLifecycleState.VPN_WAITING_FOR_RECOVERY ||
+        state.vpnLifecycleState == VpnLifecycleState.VPN_REBINDING ||
+        state.vpnLifecycleState == VpnLifecycleState.VPN_RECOVERY_FAILED
 
     return hasVpn && state.status == UiStatus.CONNECTED
 }

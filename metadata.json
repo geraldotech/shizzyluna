@@ -1,6 +1,6 @@
 {
-  "name": "shizzy lua",
-  "description": "Rootless hotspot & tethering carrier restriction bypass utility with eBPF NAT flow attribution, per-client token-bucket QoS, and persistent data quota limits (v0.10.2)",
+  "name": "Shizzy Luna",
+  "description": "Rootless hotspot and tethering utility with client access control, data limits, bandwidth limits, domain blocking, and VPN recovery (v0.10.3)",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

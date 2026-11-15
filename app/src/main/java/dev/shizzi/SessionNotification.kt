@@ -35,8 +35,14 @@ class SessionNotification(private val context: Context) {
         }
 
     private fun connectedTitle(state: SessionUiState): String = when {
+        state.vpnLifecycleState == VpnLifecycleState.VPN_WAITING_FOR_RECOVERY ->
+            "Connected · VPN disconnected — waiting for reconnection"
+        state.vpnLifecycleState == VpnLifecycleState.VPN_REBINDING ||
+            state.vpnLifecycleState == VpnLifecycleState.VPN_RECOVERY_FAILED ->
+            "Connected · VPN reconnecting"
         state.isVpnBypassed -> "Connected · VPN ignored"
-        state.isVpnBound -> "Connected · VPN"
+        state.isVpnBound && state.vpnRecoveryCount > 0L -> "Connected · VPN recovered"
+        state.isVpnBound -> "Connected · VPN connected"
         else -> "Connected"
     }
 
@@ -55,11 +61,21 @@ class SessionNotification(private val context: Context) {
     private fun loadingBody(isStopping: Boolean): String =
         if (isStopping) "Turning the hotspot off…" else "Turning the hotspot on…"
 
-    private fun connectedBody(state: SessionUiState): String = when (state.clientCount) {
-        0 -> "No devices connected"
-        else -> "${deviceCount(state.clientCount)} · " +
-            "$DOWN_ARROW ${Traffic.format(state.traffic.down)} · " +
-            "$UP_ARROW ${Traffic.format(state.traffic.up)}"
+    private fun connectedBody(state: SessionUiState): String {
+        val base = when (state.clientCount) {
+            0 -> "No devices connected"
+            else -> "${deviceCount(state.clientCount)} · " +
+                "$DOWN_ARROW ${Traffic.format(state.traffic.down)} · " +
+                "$UP_ARROW ${Traffic.format(state.traffic.up)}"
+        }
+        return when (state.vpnLifecycleState) {
+            VpnLifecycleState.VPN_WAITING_FOR_RECOVERY ->
+                "VPN disconnected — waiting for reconnection (forwarding gated) · $base"
+            VpnLifecycleState.VPN_REBINDING,
+            VpnLifecycleState.VPN_RECOVERY_FAILED,
+            -> "VPN reconnecting (forwarding gated) · $base"
+            else -> base
+        }
     }
 
     private fun deviceCount(clients: Int): String = when (clients) {

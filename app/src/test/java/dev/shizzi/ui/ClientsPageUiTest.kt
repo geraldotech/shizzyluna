@@ -5,6 +5,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -13,6 +14,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
 import dev.shizzi.ClientRule
 import dev.shizzi.ConnectedClient
@@ -337,10 +339,12 @@ class ClientsPageComposeTest {
         composeTestRule.onAllNodesWithText("BPF & Firewall Diagnostics").assertCountEquals(0)
         composeTestRule.onAllNodesWithText("Collect BPF").assertCountEquals(0)
 
-        // Connected Devices still shows client card, 0.512 Mbps badge, and 08:00 - 22:00 schedule badge
+        // Connected Devices still shows client card, 0.512 Mbps badge, and 08:00 - 22:00 schedule badge without debug attribution counters or datapath header
         composeTestRule.onNodeWithTag("client_card_E2:15:CD:54:E4:9B").assertIsDisplayed()
-        composeTestRule.onNode(hasText("0.512 Mbps", substring = true)).assertIsDisplayed()
+        composeTestRule.onNode(hasText("Limit: 0.512 Mbps", substring = true)).assertIsDisplayed()
         composeTestRule.onNode(hasText("Sched: 08:00 - 22:00", substring = true)).assertIsDisplayed()
+        composeTestRule.onAllNodesWithText("Datapath:", substring = true).assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("seen=", substring = true).assertCountEquals(0)
     }
 
     @Test
@@ -407,9 +411,12 @@ class ClientsPageComposeTest {
         composeTestRule.onNodeWithText("Experimental BPF NAT Attribution")
             .performScrollTo()
             .assertIsDisplayed()
-        composeTestRule.onNodeWithText("Diagnóstico do firewall & BPF NAT")
+        composeTestRule.onNodeWithTag("export_diagnostics_action")
             .performScrollTo()
             .assertIsDisplayed()
+        // Debug panel and Portuguese debug entry are removed in 0.10.3 release
+        composeTestRule.onAllNodesWithTag("bpf_diagnostics_debug_card").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Diagnóstico do firewall & BPF NAT").assertCountEquals(0)
     }
 
     @Test
@@ -483,13 +490,13 @@ class ClientsPageComposeTest {
             .performClick()
         composeTestRule.waitForIdle()
 
-        // About modal displays shizzy lua, Version 0.10.2, Author: GeraldoDev, GitHub button, and Close button
+        // About modal displays Shizzy Luna, Version 0.10.3, Author: GeraldoDev, GitHub button, and Close button
         composeTestRule.onNodeWithTag("about_modal_title")
             .assertIsDisplayed()
-            .assertTextContains("shizzy lua")
+            .assertTextContains("Shizzy Luna")
         composeTestRule.onNodeWithTag("about_modal_version")
             .assertIsDisplayed()
-            .assertTextContains("Version 0.10.2")
+            .assertTextContains("Version 0.10.3")
         composeTestRule.onNodeWithTag("about_modal_author")
             .assertIsDisplayed()
             .assertTextContains("Author: GeraldoDev")
@@ -596,4 +603,552 @@ class ClientsPageComposeTest {
         assertEquals(0L, savedRule!!.quotaUsedTxBytes)
         assertEquals(2L, savedRule!!.quotaResetGeneration)
     }
+
+    @Test
+    fun `13 v0_10_3 release Developer Settings removes BPF Attribution Diagnostics debug card and exports redacted files`() {
+        val baseContext = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val appInstance = dev.shizzi.App()
+        android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+            .apply {
+                isAccessible = true
+                invoke(appInstance, baseContext)
+            }
+        dev.shizzi.App::class.java.getDeclaredField("instance").apply {
+            isAccessible = true
+            set(null, appInstance)
+        }
+
+        val sampleReport = dev.shizzi.BpfAttributionStatusReport(
+            experimentalEnabled = true,
+            state = dev.shizzi.ExperimentalBpfState.MAPPINGS_AVAILABLE,
+            collectionStatus = dev.shizzi.BpfCollectionStatus.OK,
+            snapshotHealth = dev.shizzi.BpfSnapshotHealth.OK,
+            lastSuccessfulRefreshEpochMs = 1_700_000_000_000L,
+            snapshotAgeMs = 240L,
+            lastCollectionDurationMs = 9L,
+            totalCollectionsAttempted = 12L,
+            totalCollectionsSucceeded = 12L,
+            totalCollectionsFailed = 0L,
+            activeMappedFlows = 5,
+            totalEligiblePackets = 200L,
+            totalEligibleBytes = 240_000L,
+            totalAttributedPackets = 190L,
+            totalAttributedBytes = 228_000L,
+            directAttributedPackets = 40L,
+            directAttributedBytes = 48_000L,
+            bpfAttributedPackets = 150L,
+            bpfAttributedBytes = 180_000L,
+            unknownForwardedPackets = 10L,
+            unknownForwardedBytes = 12_000L,
+            unattributedPacketsByReason = mapOf(dev.shizzi.UnattributedReason.TUPLE_NOT_PRESENT.name to 10L),
+            unattributedBytesByReason = mapOf(dev.shizzi.UnattributedReason.TUPLE_NOT_PRESENT.name to 12_000L),
+            perClientCounts = listOf(
+                dev.shizzi.ClientProtocolFlowCounts(
+                    mac = "E2:15:CD:54:E4:9B",
+                    originalIpv4 = "192.168.167.151",
+                    tcpFlows = 4,
+                    udpFlows = 1,
+                ),
+            ),
+        )
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                SettingsPage(
+                    state = SettingsState(
+                        shizuku = ShizukuState.Ready(uid = 2000, isRoot = false),
+                        permissions = emptyList(),
+                        theme = ThemeChoice.DARK,
+                        design = DesignLanguage.MATERIAL_EXPRESSIVE,
+                        accent = AccentChoice.Default,
+                        customAccents = emptyList(),
+                        isLogging = true,
+                        vpnMode = VpnMode.AUTO,
+                        isRunningDiagnostics = false,
+                        automation = AutomationState(isEnabled = false, token = ""),
+                        dnsSettings = DnsSettings(),
+                        experimentalBpfEnabled = true,
+                        bpfReport = sampleReport,
+                    ),
+                    actions = SettingsActions(
+                        onSetTheme = {},
+                        onSetDesign = {},
+                        onSetAccent = {},
+                        onAddCustomAccent = {},
+                        onSetLogging = {},
+                        onSetVpnMode = {},
+                        onSetDnsPreset = {},
+                        onSetCustomDns = { _, _ -> },
+                        onOpenClients = {},
+                        onOpenLog = {},
+                        onOpenFirewallDiagnostic = {},
+                        onSetExperimentalBpfEnabled = {},
+                        onRunProbes = {},
+                        onGrantPermission = {},
+                        onShizukuAction = {},
+                        onRestartOnboarding = {},
+                        automation = AutomationActions(
+                            onSetEnabled = {},
+                            onRegenerateToken = {},
+                        ),
+                    ),
+                    toasts = rememberToastState(),
+                    onBack = {},
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // AC02: BPF Attribution Diagnostics (Debug) card is absent from SettingsPage in 0.10.3 release
+        composeTestRule.onAllNodesWithTag("bpf_diagnostics_debug_card").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("BPF Attribution Diagnostics (Debug)").assertCountEquals(0)
+
+        // AC09: Export diagnostics action is available under Developer section
+        composeTestRule.onNodeWithTag("export_diagnostics_action")
+            .performScrollTo()
+            .assertIsDisplayed()
+
+        // Verify export helper writes redacted Markdown + JSON files with release FileProvider authority
+        val exported = writeBpfDiagnosticsExportFiles(
+            context = baseContext,
+            report = sampleReport,
+            includePseudonymousIds = false,
+            timestampMs = 1700000000123L,
+        )
+        assertEquals("dev.shizzyluna.proxy.exports", exported.authority)
+        assertTrue(exported.markdownFile.exists())
+        assertTrue(exported.jsonFile.exists())
+        assertFalse(dev.shizzi.DiagnosticRedactor.containsUnredactedPii(exported.markdownFile.readText()))
+        assertFalse(dev.shizzi.DiagnosticRedactor.containsUnredactedPii(exported.jsonFile.readText()))
+    }
+
+    @Test
+    fun `14 v0_10_3 release SettingsPage renders clean 2-option Blocking Mode section without verbose internals`() {
+        val baseContext = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val appInstance = dev.shizzi.App()
+        android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+            .apply {
+                isAccessible = true
+                invoke(appInstance, baseContext)
+            }
+        dev.shizzi.App::class.java.getDeclaredField("instance").apply {
+            isAccessible = true
+            set(null, appInstance)
+        }
+
+        var selectedMode: dev.shizzi.BlockingMode? = null
+
+        val preNatReport = dev.shizzi.PreNatModeDiagnosticReport(
+            requestedMode = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+            effectiveMode = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+            runtimeState = dev.shizzi.PreNatRuntimeState.CURRENT_ACTIVE,
+            exclusiveEngineInvariant = true,
+            legacyPreNatMigrated = true,
+            legacyPreNatCleanupVerified = true,
+        )
+        val reportWithPreNat = dev.shizzi.BpfAttributionStatusReport(
+            preNatDiagnostics = preNatReport,
+        )
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                SettingsPage(
+                    state = SettingsState(
+                        shizuku = ShizukuState.Ready(uid = 2000, isRoot = false),
+                        permissions = emptyList(),
+                        theme = ThemeChoice.DARK,
+                        design = DesignLanguage.MATERIAL_EXPRESSIVE,
+                        accent = AccentChoice.Default,
+                        customAccents = emptyList(),
+                        isLogging = true,
+                        vpnMode = VpnMode.AUTO,
+                        isRunningDiagnostics = false,
+                        automation = AutomationState(isEnabled = false, token = ""),
+                        dnsSettings = DnsSettings(),
+                        requestedBlockingMode = dev.shizzi.BlockingMode.BPF_NAT_VPN,
+                        bpfReport = reportWithPreNat,
+                    ),
+                    actions = SettingsActions(
+                        onSetTheme = {},
+                        onSetDesign = {},
+                        onSetAccent = {},
+                        onAddCustomAccent = {},
+                        onSetLogging = {},
+                        onSetVpnMode = {},
+                        onSetDnsPreset = {},
+                        onSetCustomDns = { _, _ -> },
+                        onOpenClients = {},
+                        onOpenLog = {},
+                        onSelectBlockingMode = { selectedMode = it },
+                        onRunProbes = {},
+                        onGrantPermission = {},
+                        onShizukuAction = {},
+                        onRestartOnboarding = {},
+                        automation = AutomationActions(
+                            onSetEnabled = {},
+                            onRegenerateToken = {},
+                        ),
+                    ),
+                    toasts = rememberToastState(),
+                    onBack = {},
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // AC03 & AC04: Clean Blocking Mode card with concise current mode line and no verbose internals
+        composeTestRule.onNodeWithTag("blocking_mode_card")
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("blocking_mode_active_modes")
+            .performScrollTo()
+            .assertTextContains("Current mode: BPF/NAT + VPN", substring = true)
+
+        // Verbose internals and legacy debug tags are absent
+        composeTestRule.onAllNodesWithTag("blocking_mode_invariant_status").assertCountEquals(0)
+        composeTestRule.onAllNodesWithTag("legacy_prenat_migration_status").assertCountEquals(0)
+        composeTestRule.onAllNodesWithTag("prenat_restore_engine_button").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("CURRENT_ACTIVE", substring = true).assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Exclusive Blocking Mode", substring = true).assertCountEquals(0)
+
+        // Radio selection works
+        composeTestRule.onNodeWithTag("blocking_mode_radio_bpf")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(dev.shizzi.BlockingMode.BPF_NAT_VPN, selectedMode)
+    }
+
+    @Test
+    fun `15 v0_10_3 release SettingsPage and ClientsPage render clean SoftAP mode without probe diagnostics and retain offline blocked hosts`() {
+        val baseContext = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val appInstance = dev.shizzi.App()
+        android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+            .apply {
+                isAccessible = true
+                invoke(appInstance, baseContext)
+            }
+        dev.shizzi.App::class.java.getDeclaredField("instance").apply {
+            isAccessible = true
+            set(null, appInstance)
+        }
+
+        var selectedMode: dev.shizzi.BlockingMode? = null
+
+        val softApReport = dev.shizzi.SoftApModeDiagnosticReport(
+            selectedMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            effectiveMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            engineState = dev.shizzi.SoftApEngineState.ACTIVE,
+            exclusiveEngineInvariant = true,
+            clientRecords = listOf(
+                dev.shizzi.SoftApClientEnforcementRecord(
+                    mac = "E2:15:CD:54:E4:9B",
+                    activeReasons = setOf(dev.shizzi.SoftApClientBlockReason.MANUAL_BLOCK),
+                    desiredBlocked = true,
+                    appliedState = dev.shizzi.SoftApAppliedState.BLOCK_CONFIRMED,
+                ),
+            ),
+        )
+        val preNatReport = dev.shizzi.PreNatModeDiagnosticReport(
+            requestedMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            effectiveMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            effectiveModeNullable = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+            runtimeState = dev.shizzi.PreNatRuntimeState.CURRENT_ACTIVE,
+            exclusiveEngineInvariant = true,
+            bpfNatVpnDropPathEnabled = false,
+            preNatDropPathEnabled = false,
+            softApMacBlockEnabled = true,
+        )
+        val combinedReport = dev.shizzi.BpfAttributionStatusReport(
+            preNatDiagnostics = preNatReport,
+            softApDiagnostics = softApReport,
+        )
+
+        val clientA = ConnectedClient(
+            ip = "192.168.43.101",
+            mac = "E2:15:CD:54:E4:9B",
+            alias = "galaxy-a",
+            interfaceName = "ap0",
+            isBlocked = false,
+            bandwidthLimitKbps = 5000,
+        )
+        val clientB = ConnectedClient(
+            ip = "192.168.43.102",
+            mac = "AA:BB:CC:DD:EE:FF",
+            alias = "pixel-b",
+            interfaceName = "ap0",
+            isBlocked = false,
+        )
+
+        val showClientsPage = androidx.compose.runtime.mutableStateOf(false)
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                if (!showClientsPage.value) {
+                    SettingsPage(
+                        state = SettingsState(
+                            shizuku = ShizukuState.Ready(uid = 2000, isRoot = false),
+                            permissions = emptyList(),
+                            theme = ThemeChoice.DARK,
+                            design = DesignLanguage.MATERIAL_EXPRESSIVE,
+                            accent = AccentChoice.Default,
+                            customAccents = emptyList(),
+                            isLogging = true,
+                            vpnMode = VpnMode.AUTO,
+                            isRunningDiagnostics = false,
+                            automation = AutomationState(isEnabled = false, token = ""),
+                            dnsSettings = DnsSettings(),
+                            requestedBlockingMode = dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK,
+                            connectedClients = listOf(clientA, clientB),
+                            bpfReport = combinedReport,
+                        ),
+                        actions = SettingsActions(
+                            onSetTheme = {},
+                            onSetDesign = {},
+                            onSetAccent = {},
+                            onAddCustomAccent = {},
+                            onSetLogging = {},
+                            onSetVpnMode = {},
+                            onSetDnsPreset = {},
+                            onSetCustomDns = { _, _ -> },
+                            onOpenClients = {},
+                            onOpenLog = {},
+                            onSelectBlockingMode = { selectedMode = it },
+                            onRunProbes = {},
+                            onGrantPermission = {},
+                            onShizukuAction = {},
+                            onRestartOnboarding = {},
+                            automation = AutomationActions(
+                                onSetEnabled = {},
+                                onRegenerateToken = {},
+                            ),
+                        ),
+                        toasts = rememberToastState(),
+                        onBack = {},
+                    )
+                } else {
+                    ClientsPage(
+                        clients = listOf(clientB),
+                        actions = ClientActions(
+                            onToggleBlock = { _, _ -> },
+                            onSaveRule = {},
+                            onRemoveRule = {},
+                            onRefresh = {},
+                        ),
+                        savedRules = emptyList(),
+                        bpfReport = combinedReport,
+                        onBack = {},
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // AC03 & AC05: SoftAP radio option and concise current mode line are shown; probe buttons and engine state badge are absent
+        composeTestRule.onNodeWithTag("blocking_mode_radio_softap")
+            .performScrollTo()
+            .assertIsDisplayed()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(dev.shizzi.BlockingMode.SOFTAP_MAC_BLOCK, selectedMode)
+
+        composeTestRule.onNodeWithTag("blocking_mode_active_modes")
+            .performScrollTo()
+            .assertTextContains("Current mode: SoftAP MAC Block", substring = true)
+        composeTestRule.onAllNodesWithTag("softap_engine_state_badge").assertCountEquals(0)
+        composeTestRule.onAllNodesWithTag("softap_check_capability_button").assertCountEquals(0)
+        composeTestRule.onAllNodesWithTag("softap_run_live_probe_button").assertCountEquals(0)
+        composeTestRule.onAllNodesWithTag("softap_activate_mode_button").assertCountEquals(0)
+
+        // Switch to ClientsPage -> verify SoftAP active mode banner, disconnected SoftAP-blocked client retained with clean user-facing label
+        showClientsPage.value = true
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("softap_active_mode_banner")
+            .assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("clients_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("client_card_E2:15:CD:54:E4:9B"))
+        composeTestRule.onNodeWithTag("client_card_E2:15:CD:54:E4:9B")
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("softap_status_E2:15:CD:54:E4:9B")
+            .assertTextContains("Disconnected from hotspot", substring = true)
+        composeTestRule.onAllNodesWithText("BLOCK_CONFIRMED", substring = true).assertCountEquals(0)
+
+        // Open Configure dialog -> verify bandwidth limit input is disabled with SoftAP notice
+        composeTestRule.onNodeWithTag("configure_client_E2:15:CD:54:E4:9B")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("bandwidth_limit_mbps_input")
+            .performScrollTo()
+            .assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("softap_throttle_disabled_notice", useUnmergedTree = true)
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun `16 v0_10_3 release DomainBlockingPage renders concise info note Global and Per-Host tabs without diagnostic status banner`() {
+        val rulesState = androidx.compose.runtime.mutableStateListOf(
+            dev.shizzi.DomainRule(
+                id = "g1",
+                scope = dev.shizzi.DomainRuleScope.GLOBAL,
+                normalizedDomain = "doubleclick.net",
+                matchMode = dev.shizzi.DomainMatchMode.INCLUDE_SUBDOMAINS,
+                enabled = true,
+            ),
+        )
+        val clientA = ConnectedClient(
+            ip = "192.168.43.101",
+            mac = "E2:15:CD:54:E4:9B",
+            alias = "galaxy-a",
+            interfaceName = "ap0",
+            isBlocked = false,
+        )
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                DomainBlockingPage(
+                    domainRules = rulesState.toList(),
+                    connectedClients = listOf(clientA),
+                    savedClientRules = emptyList(),
+                    actions = DomainBlockingActions(
+                        onUpsertRule = { _, rawDomain, scope, clientMac, matchMode, enabled ->
+                            val v = dev.shizzi.DomainNormalizer.validateAndNormalize(rawDomain)
+                            if (v.isValid) {
+                                rulesState.add(
+                                    dev.shizzi.DomainRule(
+                                        scope = scope,
+                                        clientMac = clientMac,
+                                        normalizedDomain = v.normalizedDomain!!,
+                                        matchMode = matchMode,
+                                        enabled = enabled,
+                                    ),
+                                )
+                            }
+                            v
+                        },
+                    ),
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // AC06: Domain diagnostic banner and DNS retry engineering toggle are absent; concise note is shown
+        composeTestRule.onAllNodesWithTag("domain_capability_banner").assertCountEquals(0)
+        composeTestRule.onAllNodesWithTag("domain_dns_retry_card").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("PARTIAL_DOMAIN_ENFORCEMENT", substring = true).assertCountEquals(0)
+        composeTestRule.onNodeWithTag("domain_info_note")
+            .assertIsDisplayed()
+            .assertTextContains("Global rules work best with standard DNS. Per-host rules may be limited by traffic attribution.")
+
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_rule_card_doubleclick.net"))
+        composeTestRule.onNodeWithTag("domain_rule_card_doubleclick.net").assertIsDisplayed()
+
+        // Switch to Per Host tab -> verify "Global rules also apply" notice
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_tab_client"))
+        composeTestRule.onNodeWithTag("domain_tab_client").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_global_also_applies_notice"))
+        composeTestRule.onNodeWithTag("domain_global_also_applies_notice")
+            .assertIsDisplayed()
+            .assertTextContains("Global rules also apply", substring = true)
+
+        // Open Add Host Rule dialog -> enter invalid URL -> verify inline error
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_add_client_button"))
+        composeTestRule.onNodeWithTag("domain_add_client_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_rule_dialog").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("domain_input_field").performTextReplacement("https://bad.example.com/path")
+        composeTestRule.onNodeWithTag("domain_dialog_save_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_input_error").assertIsDisplayed()
+
+        // Replace with valid wildcard domain "*.TikTok.com." -> verify normalized rule card appears
+        composeTestRule.onNodeWithTag("domain_input_field").performTextReplacement("*.TikTok.com.")
+        composeTestRule.onNodeWithTag("domain_dialog_save_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_rule_card_tiktok.com"))
+        composeTestRule.onNodeWithTag("domain_rule_card_tiktok.com").assertIsDisplayed()
+    }
+
+    @Test
+    fun `17 v0_10_3 release VpnSection Stop hotspot when VPN disconnects toggle warning and DomainBlockingPage BPF hint`() {
+        val vpnModeState = androidx.compose.runtime.mutableStateOf(VpnMode.AUTO)
+        val stopOnDisconnectState = androidx.compose.runtime.mutableStateOf(true)
+        val showDomainPage = androidx.compose.runtime.mutableStateOf(false)
+        val bpfEnabledState = androidx.compose.runtime.mutableStateOf(false)
+
+        composeTestRule.setContent {
+            ShizziTheme {
+                if (!showDomainPage.value) {
+                    VpnSection(
+                        selected = vpnModeState.value,
+                        onSelect = { vpnModeState.value = it },
+                        stopHotspotOnVpnDisconnect = stopOnDisconnectState.value,
+                        onSetStopHotspotOnVpnDisconnect = { stopOnDisconnectState.value = it },
+                    )
+                } else {
+                    DomainBlockingPage(
+                        domainRules = emptyList(),
+                        connectedClients = listOf(
+                            ConnectedClient(
+                                ip = "192.168.43.101",
+                                mac = "E2:15:CD:54:E4:9B",
+                                alias = "Phone A",
+                                interfaceName = "ap0",
+                            ),
+                        ),
+                        experimentalBpfEnabled = bpfEnabledState.value,
+                        initialScope = dev.shizzi.DomainRuleScope.CLIENT,
+                        initialClientMac = "E2:15:CD:54:E4:9B",
+                        actions = DomainBlockingActions(
+                            onSetExperimentalBpfEnabled = { bpfEnabledState.value = it },
+                        ),
+                    )
+                }
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // 1. Verify "Stop hotspot when VPN disconnects" toggle is ON by default; warning card is not displayed
+        composeTestRule.onNodeWithTag("vpn_stop_on_disconnect_toggle").assertIsDisplayed()
+        composeTestRule.onAllNodesWithTag("vpn_keep_hotspot_warning_card").assertCountEquals(0)
+
+        // 2. Toggle OFF -> warning card appears with exact non-bypass text
+        composeTestRule.onNodeWithTag("vpn_stop_on_disconnect_switch").performClick()
+        composeTestRule.waitForIdle()
+        assertFalse(stopOnDisconnectState.value)
+        composeTestRule.onNodeWithTag("vpn_keep_hotspot_warning_card").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("vpn_keep_hotspot_warning_text", useUnmergedTree = true)
+            .assertTextContains("While the VPN is disconnected, internet access may be interrupted. Traffic must not silently bypass the VPN.", substring = true)
+
+        // 3. Switch to VpnMode.NEVER -> switch is disabled and warning card is hidden
+        vpnModeState.value = VpnMode.NEVER
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("vpn_stop_on_disconnect_switch").assertIsNotEnabled()
+        composeTestRule.onAllNodesWithTag("vpn_keep_hotspot_warning_card").assertCountEquals(0)
+
+        // 4. Switch to DomainBlockingPage on Per Host tab with experimentalBpfEnabled = false
+        showDomainPage.value = true
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("domain_lazy_column")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("domain_bpf_disabled_warning_card"))
+        composeTestRule.onNodeWithTag("domain_bpf_disabled_warning_card").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("domain_enable_bpf_button").performClick()
+        composeTestRule.waitForIdle()
+        assertTrue(bpfEnabledState.value)
+        composeTestRule.onAllNodesWithTag("domain_bpf_disabled_warning_card").assertCountEquals(0)
+        composeTestRule.onAllNodesWithTag("domain_dns_retry_toggle").assertCountEquals(0)
+    }
 }
+
+
